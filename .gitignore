@@ -1,0 +1,22 @@
+# Rust build output
+/target/
+
+# Local shirabe data
+/.shirabe/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+
+# Frontend dependencies and build output
+/ui/node_modules/
+/ui/dist/
+
+# Logs and local environment
+*.log
+.env
+.env.*
+
+# macOS/editor noise
+.DS_Store
+*.swp
+*.swo
