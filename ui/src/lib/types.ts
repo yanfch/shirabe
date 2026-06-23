@@ -341,13 +341,18 @@ export type RunStep = {
   name: string;
   status: string;
   error_type: string | null;
+  source_event_id: string | null;
+  source_ref: string | null;
   started_at_ns: number;
   ended_at_ns: number | null;
   duration_ns: number | null;
   order_index: number | null;
+  llm_call_id: string | null;
+  tool_call_id: string | null;
   input_tokens: number;
   output_tokens: number;
   cost_usd: number;
+  metadata_json: string | null;
 };
 
 export type LlmCall = {
