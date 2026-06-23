@@ -33,6 +33,27 @@ export function fmtTime(ns: number | null | undefined) {
   return new Date(Math.floor(ns / 1_000_000)).toLocaleString();
 }
 
+export function fmtDuration(ns: number | null | undefined) {
+  if (ns == null) return "-";
+  if (ns < 0) return "-";
+  if (ns === 0) return "0ms";
+  if (ns < 1_000_000) return "<1ms";
+
+  const ms = Math.round(ns / 1_000_000);
+  if (ms < 1_000) return `${ms}ms`;
+
+  const seconds = Math.round(ms / 1_000);
+  if (seconds < 60) return `${seconds}s`;
+
+  const minutes = Math.floor(seconds / 60);
+  const remainingSeconds = seconds % 60;
+  if (minutes < 60) return remainingSeconds > 0 ? `${minutes}m ${remainingSeconds}s` : `${minutes}m`;
+
+  const hours = Math.floor(minutes / 60);
+  const remainingMinutes = minutes % 60;
+  return remainingMinutes > 0 ? `${hours}h ${String(remainingMinutes).padStart(2, "0")}m` : `${hours}h`;
+}
+
 export function cacheRatio(totals: Totals | null | undefined) {
   if (!totals || totals.input_tokens <= 0) return null;
   return totals.cache_read_tokens / totals.input_tokens;

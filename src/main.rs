@@ -6,6 +6,7 @@ mod pricing;
 pub mod projection;
 mod rollup;
 mod server;
+mod skills;
 
 use anyhow::Result;
 use clap::Parser;

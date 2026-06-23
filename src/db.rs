@@ -8,7 +8,7 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
 
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 4;
 
 pub struct Database {
     path: PathBuf,
@@ -503,6 +503,7 @@ CREATE INDEX IF NOT EXISTS idx_runs_source_started ON runs(source, started_at_ns
 CREATE INDEX IF NOT EXISTS idx_runs_source_day ON runs(source, started_day);
 CREATE INDEX IF NOT EXISTS idx_runs_source_month ON runs(source, started_month);
 CREATE INDEX IF NOT EXISTS idx_runs_session ON runs(session_id);
+CREATE INDEX IF NOT EXISTS idx_runs_session_started ON runs(session_id, started_at_ns);
 
 CREATE TABLE IF NOT EXISTS turns (
     turn_id TEXT PRIMARY KEY,
@@ -533,6 +534,7 @@ CREATE TABLE IF NOT EXISTS turns (
 );
 CREATE INDEX IF NOT EXISTS idx_turns_run ON turns(run_id);
 CREATE INDEX IF NOT EXISTS idx_turns_session ON turns(session_id);
+CREATE INDEX IF NOT EXISTS idx_turns_session_started ON turns(session_id, started_at_ns);
 CREATE INDEX IF NOT EXISTS idx_turns_started ON turns(started_at_ns);
 CREATE INDEX IF NOT EXISTS idx_turns_source_started ON turns(source, started_at_ns);
 CREATE INDEX IF NOT EXISTS idx_turns_source_day ON turns(source, started_day);
@@ -614,9 +616,12 @@ CREATE TABLE IF NOT EXISTS llm_calls (
     FOREIGN KEY (run_id) REFERENCES runs(run_id)
 );
 CREATE INDEX IF NOT EXISTS idx_llm_calls_run ON llm_calls(run_id);
+CREATE INDEX IF NOT EXISTS idx_llm_calls_run_started ON llm_calls(run_id, started_at_ns);
 CREATE INDEX IF NOT EXISTS idx_llm_calls_source_run ON llm_calls(source, run_id);
+CREATE INDEX IF NOT EXISTS idx_llm_calls_turn ON llm_calls(turn_id);
 CREATE INDEX IF NOT EXISTS idx_llm_calls_run_model ON llm_calls(run_id, model);
 CREATE INDEX IF NOT EXISTS idx_llm_calls_session ON llm_calls(session_id);
+CREATE INDEX IF NOT EXISTS idx_llm_calls_session_started ON llm_calls(session_id, started_at_ns);
 CREATE INDEX IF NOT EXISTS idx_llm_calls_session_model ON llm_calls(session_id, model);
 CREATE INDEX IF NOT EXISTS idx_llm_calls_started ON llm_calls(started_at_ns);
 CREATE INDEX IF NOT EXISTS idx_llm_calls_source_started ON llm_calls(source, started_at_ns);
@@ -649,8 +654,12 @@ CREATE TABLE IF NOT EXISTS tool_calls (
     FOREIGN KEY (run_id) REFERENCES runs(run_id)
 );
 CREATE INDEX IF NOT EXISTS idx_tool_calls_run ON tool_calls(run_id);
+CREATE INDEX IF NOT EXISTS idx_tool_calls_run_started ON tool_calls(run_id, started_at_ns);
 CREATE INDEX IF NOT EXISTS idx_tool_calls_source_run ON tool_calls(source, run_id);
+CREATE INDEX IF NOT EXISTS idx_tool_calls_turn ON tool_calls(turn_id);
+CREATE INDEX IF NOT EXISTS idx_tool_calls_turn_status ON tool_calls(turn_id, status);
 CREATE INDEX IF NOT EXISTS idx_tool_calls_session ON tool_calls(session_id);
+CREATE INDEX IF NOT EXISTS idx_tool_calls_session_started ON tool_calls(session_id, started_at_ns);
 CREATE INDEX IF NOT EXISTS idx_tool_calls_started ON tool_calls(started_at_ns);
 CREATE INDEX IF NOT EXISTS idx_tool_calls_source_started ON tool_calls(source, started_at_ns);
 CREATE INDEX IF NOT EXISTS idx_tool_calls_source_day_name ON tool_calls(source, started_day, tool_name);
@@ -671,6 +680,40 @@ CREATE TABLE IF NOT EXISTS run_signals (
 );
 CREATE INDEX IF NOT EXISTS idx_run_signals_run ON run_signals(run_id);
 CREATE INDEX IF NOT EXISTS idx_run_signals_type ON run_signals(signal_type, severity);
+
+CREATE TABLE IF NOT EXISTS skill_events (
+    skill_event_id TEXT PRIMARY KEY,
+    source TEXT NOT NULL,
+    skill_name TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    confidence REAL NOT NULL DEFAULT 0,
+    session_id TEXT,
+    run_id TEXT NOT NULL,
+    turn_id TEXT,
+    source_event_id TEXT,
+    source_ref TEXT,
+    occurred_at_ns INTEGER NOT NULL,
+    occurred_day TEXT,
+    occurred_month TEXT,
+    metadata_json TEXT,
+    FOREIGN KEY (session_id) REFERENCES sessions(session_id),
+    FOREIGN KEY (run_id) REFERENCES runs(run_id),
+    FOREIGN KEY (turn_id) REFERENCES turns(turn_id)
+);
+CREATE INDEX IF NOT EXISTS idx_skill_events_source_time
+ON skill_events(source, occurred_at_ns);
+CREATE INDEX IF NOT EXISTS idx_skill_events_source_day_name
+ON skill_events(source, occurred_day, skill_name);
+CREATE INDEX IF NOT EXISTS idx_skill_events_source_month_name
+ON skill_events(source, occurred_month, skill_name);
+CREATE INDEX IF NOT EXISTS idx_skill_events_run
+ON skill_events(run_id);
+CREATE INDEX IF NOT EXISTS idx_skill_events_session
+ON skill_events(session_id);
+CREATE INDEX IF NOT EXISTS idx_skill_events_session_time
+ON skill_events(session_id, occurred_at_ns);
+CREATE INDEX IF NOT EXISTS idx_skill_events_name_type
+ON skill_events(skill_name, event_type);
 
 CREATE TABLE IF NOT EXISTS metric_rollups (
     bucket_start_ns INTEGER NOT NULL,

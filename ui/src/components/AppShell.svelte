@@ -1,18 +1,41 @@
 <script lang="ts">
-  import type { Overview } from "../lib/types";
+  import type { Overview, SyncStatus } from "../lib/types";
 
   export let overview: Overview | null;
+  export let syncStatus: SyncStatus | null;
   export let selectedRunId: string | null;
-  export let activePage: "overview" | "usage";
+  export let selectedSessionId: string | null;
+  export let activePage: "overview" | "usage" | "sessions";
   export let onOverview: () => void;
   export let onUsage: () => void;
+  export let onSessions: () => void;
+  export let onSync: () => void;
 
-  $: title = selectedRunId ? "Run Detail" : activePage === "usage" ? "Usage" : "Overview";
+  $: title = selectedRunId
+    ? "Run Detail"
+    : selectedSessionId
+      ? "Session Detail"
+      : activePage === "usage"
+        ? "Usage"
+        : activePage === "sessions"
+          ? "Sessions"
+          : "Overview";
   $: subtitle = selectedRunId
     ? selectedRunId
-    : activePage === "usage"
-      ? "Usage, tokens, cost, cache, sessions, and tools"
-      : "Local AI operations overview";
+    : selectedSessionId
+      ? selectedSessionId
+      : activePage === "usage"
+        ? "Usage, tokens, cost, cache, sessions, and tools"
+        : activePage === "sessions"
+          ? "Trace sessions, turns, timeline, models, tools, and skills"
+          : "Local AI operations overview";
+  $: syncRunning = syncStatus?.state === "running";
+  $: syncLabel = syncRunning ? "Syncing" : syncStatus?.state === "failed" ? "Retry Sync" : "Sync";
+  $: syncDetail = syncRunning
+    ? syncStatus?.phase
+    : syncStatus?.finished_at_ns
+      ? `Last sync ${syncStatus.sources.filter((source) => source.status === "ok").length}/${syncStatus.sources.length}`
+      : "Manual refresh";
 </script>
 
 <div class="app-shell">
@@ -22,15 +45,19 @@
       <div class="brand-subtitle">AI OPERATIONS DIAGNOSTICS</div>
     </div>
     <nav class="nav-list">
-      <button class:active={!selectedRunId && activePage === "overview"} on:click={onOverview}>~ Overview</button>
-      <button class:active={!selectedRunId && activePage === "usage"} on:click={onUsage}>% Usage</button>
-      <button class:active={!!selectedRunId} disabled={!selectedRunId}># Run Detail</button>
+      <button class:active={!selectedRunId && !selectedSessionId && activePage === "overview"} on:click={onOverview}>~ Overview</button>
+      <button class:active={!selectedRunId && !selectedSessionId && activePage === "usage"} on:click={onUsage}>% Usage</button>
+      <button class:active={!selectedRunId && activePage === "sessions"} on:click={onSessions}>= Sessions</button>
     </nav>
     <div class="sidebar-status">
       <div class="status-row"><span class="dot"></span>LOCAL API</div>
       <div class="status-grid">
         <span>Sources</span><strong>{overview?.totals.import_sources ?? "-"}</strong>
         <span>Files</span><strong>{overview?.totals.import_files ?? "-"}</strong>
+      </div>
+      <div class="sync-control">
+        <button class:running={syncRunning} on:click={onSync} disabled={syncRunning}>{syncLabel}</button>
+        <span>{syncDetail}</span>
       </div>
     </div>
   </aside>
@@ -40,6 +67,8 @@
       <div>
         {#if selectedRunId}
           <p class="breadcrumb">Runs &gt; Detail</p>
+        {:else if selectedSessionId}
+          <p class="breadcrumb">Sessions &gt; Detail</p>
         {/if}
         <h1>&gt;_ {title}</h1>
         <p>{subtitle}</p>

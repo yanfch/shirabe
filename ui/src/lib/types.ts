@@ -8,6 +8,7 @@ export type Overview = {
   recent_runs: Run[];
   tool_summaries: ToolSummary[];
   tool_failures: ToolFailureSummary[];
+  skill_summaries: SkillSummary[];
   model_summaries: ModelSummary[];
 };
 
@@ -24,6 +25,7 @@ export type Usage = {
   recent_runs: Run[];
   tool_summaries: ToolSummary[];
   tool_failures: ToolFailureSummary[];
+  skill_summaries: SkillSummary[];
   model_summaries: ModelSummary[];
 };
 
@@ -37,6 +39,39 @@ export type UsageFilters = {
   grain: UsageGrain;
   source: string | null;
   model: string | null;
+};
+
+export type SyncStatus = {
+  status: string;
+  state: string;
+  phase: string;
+  started_at_ns: number | null;
+  finished_at_ns: number | null;
+  duration_ms: number | null;
+  sources: SyncSourceReport[];
+  rollup: SyncRollupReport | null;
+  error: string | null;
+};
+
+export type SyncSourceReport = {
+  source: string;
+  status: string;
+  files_seen: number;
+  files_imported: number;
+  files_skipped: number;
+  events_projected: number;
+  source_bytes_scanned: number;
+  elapsed_ms: number;
+  error: string | null;
+};
+
+export type SyncRollupReport = {
+  status: string;
+  source_rollups: number;
+  model_rollups: number;
+  tool_rollups: number;
+  tool_model_rollups: number;
+  elapsed_ms: number;
 };
 
 export type Totals = {
@@ -80,6 +115,7 @@ export type UsageSummary = {
 export type UsageBucketSummary = {
   bucket_key: string;
   date: string;
+  bucket_count: number;
   sessions: number;
   runs: number;
   turns: number;
@@ -155,6 +191,18 @@ export type ModelSummary = {
   total_cost_usd: number;
 };
 
+export type SkillSummary = {
+  source: string;
+  skill_name: string;
+  loaded_count: number;
+  invoked_count: number;
+  attributed_count: number;
+  sessions: number;
+  runs: number;
+  last_used_at_ns: number;
+  confidence: number;
+};
+
 export type ImportSource = {
   source_id: string;
   source: string;
@@ -181,6 +229,7 @@ export type Run = {
   session_id: string | null;
   started_at_ns: number;
   ended_at_ns: number | null;
+  duration_ns: number | null;
   llm_call_count: number;
   tool_call_count: number;
   failed_tool_count: number;
@@ -201,6 +250,82 @@ export type RunDetail = {
   tool_calls: ToolCall[];
 };
 
+export type SessionList = {
+  status: string;
+  sessions: SessionSummary[];
+};
+
+export type SessionDetail = {
+  status: string;
+  session: SessionSummary;
+  runs: Run[];
+  turns: TurnSummary[];
+  timeline: SessionTimelineEvent[];
+  llm_calls: LlmCall[];
+  tool_calls: ToolCall[];
+  skill_events: SkillEventRecord[];
+  tool_summaries: ToolSummary[];
+  skill_summaries: SkillSummary[];
+  model_summaries: ModelSummary[];
+};
+
+export type TurnSummary = {
+  turn_id: string;
+  run_id: string;
+  session_id: string | null;
+  source: string;
+  turn_index: number | null;
+  role: string | null;
+  status: string | null;
+  started_at_ns: number;
+  ended_at_ns: number | null;
+  duration_ns: number | null;
+  llm_calls: number;
+  tool_calls: number;
+  failed_tool_calls: number;
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_tokens: number;
+  total_cost_usd: number;
+  models: string[];
+};
+
+export type SkillEventRecord = {
+  skill_event_id: string;
+  source: string;
+  skill_name: string;
+  event_type: string;
+  confidence: number;
+  session_id: string | null;
+  run_id: string;
+  turn_id: string | null;
+  source_event_id: string | null;
+  source_ref: string | null;
+  occurred_at_ns: number;
+  metadata_json: string | null;
+};
+
+export type SessionTimelineEvent = {
+  event_id: string;
+  event_type: "llm" | "tool" | "skill" | string;
+  run_id: string;
+  turn_id: string | null;
+  label: string;
+  status: string;
+  error_type: string | null;
+  started_at_ns: number;
+  ended_at_ns: number | null;
+  duration_ns: number | null;
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_tokens: number;
+  total_cost_usd: number;
+  model: string | null;
+  tool_name: string | null;
+  skill_name: string | null;
+  skill_event_type: string | null;
+};
+
 export type RunSignal = {
   signal_id: string;
   signal_type: string;
@@ -218,6 +343,7 @@ export type RunStep = {
   error_type: string | null;
   started_at_ns: number;
   ended_at_ns: number | null;
+  duration_ns: number | null;
   order_index: number | null;
   input_tokens: number;
   output_tokens: number;
@@ -236,6 +362,9 @@ export type LlmCall = {
   cache_ratio: number | null;
   context_window_percent: number | null;
   total_cost_usd: number;
+  started_at_ns: number;
+  ended_at_ns: number | null;
+  duration_ns: number | null;
 };
 
 export type ToolCall = {

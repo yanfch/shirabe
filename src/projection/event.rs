@@ -16,6 +16,7 @@ pub struct NormalizedEvent {
     pub turn: Option<TurnHint>,
     pub operation: Operation,
     pub usage: Usage,
+    pub skill_events: Vec<SkillEventHint>,
     pub confidence: f64,
 }
 
@@ -121,6 +122,31 @@ pub struct Usage {
     pub cost_confidence: Option<String>,
     pub model_context_window: Option<i64>,
     pub context_window_percent: Option<f64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SkillEventHint {
+    pub skill_name: String,
+    pub event_type: SkillEventType,
+    pub confidence: f64,
+    pub metadata: Option<Value>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkillEventType {
+    Loaded,
+    Invoked,
+    Attributed,
+}
+
+impl SkillEventType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Loaded => "loaded",
+            Self::Invoked => "invoked",
+            Self::Attributed => "attributed",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]

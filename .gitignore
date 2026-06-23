@@ -16,6 +16,11 @@
 .env
 .env.*
 
+# Local design notes and generated visual assets
+/assets/
+/docs/
+/prototypes/
+
 # macOS/editor noise
 .DS_Store
 *.swp

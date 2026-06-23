@@ -18,10 +18,27 @@ use crate::projection::{
     },
     projector::{ProjectionCache, Projector},
 };
+use crate::skills;
 
 use super::{ImportReport, ImportTiming};
 
 pub fn import(db: &Database, path: Option<PathBuf>) -> Result<ImportReport> {
+    import_with_modified_since(db, path, None)
+}
+
+pub fn import_recent(
+    db: &Database,
+    path: Option<PathBuf>,
+    modified_since_ns: i64,
+) -> Result<ImportReport> {
+    import_with_modified_since(db, path, Some(modified_since_ns))
+}
+
+fn import_with_modified_since(
+    db: &Database,
+    path: Option<PathBuf>,
+    modified_since_ns: Option<i64>,
+) -> Result<ImportReport> {
     let total_started = Instant::now();
     let root_path = path.unwrap_or_else(default_claude_projects_dir);
     let source_kind = if root_path.is_file() {
@@ -33,7 +50,7 @@ pub fn import(db: &Database, path: Option<PathBuf>) -> Result<ImportReport> {
 
     let scan_started = Instant::now();
     let tx = db.begin_batch()?;
-    let scan = scan_sessions(db, &source_id, &root_path)?;
+    let scan = scan_sessions(db, &source_id, &root_path, modified_since_ns)?;
     tx.commit()?;
     let scan_elapsed_ms = scan_started.elapsed().as_millis();
 
@@ -89,10 +106,18 @@ fn default_claude_projects_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(".claude").join("projects"))
 }
 
-fn scan_sessions(db: &Database, source_id: &str, root: &Path) -> Result<ScanSize> {
+fn scan_sessions(
+    db: &Database,
+    source_id: &str,
+    root: &Path,
+    modified_since_ns: Option<i64>,
+) -> Result<ScanSize> {
     if root.is_file() {
         let metadata = fs::metadata(root).with_context(|| format!("stat {}", root.display()))?;
         let modified_ns = metadata.modified().map(system_time_ns).unwrap_or_default();
+        if modified_since_ns.is_some_and(|since| modified_ns < since) {
+            return Ok(ScanSize::default());
+        }
         let prepared = db.prepare_import_file(source_id, root, metadata.len(), modified_ns)?;
         let imported = if prepared.should_import {
             import_session_file(db, &prepared.file_id, root)?
@@ -131,9 +156,12 @@ fn scan_sessions(db: &Database, source_id: &str, root: &Path) -> Result<ScanSize
         let entry = entry.with_context(|| format!("scan {}", root.display()))?;
         if entry.file_type().is_file() && is_jsonl(entry.path()) {
             let metadata = entry.metadata()?;
+            let modified_ns = metadata.modified().map(system_time_ns).unwrap_or_default();
+            if modified_since_ns.is_some_and(|since| modified_ns < since) {
+                continue;
+            }
             files_seen += 1;
             bytes = bytes.saturating_add(metadata.len());
-            let modified_ns = metadata.modified().map(system_time_ns).unwrap_or_default();
             let prepared =
                 db.prepare_import_file(source_id, entry.path(), metadata.len(), modified_ns)?;
             if !prepared.should_import {
@@ -342,7 +370,7 @@ impl SessionState {
             let source_event_id =
                 string_field(message, "id").unwrap_or_else(|| assistant_uuid.clone());
             let model = self.model.clone().unwrap_or_else(|| "unknown".to_string());
-            events.push(self.event(
+            let mut event = self.event(
                 path,
                 line_number,
                 timestamp_ns,
@@ -352,7 +380,9 @@ impl SessionState {
                 OperationStatus::Success,
                 usage_from_message(message, usage),
                 None,
-            ));
+            );
+            event.skill_events = skills::claude::attributed_skill_events(object, message);
+            events.push(event);
         }
 
         if let Some(content) = message.get("content").and_then(Value::as_array) {
@@ -368,6 +398,7 @@ impl SessionState {
                     .unwrap_or_else(|| format!("{assistant_uuid}:tool:{line_number}"));
                 let tool_name =
                     string_field(item, "name").unwrap_or_else(|| "tool_use".to_string());
+                let skill_events = skills::claude::skill_events_from_tool_use(item, &tool_name);
                 self.assistant_tools
                     .entry(assistant_uuid.clone())
                     .or_default()
@@ -375,7 +406,7 @@ impl SessionState {
                         id: tool_id.clone(),
                         name: tool_name.clone(),
                     });
-                events.push(self.event(
+                let mut event = self.event(
                     path,
                     line_number,
                     timestamp_ns,
@@ -385,7 +416,9 @@ impl SessionState {
                     OperationStatus::Success,
                     Usage::default(),
                     None,
-                ));
+                );
+                event.skill_events = skill_events;
+                events.push(event);
             }
         }
 
@@ -513,6 +546,7 @@ impl SessionState {
                 metadata,
             },
             usage,
+            skill_events: Vec::new(),
             confidence: 0.9,
         }
     }
@@ -676,7 +710,7 @@ fn file_len(path: &Path) -> Result<u64> {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct ScanSize {
     files_seen: usize,
     files_imported: usize,

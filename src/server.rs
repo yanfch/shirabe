@@ -1,4 +1,9 @@
-use std::{net::SocketAddr, path::PathBuf, sync::Arc};
+use std::{
+    net::SocketAddr,
+    path::PathBuf,
+    sync::{Arc, Mutex},
+    time::Instant,
+};
 
 use anyhow::{Context, Result};
 use axum::{
@@ -6,29 +11,40 @@ use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use tower_http::{services::ServeDir, trace::TraceLayer};
 
+use crate::{db::Database, importers, rollup};
+
 #[derive(Debug)]
 struct AppState {
     db_path: PathBuf,
     ui_dir: PathBuf,
+    sync: Mutex<SyncStatus>,
 }
 
 pub async fn serve(db_path: PathBuf, bind: String, ui_dir: PathBuf) -> Result<()> {
     let addr: SocketAddr = bind
         .parse()
         .with_context(|| format!("parse bind address {bind}"))?;
-    let state = Arc::new(AppState { db_path, ui_dir });
+    let state = Arc::new(AppState {
+        db_path,
+        ui_dir,
+        sync: Mutex::new(SyncStatus::default()),
+    });
 
     let app = Router::new()
         .route("/api/health", get(health))
         .route("/api/overview", get(overview))
         .route("/api/usage", get(usage))
+        .route("/api/sync", post(start_sync))
+        .route("/api/sync/status", get(sync_status))
+        .route("/api/sessions", get(sessions))
+        .route("/api/sessions/{id}", get(session_detail))
         .route("/api/runs/{id}", get(run_detail))
         .fallback_service(ServeDir::new(state.ui_dir.clone()))
         .layer(TraceLayer::new_for_http())
@@ -60,6 +76,49 @@ async fn usage(State(state): State<Arc<AppState>>, Query(query): Query<UsageQuer
     let filters = UsageFilters::from_query(query);
     match load_usage(&state.db_path, filters) {
         Ok(response) => Json(response).into_response(),
+        Err(error) => api_error(error),
+    }
+}
+
+async fn sync_status(State(state): State<Arc<AppState>>) -> Response {
+    Json(current_sync_status(&state)).into_response()
+}
+
+async fn start_sync(State(state): State<Arc<AppState>>) -> Response {
+    let response = {
+        let mut sync = state.sync.lock().expect("sync status lock poisoned");
+        if sync.state == "running" {
+            return (StatusCode::ACCEPTED, Json(sync.clone())).into_response();
+        }
+
+        *sync = SyncStatus::running();
+        sync.clone()
+    };
+
+    let job_state = state.clone();
+    tokio::task::spawn_blocking(move || run_sync_job(job_state));
+
+    (StatusCode::ACCEPTED, Json(response)).into_response()
+}
+
+async fn sessions(State(state): State<Arc<AppState>>) -> Response {
+    match load_sessions(&state.db_path) {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => api_error(error),
+    }
+}
+
+async fn session_detail(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
+    match load_session_detail(&state.db_path, &id) {
+        Ok(Some(response)) => Json(response).into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                status: "error",
+                message: format!("session not found: {id}"),
+            }),
+        )
+            .into_response(),
         Err(error) => api_error(error),
     }
 }
@@ -113,6 +172,96 @@ struct UsageResponse {
     recent_runs: Vec<RecentRun>,
     tool_summaries: Vec<ToolSummary>,
     tool_failures: Vec<ToolFailureSummary>,
+    skill_summaries: Vec<SkillSummary>,
+    model_summaries: Vec<ModelSummary>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SyncStatus {
+    status: &'static str,
+    state: String,
+    phase: String,
+    started_at_ns: Option<i64>,
+    finished_at_ns: Option<i64>,
+    duration_ms: Option<i64>,
+    sources: Vec<SyncSourceReport>,
+    rollup: Option<SyncRollupReport>,
+    error: Option<String>,
+}
+
+impl SyncStatus {
+    fn running() -> Self {
+        Self {
+            status: "ok",
+            state: "running".to_string(),
+            phase: "queued".to_string(),
+            started_at_ns: Some(crate::db::now_ns()),
+            finished_at_ns: None,
+            duration_ms: None,
+            sources: Vec::new(),
+            rollup: None,
+            error: None,
+        }
+    }
+}
+
+impl Default for SyncStatus {
+    fn default() -> Self {
+        Self {
+            status: "ok",
+            state: "idle".to_string(),
+            phase: "idle".to_string(),
+            started_at_ns: None,
+            finished_at_ns: None,
+            duration_ms: None,
+            sources: Vec::new(),
+            rollup: None,
+            error: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SyncSourceReport {
+    source: String,
+    status: String,
+    files_seen: usize,
+    files_imported: usize,
+    files_skipped: usize,
+    events_projected: usize,
+    source_bytes_scanned: u64,
+    elapsed_ms: i64,
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SyncRollupReport {
+    status: String,
+    source_rollups: i64,
+    model_rollups: i64,
+    tool_rollups: i64,
+    tool_model_rollups: i64,
+    elapsed_ms: i64,
+}
+
+#[derive(Debug, Serialize)]
+struct SessionListResponse {
+    status: &'static str,
+    sessions: Vec<SessionSummary>,
+}
+
+#[derive(Debug, Serialize)]
+struct SessionDetailResponse {
+    status: &'static str,
+    session: SessionSummary,
+    runs: Vec<RecentRun>,
+    turns: Vec<TurnSummary>,
+    timeline: Vec<SessionTimelineEvent>,
+    llm_calls: Vec<LlmCall>,
+    tool_calls: Vec<ToolCall>,
+    skill_events: Vec<SkillEventRecord>,
+    tool_summaries: Vec<ToolSummary>,
+    skill_summaries: Vec<SkillSummary>,
     model_summaries: Vec<ModelSummary>,
 }
 
@@ -204,6 +353,7 @@ struct UsageSummary {
 struct UsageBucketSummary {
     bucket_key: String,
     date: String,
+    bucket_count: i64,
     sessions: i64,
     runs: i64,
     turns: i64,
@@ -216,6 +366,8 @@ struct UsageBucketSummary {
     cache_write_tokens: i64,
     total_cost_usd: f64,
 }
+
+const MAX_USAGE_BUCKETS: usize = 72;
 
 #[derive(Debug, Serialize)]
 struct ImportSourceSummary {
@@ -321,6 +473,79 @@ struct ModelSummary {
     output_tokens: i64,
     cache_read_tokens: i64,
     total_cost_usd: f64,
+}
+
+#[derive(Debug, Serialize)]
+struct SkillSummary {
+    source: String,
+    skill_name: String,
+    loaded_count: i64,
+    invoked_count: i64,
+    attributed_count: i64,
+    sessions: i64,
+    runs: i64,
+    last_used_at_ns: i64,
+    confidence: f64,
+}
+
+#[derive(Debug, Serialize)]
+struct TurnSummary {
+    turn_id: String,
+    run_id: String,
+    session_id: Option<String>,
+    source: String,
+    turn_index: Option<i64>,
+    role: Option<String>,
+    status: Option<String>,
+    started_at_ns: i64,
+    ended_at_ns: Option<i64>,
+    duration_ns: Option<i64>,
+    llm_calls: i64,
+    tool_calls: i64,
+    failed_tool_calls: i64,
+    input_tokens: i64,
+    output_tokens: i64,
+    cache_read_tokens: i64,
+    total_cost_usd: f64,
+    models: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct SkillEventRecord {
+    skill_event_id: String,
+    source: String,
+    skill_name: String,
+    event_type: String,
+    confidence: f64,
+    session_id: Option<String>,
+    run_id: String,
+    turn_id: Option<String>,
+    source_event_id: Option<String>,
+    source_ref: Option<String>,
+    occurred_at_ns: i64,
+    metadata_json: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct SessionTimelineEvent {
+    event_id: String,
+    event_type: String,
+    run_id: String,
+    turn_id: Option<String>,
+    label: String,
+    status: String,
+    error_type: Option<String>,
+    started_at_ns: i64,
+    ended_at_ns: Option<i64>,
+    duration_ns: Option<i64>,
+    input_tokens: i64,
+    output_tokens: i64,
+    cache_read_tokens: i64,
+    total_cost_usd: f64,
+    model: Option<String>,
+    tool_name: Option<String>,
+    skill_name: Option<String>,
+    skill_event_type: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -505,8 +730,31 @@ impl UsageFilters {
         }
     }
 
-    fn rollup_key_where(&self, alias: &str) -> String {
-        let bucket = self.usage_grain();
+    fn stats_rollup_grain(&self) -> &'static str {
+        if self.date_range_sql().is_some() {
+            "day"
+        } else {
+            "month"
+        }
+    }
+
+    fn chart_rollup_grain(&self) -> &'static str {
+        if self.usage_grain() == "month" && self.date_range_sql().is_some() {
+            "day"
+        } else {
+            self.usage_grain()
+        }
+    }
+
+    fn chart_bucket_key_expr(&self, alias: &str, rollup_grain: &str) -> String {
+        if self.usage_grain() == "month" && rollup_grain == "day" {
+            format!("substr({alias}.bucket_key, 1, 7)")
+        } else {
+            format!("{alias}.bucket_key")
+        }
+    }
+
+    fn rollup_key_where_for(&self, alias: &str, bucket: &str) -> String {
         let mut conditions = vec![format!("{alias}.bucket = {}", sql_literal(bucket))];
         if let Some(range) = self.date_range_sql() {
             conditions.push(range.bucket_key_condition(alias, bucket));
@@ -515,7 +763,11 @@ impl UsageFilters {
     }
 
     fn rollup_source_where(&self, alias: &str) -> String {
-        let mut conditions = vec![self.rollup_key_where(alias)];
+        self.rollup_source_where_for(alias, self.stats_rollup_grain())
+    }
+
+    fn rollup_source_where_for(&self, alias: &str, bucket: &str) -> String {
+        let mut conditions = vec![self.rollup_key_where_for(alias, bucket)];
         if let Some(source) = &self.source {
             conditions.push(format!("{alias}.source = {}", sql_literal(source)));
         }
@@ -523,15 +775,15 @@ impl UsageFilters {
     }
 
     fn rollup_model_where(&self, alias: &str) -> String {
-        let mut conditions = vec![self.rollup_source_where(alias)];
+        self.rollup_model_where_for(alias, self.stats_rollup_grain())
+    }
+
+    fn rollup_model_where_for(&self, alias: &str, bucket: &str) -> String {
+        let mut conditions = vec![self.rollup_source_where_for(alias, bucket)];
         if let Some(model) = &self.model {
             conditions.push(format!("{alias}.model = {}", sql_literal(model)));
         }
         join_conditions(conditions)
-    }
-
-    fn bucket_limit(&self) -> i64 {
-        120
     }
 
     fn from_query(query: UsageQuery) -> Self {
@@ -635,6 +887,17 @@ impl UsageFilters {
         join_conditions(conditions)
     }
 
+    fn skill_where(&self, alias: &str) -> String {
+        let mut conditions = vec![self.date_predicate(&format!("{alias}.occurred_at_ns"))];
+        if let Some(source) = self.source_condition(alias) {
+            conditions.push(source);
+        }
+        if let Some(model) = self.model_exists_for_skill(alias) {
+            conditions.push(model);
+        }
+        join_conditions(conditions)
+    }
+
     fn date_predicate(&self, timestamp_expr: &str) -> String {
         if let Some(range) = self.date_range_sql() {
             format!(
@@ -694,6 +957,14 @@ impl UsageFilters {
             )
         })
     }
+
+    fn model_exists_for_skill(&self, alias: &str) -> Option<String> {
+        self.model_condition("lm").map(|condition| {
+            format!(
+                "EXISTS (SELECT 1 FROM llm_calls lm WHERE lm.run_id = {alias}.run_id AND {condition})"
+            )
+        })
+    }
 }
 
 impl UsageSummary {
@@ -738,7 +1009,7 @@ fn load_usage(db_path: &PathBuf, filters: UsageFilters) -> Result<UsageResponse>
     let conn =
         Connection::open(db_path).with_context(|| format!("open sqlite {}", db_path.display()))?;
     let totals = load_usage_totals(&conn, &filters)?;
-    let buckets = load_usage_buckets(&conn, &filters)?;
+    let buckets = compact_usage_buckets(load_usage_buckets(&conn, &filters)?);
     let summary = UsageSummary::from_totals(&totals);
 
     Ok(UsageResponse {
@@ -754,8 +1025,155 @@ fn load_usage(db_path: &PathBuf, filters: UsageFilters) -> Result<UsageResponse>
         recent_runs: load_recent_runs_scoped(&conn, &filters)?,
         tool_summaries: load_tool_summaries_scoped(&conn, &filters)?,
         tool_failures: load_tool_failures_scoped(&conn, &filters)?,
+        skill_summaries: load_skill_summaries_scoped(&conn, &filters)?,
         model_summaries: load_model_summaries_scoped(&conn, &filters)?,
     })
+}
+
+fn load_sessions(db_path: &PathBuf) -> Result<SessionListResponse> {
+    let conn =
+        Connection::open(db_path).with_context(|| format!("open sqlite {}", db_path.display()))?;
+
+    Ok(SessionListResponse {
+        status: "ok",
+        sessions: load_recent_sessions_scoped_limit(&conn, &UsageFilters::all(), 80)?,
+    })
+}
+
+fn current_sync_status(state: &AppState) -> SyncStatus {
+    state
+        .sync
+        .lock()
+        .expect("sync status lock poisoned")
+        .clone()
+}
+
+fn run_sync_job(state: Arc<AppState>) {
+    let started = Instant::now();
+    let result = run_sync_job_inner(&state);
+    let finished_at_ns = crate::db::now_ns();
+    let duration_ms = elapsed_ms(started);
+
+    let mut sync = state.sync.lock().expect("sync status lock poisoned");
+    sync.finished_at_ns = Some(finished_at_ns);
+    sync.duration_ms = Some(duration_ms);
+    match result {
+        Ok(()) => {
+            sync.state = "idle".to_string();
+            sync.phase = "complete".to_string();
+        }
+        Err(error) => {
+            sync.state = "failed".to_string();
+            sync.phase = "failed".to_string();
+            sync.error = Some(format!("{error:#}"));
+        }
+    }
+}
+
+fn run_sync_job_inner(state: &Arc<AppState>) -> Result<()> {
+    let db = Database::open(&state.db_path)
+        .with_context(|| format!("open sqlite {}", state.db_path.display()))?;
+    db.migrate()?;
+
+    for source in ["codex", "pi", "claude", "kanade"] {
+        set_sync_phase(state, &format!("import {source}"));
+        let report = import_sync_source(&db, source);
+        state
+            .sync
+            .lock()
+            .expect("sync status lock poisoned")
+            .sources
+            .push(report);
+    }
+
+    set_sync_phase(state, "refresh rollups");
+    let started = Instant::now();
+    let report = rollup::refresh_all(&db)?;
+    state.sync.lock().expect("sync status lock poisoned").rollup = Some(SyncRollupReport {
+        status: report.status.to_string(),
+        source_rollups: report.source_rollups,
+        model_rollups: report.model_rollups,
+        tool_rollups: report.tool_rollups,
+        tool_model_rollups: report.tool_model_rollups,
+        elapsed_ms: elapsed_ms(started),
+    });
+
+    Ok(())
+}
+
+fn set_sync_phase(state: &AppState, phase: &str) {
+    state.sync.lock().expect("sync status lock poisoned").phase = phase.to_string();
+}
+
+fn import_sync_source(db: &Database, source: &str) -> SyncSourceReport {
+    let started = Instant::now();
+    let modified_since_ns = sync_modified_since_ns();
+    let result = match source {
+        "codex" => importers::codex::import_recent(db, None, modified_since_ns),
+        "pi" => importers::pi::import_recent(db, None, modified_since_ns),
+        "claude" => importers::claude::import_recent(db, None, modified_since_ns),
+        "kanade" => importers::kanade::import_recent(db, None, modified_since_ns),
+        _ => unreachable!("unsupported sync source"),
+    };
+
+    match result {
+        Ok(report) => SyncSourceReport {
+            source: report.source,
+            status: "ok".to_string(),
+            files_seen: report.files_seen,
+            files_imported: report.files_imported,
+            files_skipped: report.files_skipped,
+            events_projected: report.events_projected,
+            source_bytes_scanned: report.source_bytes_scanned,
+            elapsed_ms: elapsed_ms(started),
+            error: None,
+        },
+        Err(error) => SyncSourceReport {
+            source: source.to_string(),
+            status: "failed".to_string(),
+            files_seen: 0,
+            files_imported: 0,
+            files_skipped: 0,
+            events_projected: 0,
+            source_bytes_scanned: 0,
+            elapsed_ms: elapsed_ms(started),
+            error: Some(format!("{error:#}")),
+        },
+    }
+}
+
+fn sync_modified_since_ns() -> i64 {
+    const RECENT_SYNC_WINDOW_NS: i64 = 36 * 60 * 60 * 1_000_000_000;
+    crate::db::now_ns().saturating_sub(RECENT_SYNC_WINDOW_NS)
+}
+
+fn elapsed_ms(started: Instant) -> i64 {
+    started.elapsed().as_millis().min(i64::MAX as u128) as i64
+}
+
+fn load_session_detail(
+    db_path: &PathBuf,
+    session_id: &str,
+) -> Result<Option<SessionDetailResponse>> {
+    let conn =
+        Connection::open(db_path).with_context(|| format!("open sqlite {}", db_path.display()))?;
+    let Some(session) = load_session_summary(&conn, session_id)? else {
+        return Ok(None);
+    };
+
+    Ok(Some(SessionDetailResponse {
+        status: "ok",
+        session,
+        runs: load_session_runs(&conn, session_id)?,
+        turns: load_session_turns(&conn, session_id)?,
+        timeline: load_session_timeline(&conn, session_id)?,
+        llm_calls: load_session_llm_calls(&conn, session_id)?,
+        tool_calls: load_session_tool_calls(&conn, session_id)?,
+        skill_events: load_session_skill_events(&conn, session_id)?,
+        tool_summaries: load_session_tool_summaries(&conn, session_id)?,
+        skill_summaries: load_session_skill_summaries(&conn, session_id)?,
+        model_summaries: load_session_model_summaries(&conn, session_id)?,
+    }))
 }
 
 fn load_run_detail(db_path: &PathBuf, run_id: &str) -> Result<Option<RunDetailResponse>> {
@@ -799,17 +1217,6 @@ fn load_totals(conn: &Connection) -> Result<OverviewTotals> {
 }
 
 fn load_usage_totals(conn: &Connection, filters: &UsageFilters) -> Result<OverviewTotals> {
-    let import_source_where = filters
-        .source_condition("s")
-        .unwrap_or_else(|| "1 = 1".to_string());
-    let import_file_where = filters
-        .source_condition("s")
-        .unwrap_or_else(|| "1 = 1".to_string());
-    let source_where = filters.rollup_source_where("s");
-    let model_where = filters.rollup_model_where("m");
-    let tool_where = filters.rollup_source_where("t");
-    let tool_model_where = filters.rollup_model_where("tm");
-
     let sessions = if filters.model.is_some() {
         count_sql(
             conn,
@@ -828,6 +1235,7 @@ fn load_usage_totals(conn: &Connection, filters: &UsageFilters) -> Result<Overvi
         )?
     };
 
+    let model_where = filters.rollup_model_where("m");
     let (
         runs,
         turns,
@@ -837,173 +1245,102 @@ fn load_usage_totals(conn: &Connection, filters: &UsageFilters) -> Result<Overvi
         cache_read_tokens,
         cache_write_tokens,
         total_cost_usd,
+        tool_calls,
+        failed_tool_calls,
     ) = if filters.model.is_some() {
-        (
-            sum_i64_sql(
-                conn,
-                &format!(
-                    "SELECT COALESCE(SUM(m.runs), 0) FROM usage_model_rollups m WHERE {model_where}"
-                ),
-            )?,
-            sum_i64_sql(
-                conn,
-                &format!(
-                    "SELECT COALESCE(SUM(m.turns), 0) FROM usage_model_rollups m WHERE {model_where}"
-                ),
-            )?,
-            sum_i64_sql(
-                conn,
-                &format!(
-                    "SELECT COALESCE(SUM(m.llm_calls), 0) FROM usage_model_rollups m WHERE {model_where}"
-                ),
-            )?,
-            sum_i64_sql(
-                conn,
-                &format!(
-                    "SELECT COALESCE(SUM(m.input_tokens), 0) FROM usage_model_rollups m WHERE {model_where}"
-                ),
-            )?,
-            sum_i64_sql(
-                conn,
-                &format!(
-                    "SELECT COALESCE(SUM(m.output_tokens), 0) FROM usage_model_rollups m WHERE {model_where}"
-                ),
-            )?,
-            sum_i64_sql(
-                conn,
-                &format!(
-                    "SELECT COALESCE(SUM(m.cache_read_tokens), 0) FROM usage_model_rollups m WHERE {model_where}"
-                ),
-            )?,
-            sum_i64_sql(
-                conn,
-                &format!(
-                    "SELECT COALESCE(SUM(m.cache_write_tokens), 0) FROM usage_model_rollups m WHERE {model_where}"
-                ),
-            )?,
-            sum_model_rollup_cost_where(conn, &model_where)?,
-        )
-    } else {
-        (
-            sum_i64_sql(
-                conn,
-                &format!(
-                    "SELECT COALESCE(SUM(s.runs), 0) FROM usage_source_rollups s WHERE {source_where}"
-                ),
-            )?,
-            sum_i64_sql(
-                conn,
-                &format!(
-                    "SELECT COALESCE(SUM(s.turns), 0) FROM usage_source_rollups s WHERE {source_where}"
-                ),
-            )?,
-            sum_i64_sql(
-                conn,
-                &format!(
-                    "SELECT COALESCE(SUM(s.llm_calls), 0) FROM usage_source_rollups s WHERE {source_where}"
-                ),
-            )?,
-            sum_i64_sql(
-                conn,
-                &format!(
-                    "SELECT COALESCE(SUM(s.input_tokens), 0) FROM usage_source_rollups s WHERE {source_where}"
-                ),
-            )?,
-            sum_i64_sql(
-                conn,
-                &format!(
-                    "SELECT COALESCE(SUM(s.output_tokens), 0) FROM usage_source_rollups s WHERE {source_where}"
-                ),
-            )?,
-            sum_i64_sql(
-                conn,
-                &format!(
-                    "SELECT COALESCE(SUM(s.cache_read_tokens), 0) FROM usage_source_rollups s WHERE {source_where}"
-                ),
-            )?,
-            sum_i64_sql(
-                conn,
-                &format!(
-                    "SELECT COALESCE(SUM(s.cache_write_tokens), 0) FROM usage_source_rollups s WHERE {source_where}"
-                ),
-            )?,
-            sum_model_rollup_cost_where(conn, &filters.rollup_source_where("m"))?,
-        )
-    };
+        let usage_sql = format!(
+            "SELECT
+                COALESCE(SUM(m.runs), 0),
+                COALESCE(SUM(m.turns), 0),
+                COALESCE(SUM(m.llm_calls), 0),
+                COALESCE(SUM(m.input_tokens), 0),
+                COALESCE(SUM(m.output_tokens), 0),
+                COALESCE(SUM(m.cache_read_tokens), 0),
+                COALESCE(SUM(m.cache_write_tokens), 0),
+                COALESCE(SUM({MODEL_ROLLUP_COST_SQL}), 0)
+             FROM usage_model_rollups m
+             LEFT JOIN model_prices mp ON mp.model_name = m.model
+             WHERE {model_where}"
+        );
+        let usage = conn.query_row(&usage_sql, [], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, i64>(6)?,
+                row.get::<_, f64>(7)?,
+            ))
+        })?;
 
-    let (tool_calls, failed_tool_calls) = if filters.model.is_some() {
+        let tool_model_where = filters.rollup_model_where("tm");
+        let tool_sql = format!(
+            "SELECT
+                COALESCE(SUM(tm.calls), 0),
+                COALESCE(SUM(tm.failed_calls), 0)
+             FROM usage_tool_model_rollups tm
+             WHERE {tool_model_where}"
+        );
+        let tools = conn.query_row(&tool_sql, [], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+        })?;
+
         (
-            sum_i64_sql(
-                conn,
-                &format!(
-                    "SELECT COALESCE(SUM(tm.calls), 0) FROM usage_tool_model_rollups tm WHERE {tool_model_where}"
-                ),
-            )?,
-            sum_i64_sql(
-                conn,
-                &format!(
-                    "SELECT COALESCE(SUM(tm.failed_calls), 0) FROM usage_tool_model_rollups tm WHERE {tool_model_where}"
-                ),
-            )?,
+            usage.0, usage.1, usage.2, usage.3, usage.4, usage.5, usage.6, usage.7, tools.0,
+            tools.1,
         )
     } else {
+        let source_where = filters.rollup_source_where("s");
+        let usage_sql = format!(
+            "SELECT
+                COALESCE(SUM(s.runs), 0),
+                COALESCE(SUM(s.turns), 0),
+                COALESCE(SUM(s.llm_calls), 0),
+                COALESCE(SUM(s.input_tokens), 0),
+                COALESCE(SUM(s.output_tokens), 0),
+                COALESCE(SUM(s.cache_read_tokens), 0),
+                COALESCE(SUM(s.cache_write_tokens), 0),
+                COALESCE(SUM(s.tool_calls), 0),
+                COALESCE(SUM(s.failed_tool_calls), 0)
+             FROM usage_source_rollups s
+             WHERE {source_where}"
+        );
+        let usage = conn.query_row(&usage_sql, [], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, i64>(6)?,
+                row.get::<_, i64>(7)?,
+                row.get::<_, i64>(8)?,
+            ))
+        })?;
+
         (
-            sum_i64_sql(
-                conn,
-                &format!(
-                    "SELECT COALESCE(SUM(t.tool_calls), 0) FROM usage_source_rollups t WHERE {tool_where}"
-                ),
-            )?,
-            sum_i64_sql(
-                conn,
-                &format!(
-                    "SELECT COALESCE(SUM(t.failed_tool_calls), 0) FROM usage_source_rollups t WHERE {tool_where}"
-                ),
-            )?,
+            usage.0,
+            usage.1,
+            usage.2,
+            usage.3,
+            usage.4,
+            usage.5,
+            usage.6,
+            sum_model_rollup_cost_where(conn, &filters.rollup_source_where("m"))?,
+            usage.7,
+            usage.8,
         )
     };
 
     Ok(OverviewTotals {
-        import_sources: count_sql(
-            conn,
-            &format!("SELECT COUNT(*) FROM import_sources s WHERE {import_source_where}"),
-        )?,
-        import_files: count_sql(
-            conn,
-            &format!(
-                "SELECT COUNT(*)
-                 FROM import_files f
-                 JOIN import_sources s ON s.source_id = f.source_id
-                 WHERE {import_file_where}"
-            ),
-        )?,
-        imported_files: count_sql(
-            conn,
-            &format!(
-                "SELECT COUNT(*)
-                 FROM import_files f
-                 JOIN import_sources s ON s.source_id = f.source_id
-                 WHERE f.status = 'imported' AND {import_file_where}"
-            ),
-        )?,
-        partial_files: count_sql(
-            conn,
-            &format!(
-                "SELECT COUNT(*)
-                 FROM import_files f
-                 JOIN import_sources s ON s.source_id = f.source_id
-                 WHERE f.status = 'partial' AND {import_file_where}"
-            ),
-        )?,
-        failed_files: count_sql(
-            conn,
-            &format!(
-                "SELECT COUNT(*)
-                 FROM import_files f
-                 JOIN import_sources s ON s.source_id = f.source_id
-                 WHERE f.status = 'failed' AND {import_file_where}"
-            ),
-        )?,
+        import_sources: 0,
+        import_files: 0,
+        imported_files: 0,
+        partial_files: 0,
+        failed_files: 0,
         sessions,
         runs,
         turns,
@@ -1069,13 +1406,7 @@ fn load_source_options(conn: &Connection) -> Result<Vec<String>> {
         "WITH sources AS (
             SELECT source FROM import_sources
             UNION
-            SELECT source FROM sessions
-            UNION
-            SELECT source FROM runs
-            UNION
-            SELECT source FROM llm_calls
-            UNION
-            SELECT source FROM tool_calls
+            SELECT source FROM usage_source_rollups
          )
          SELECT source
          FROM sources
@@ -1089,7 +1420,7 @@ fn load_source_options(conn: &Connection) -> Result<Vec<String>> {
 fn load_model_options(conn: &Connection) -> Result<Vec<String>> {
     let mut statement = conn.prepare(
         "SELECT DISTINCT COALESCE(NULLIF(model, ''), 'unknown') AS model
-         FROM llm_calls
+         FROM usage_model_rollups
          ORDER BY model",
     )?;
     let rows = statement.query_map([], |row| row.get(0))?;
@@ -1100,66 +1431,104 @@ fn load_usage_buckets(
     conn: &Connection,
     filters: &UsageFilters,
 ) -> Result<Vec<UsageBucketSummary>> {
-    let bucket_limit = filters.bucket_limit();
+    let rollup_grain = filters.chart_rollup_grain();
     let sql = if filters.model.is_some() {
-        let model_where = filters.rollup_model_where("m");
-        let tool_model_where = filters.rollup_model_where("tm");
+        let model_where = filters.rollup_model_where_for("m", rollup_grain);
+        let tool_model_where = filters.rollup_model_where_for("tm", rollup_grain);
+        let model_bucket_key = filters.chart_bucket_key_expr("m", rollup_grain);
+        let tool_bucket_key = filters.chart_bucket_key_expr("tm", rollup_grain);
         format!(
-            "SELECT
-                m.bucket_key,
-                COALESCE(SUM(m.sessions), 0),
-                COALESCE(SUM(m.runs), 0),
-                COALESCE(SUM(m.turns), 0),
-                COALESCE(SUM(m.llm_calls), 0),
-                COALESCE((
-                    SELECT SUM(tm.calls)
-                    FROM usage_tool_model_rollups tm
-                    WHERE {tool_model_where} AND tm.bucket_key = m.bucket_key
-                ), 0),
-                COALESCE((
-                    SELECT SUM(tm.failed_calls)
-                    FROM usage_tool_model_rollups tm
-                    WHERE {tool_model_where} AND tm.bucket_key = m.bucket_key
-                ), 0),
-                COALESCE(SUM(m.input_tokens), 0),
-                COALESCE(SUM(m.output_tokens), 0),
-                COALESCE(SUM(m.cache_read_tokens), 0),
-                COALESCE(SUM(m.cache_write_tokens), 0),
-                COALESCE(SUM({MODEL_ROLLUP_COST_SQL}), 0)
-             FROM usage_model_rollups m
-             LEFT JOIN model_prices mp ON mp.model_name = m.model
-             WHERE {model_where}
-             GROUP BY m.bucket_key
-             ORDER BY m.bucket_key DESC
-             LIMIT {bucket_limit}"
+            "WITH model_buckets AS (
+                SELECT
+                    {model_bucket_key} AS bucket_key,
+                    COALESCE(SUM(m.sessions), 0) AS sessions,
+                    COALESCE(SUM(m.runs), 0) AS runs,
+                    COALESCE(SUM(m.turns), 0) AS turns,
+                    COALESCE(SUM(m.llm_calls), 0) AS llm_calls,
+                    COALESCE(SUM(m.input_tokens), 0) AS input_tokens,
+                    COALESCE(SUM(m.output_tokens), 0) AS output_tokens,
+                    COALESCE(SUM(m.cache_read_tokens), 0) AS cache_read_tokens,
+                    COALESCE(SUM(m.cache_write_tokens), 0) AS cache_write_tokens,
+                    COALESCE(SUM({MODEL_ROLLUP_COST_SQL}), 0) AS total_cost_usd
+                 FROM usage_model_rollups m
+                 LEFT JOIN model_prices mp ON mp.model_name = m.model
+                 WHERE {model_where}
+                 GROUP BY 1
+             ),
+             tool_buckets AS (
+                SELECT
+                    {tool_bucket_key} AS bucket_key,
+                    COALESCE(SUM(tm.calls), 0) AS tool_calls,
+                    COALESCE(SUM(tm.failed_calls), 0) AS failed_tool_calls
+                 FROM usage_tool_model_rollups tm
+                 WHERE {tool_model_where}
+                 GROUP BY 1
+             )
+             SELECT
+                mb.bucket_key,
+                mb.sessions,
+                mb.runs,
+                mb.turns,
+                mb.llm_calls,
+                COALESCE(tb.tool_calls, 0),
+                COALESCE(tb.failed_tool_calls, 0),
+                mb.input_tokens,
+                mb.output_tokens,
+                mb.cache_read_tokens,
+                mb.cache_write_tokens,
+                mb.total_cost_usd
+             FROM model_buckets mb
+             LEFT JOIN tool_buckets tb ON tb.bucket_key = mb.bucket_key
+             ORDER BY mb.bucket_key DESC"
         )
     } else {
-        let source_where = filters.rollup_source_where("s");
-        let model_where = filters.rollup_source_where("m");
+        let source_where = filters.rollup_source_where_for("s", rollup_grain);
+        let model_where = filters.rollup_source_where_for("m", rollup_grain);
+        let source_bucket_key = filters.chart_bucket_key_expr("s", rollup_grain);
+        let model_bucket_key = filters.chart_bucket_key_expr("m", rollup_grain);
         format!(
-            "SELECT
-                s.bucket_key,
-                COALESCE(SUM(s.sessions), 0),
-                COALESCE(SUM(s.runs), 0),
-                COALESCE(SUM(s.turns), 0),
-                COALESCE(SUM(s.llm_calls), 0),
-                COALESCE(SUM(s.tool_calls), 0),
-                COALESCE(SUM(s.failed_tool_calls), 0),
-                COALESCE(SUM(s.input_tokens), 0),
-                COALESCE(SUM(s.output_tokens), 0),
-                COALESCE(SUM(s.cache_read_tokens), 0),
-                COALESCE(SUM(s.cache_write_tokens), 0),
-                COALESCE((
-                    SELECT SUM({MODEL_ROLLUP_COST_SQL})
-                    FROM usage_model_rollups m
-                    LEFT JOIN model_prices mp ON mp.model_name = m.model
-                    WHERE {model_where} AND m.bucket_key = s.bucket_key
-                ), 0)
-             FROM usage_source_rollups s
-             WHERE {source_where}
-             GROUP BY s.bucket_key
-             ORDER BY s.bucket_key DESC
-             LIMIT {bucket_limit}"
+            "WITH source_buckets AS (
+                SELECT
+                    {source_bucket_key} AS bucket_key,
+                    COALESCE(SUM(s.sessions), 0) AS sessions,
+                    COALESCE(SUM(s.runs), 0) AS runs,
+                    COALESCE(SUM(s.turns), 0) AS turns,
+                    COALESCE(SUM(s.llm_calls), 0) AS llm_calls,
+                    COALESCE(SUM(s.tool_calls), 0) AS tool_calls,
+                    COALESCE(SUM(s.failed_tool_calls), 0) AS failed_tool_calls,
+                    COALESCE(SUM(s.input_tokens), 0) AS input_tokens,
+                    COALESCE(SUM(s.output_tokens), 0) AS output_tokens,
+                    COALESCE(SUM(s.cache_read_tokens), 0) AS cache_read_tokens,
+                    COALESCE(SUM(s.cache_write_tokens), 0) AS cache_write_tokens
+                 FROM usage_source_rollups s
+                 WHERE {source_where}
+                 GROUP BY 1
+             ),
+             model_costs AS (
+                SELECT
+                    {model_bucket_key} AS bucket_key,
+                    COALESCE(SUM({MODEL_ROLLUP_COST_SQL}), 0) AS total_cost_usd
+                 FROM usage_model_rollups m
+                 LEFT JOIN model_prices mp ON mp.model_name = m.model
+                 WHERE {model_where}
+                 GROUP BY 1
+             )
+             SELECT
+                sb.bucket_key,
+                sb.sessions,
+                sb.runs,
+                sb.turns,
+                sb.llm_calls,
+                sb.tool_calls,
+                sb.failed_tool_calls,
+                sb.input_tokens,
+                sb.output_tokens,
+                sb.cache_read_tokens,
+                sb.cache_write_tokens,
+                COALESCE(mc.total_cost_usd, 0)
+             FROM source_buckets sb
+             LEFT JOIN model_costs mc ON mc.bucket_key = sb.bucket_key
+             ORDER BY sb.bucket_key DESC"
         )
     };
     let mut statement = conn.prepare(&sql)?;
@@ -1169,6 +1538,7 @@ fn load_usage_buckets(
         Ok(UsageBucketSummary {
             date: bucket_key.clone(),
             bucket_key,
+            bucket_count: 1,
             sessions: row.get(1)?,
             runs: row.get(2)?,
             turns: row.get(3)?,
@@ -1184,6 +1554,70 @@ fn load_usage_buckets(
     })?;
 
     collect_rows(rows)
+}
+
+fn compact_usage_buckets(buckets: Vec<UsageBucketSummary>) -> Vec<UsageBucketSummary> {
+    if buckets.len() <= MAX_USAGE_BUCKETS {
+        return buckets;
+    }
+
+    let mut ascending = buckets;
+    ascending.reverse();
+    let group_size = ascending.len().div_ceil(MAX_USAGE_BUCKETS);
+    let mut compacted = Vec::with_capacity(ascending.len().div_ceil(group_size));
+
+    for group in ascending.chunks(group_size) {
+        compacted.push(aggregate_usage_bucket_group(group));
+    }
+
+    compacted.reverse();
+    compacted
+}
+
+fn aggregate_usage_bucket_group(group: &[UsageBucketSummary]) -> UsageBucketSummary {
+    let first = &group[0];
+    let last = &group[group.len() - 1];
+    let mut summary = UsageBucketSummary {
+        bucket_key: if group.len() == 1 {
+            first.bucket_key.clone()
+        } else {
+            format!("{}..{}", first.bucket_key, last.bucket_key)
+        },
+        date: if group.len() == 1 {
+            first.date.clone()
+        } else {
+            format!("{} - {}", first.date, last.date)
+        },
+        bucket_count: 0,
+        sessions: 0,
+        runs: 0,
+        turns: 0,
+        llm_calls: 0,
+        tool_calls: 0,
+        failed_tool_calls: 0,
+        input_tokens: 0,
+        output_tokens: 0,
+        cache_read_tokens: 0,
+        cache_write_tokens: 0,
+        total_cost_usd: 0.0,
+    };
+
+    for bucket in group {
+        summary.bucket_count += bucket.bucket_count;
+        summary.sessions += bucket.sessions;
+        summary.runs += bucket.runs;
+        summary.turns += bucket.turns;
+        summary.llm_calls += bucket.llm_calls;
+        summary.tool_calls += bucket.tool_calls;
+        summary.failed_tool_calls += bucket.failed_tool_calls;
+        summary.input_tokens += bucket.input_tokens;
+        summary.output_tokens += bucket.output_tokens;
+        summary.cache_read_tokens += bucket.cache_read_tokens;
+        summary.cache_write_tokens += bucket.cache_write_tokens;
+        summary.total_cost_usd += bucket.total_cost_usd;
+    }
+
+    summary
 }
 
 fn load_source_usage(conn: &Connection) -> Result<Vec<SourceUsageSummary>> {
@@ -1293,90 +1727,163 @@ fn load_recent_sessions_scoped(
     conn: &Connection,
     filters: &UsageFilters,
 ) -> Result<Vec<SessionSummary>> {
+    load_recent_sessions_scoped_limit(conn, filters, 20)
+}
+
+fn load_recent_sessions_scoped_limit(
+    conn: &Connection,
+    filters: &UsageFilters,
+    limit: i64,
+) -> Result<Vec<SessionSummary>> {
+    let limit = limit.clamp(1, 200);
     let session_where = filters.session_where("s");
     let runs_where = filters.run_where("r");
     let turns_where = filters.turn_where("t");
     let llm_where = filters.llm_where("l");
     let tool_where = filters.tool_where("tc");
-    let sql = format!(
-        "WITH recent AS (
-            SELECT
-                s.session_id,
-                s.source,
-                s.kind,
-                s.title,
-                s.first_seen_ns,
-                s.last_seen_ns
-            FROM sessions s
-            WHERE {session_where}
-            ORDER BY s.last_seen_ns DESC
-            LIMIT 20
-         ),
-         run_agg AS (
-            SELECT r.session_id, COUNT(*) AS runs
-            FROM runs r
-            JOIN recent rs ON rs.session_id = r.session_id
-            WHERE {runs_where}
-            GROUP BY r.session_id
-         ),
-         turn_agg AS (
-            SELECT t.session_id, COUNT(*) AS turns
-            FROM turns t
-            JOIN recent rs ON rs.session_id = t.session_id
-            WHERE {turns_where}
-            GROUP BY t.session_id
-         ),
-         llm_agg AS (
-            SELECT
-                l.session_id,
-                COUNT(*) AS llm_calls,
-                COALESCE(SUM(l.input_tokens), 0) AS input_tokens,
-                COALESCE(SUM(l.output_tokens), 0) AS output_tokens,
-                COALESCE(SUM(l.cache_read_tokens), 0) AS cache_read_tokens,
-                COALESCE(SUM(l.cache_write_tokens), 0) AS cache_write_tokens,
-                COALESCE(SUM({LLM_COST_SQL}), 0) AS total_cost_usd,
-                COALESCE(GROUP_CONCAT(DISTINCT COALESCE(NULLIF(l.model, ''), 'unknown')), '') AS models
-            FROM llm_calls l
-            JOIN recent rs ON rs.session_id = l.session_id
-            LEFT JOIN model_prices mp ON mp.model_name = l.model
-            WHERE {llm_where}
-            GROUP BY l.session_id
-         ),
-         tool_agg AS (
-            SELECT
-                tc.session_id,
-                COUNT(*) AS tool_calls,
-                COALESCE(SUM(CASE WHEN tc.status = 'failed' THEN 1 ELSE 0 END), 0) AS failed_tool_calls
-            FROM tool_calls tc
-            JOIN recent rs ON rs.session_id = tc.session_id
-            WHERE {tool_where}
-            GROUP BY tc.session_id
-         )
-         SELECT
-            recent.session_id,
-            recent.source,
-            recent.kind,
-            recent.title,
-            recent.first_seen_ns,
-            recent.last_seen_ns,
-            COALESCE(run_agg.runs, 0) AS runs,
-            COALESCE(turn_agg.turns, 0) AS turns,
-            COALESCE(llm_agg.llm_calls, 0) AS llm_calls,
-            COALESCE(tool_agg.tool_calls, 0) AS tool_calls,
-            COALESCE(tool_agg.failed_tool_calls, 0) AS failed_tool_calls,
-            COALESCE(llm_agg.input_tokens, 0) AS input_tokens,
-            COALESCE(llm_agg.output_tokens, 0) AS output_tokens,
-            COALESCE(llm_agg.cache_read_tokens, 0) AS cache_read_tokens,
-            COALESCE(llm_agg.cache_write_tokens, 0) AS cache_write_tokens,
-            COALESCE(llm_agg.total_cost_usd, 0) AS total_cost_usd,
-            COALESCE(llm_agg.models, '') AS models
-         FROM recent
-         LEFT JOIN run_agg ON run_agg.session_id = recent.session_id
-         LEFT JOIN turn_agg ON turn_agg.session_id = recent.session_id
-         LEFT JOIN llm_agg ON llm_agg.session_id = recent.session_id
-         LEFT JOIN tool_agg ON tool_agg.session_id = recent.session_id
-         ORDER BY recent.last_seen_ns DESC"
-    );
+    let sql = if filters.model.is_some() {
+        format!(
+            "WITH recent AS (
+                SELECT
+                    s.session_id,
+                    s.source,
+                    s.kind,
+                    s.title,
+                    s.first_seen_ns,
+                    s.last_seen_ns
+                FROM sessions s
+                WHERE {session_where}
+                ORDER BY s.last_seen_ns DESC
+                LIMIT {limit}
+             ),
+             run_agg AS (
+                SELECT r.session_id, COUNT(*) AS runs
+                FROM runs r
+                WHERE r.session_id IN (SELECT session_id FROM recent) AND {runs_where}
+                GROUP BY r.session_id
+             ),
+             turn_agg AS (
+                SELECT t.session_id, COUNT(*) AS turns
+                FROM turns t
+                WHERE t.session_id IN (SELECT session_id FROM recent) AND {turns_where}
+                GROUP BY t.session_id
+             ),
+             llm_agg AS (
+                SELECT
+                    l.session_id,
+                    COUNT(*) AS llm_calls,
+                    COALESCE(SUM(l.input_tokens), 0) AS input_tokens,
+                    COALESCE(SUM(l.output_tokens), 0) AS output_tokens,
+                    COALESCE(SUM(l.cache_read_tokens), 0) AS cache_read_tokens,
+                    COALESCE(SUM(l.cache_write_tokens), 0) AS cache_write_tokens,
+                    COALESCE(SUM({LLM_COST_SQL}), 0) AS total_cost_usd,
+                    COALESCE(GROUP_CONCAT(DISTINCT COALESCE(NULLIF(l.model, ''), 'unknown')), '') AS models
+                FROM llm_calls l
+                LEFT JOIN model_prices mp ON mp.model_name = l.model
+                WHERE l.session_id IN (SELECT session_id FROM recent) AND {llm_where}
+                GROUP BY l.session_id
+             ),
+             tool_agg AS (
+                SELECT
+                    tc.session_id,
+                    COUNT(*) AS tool_calls,
+                    COALESCE(SUM(CASE WHEN tc.status = 'failed' THEN 1 ELSE 0 END), 0) AS failed_tool_calls
+                FROM tool_calls tc
+                WHERE tc.session_id IN (SELECT session_id FROM recent) AND {tool_where}
+                GROUP BY tc.session_id
+             )
+             SELECT
+                recent.session_id,
+                recent.source,
+                recent.kind,
+                recent.title,
+                recent.first_seen_ns,
+                recent.last_seen_ns,
+                COALESCE(run_agg.runs, 0) AS runs,
+                COALESCE(turn_agg.turns, 0) AS turns,
+                COALESCE(llm_agg.llm_calls, 0) AS llm_calls,
+                COALESCE(tool_agg.tool_calls, 0) AS tool_calls,
+                COALESCE(tool_agg.failed_tool_calls, 0) AS failed_tool_calls,
+                COALESCE(llm_agg.input_tokens, 0) AS input_tokens,
+                COALESCE(llm_agg.output_tokens, 0) AS output_tokens,
+                COALESCE(llm_agg.cache_read_tokens, 0) AS cache_read_tokens,
+                COALESCE(llm_agg.cache_write_tokens, 0) AS cache_write_tokens,
+                COALESCE(llm_agg.total_cost_usd, 0) AS total_cost_usd,
+                COALESCE(llm_agg.models, '') AS models
+             FROM recent
+             LEFT JOIN run_agg ON run_agg.session_id = recent.session_id
+             LEFT JOIN turn_agg ON turn_agg.session_id = recent.session_id
+             LEFT JOIN llm_agg ON llm_agg.session_id = recent.session_id
+             LEFT JOIN tool_agg ON tool_agg.session_id = recent.session_id
+             ORDER BY recent.last_seen_ns DESC"
+        )
+    } else {
+        format!(
+            "WITH recent AS (
+                SELECT
+                    s.session_id,
+                    s.source,
+                    s.kind,
+                    s.title,
+                    s.first_seen_ns,
+                    s.last_seen_ns
+                FROM sessions s
+                WHERE {session_where}
+                ORDER BY s.last_seen_ns DESC
+                LIMIT {limit}
+             ),
+             run_agg AS (
+                SELECT
+                    r.session_id,
+                    COUNT(*) AS runs,
+                    COALESCE(SUM(r.llm_call_count), 0) AS llm_calls,
+                    COALESCE(SUM(r.tool_call_count), 0) AS tool_calls,
+                    COALESCE(SUM(r.failed_tool_count), 0) AS failed_tool_calls,
+                    COALESCE(SUM(r.input_tokens), 0) AS input_tokens,
+                    COALESCE(SUM(r.output_tokens), 0) AS output_tokens,
+                    COALESCE(SUM(r.cache_read_tokens), 0) AS cache_read_tokens,
+                    COALESCE(SUM(r.cache_write_tokens), 0) AS cache_write_tokens,
+                    COALESCE(SUM(r.total_cost_usd), 0) AS total_cost_usd
+                FROM runs r
+                WHERE r.session_id IN (SELECT session_id FROM recent) AND {runs_where}
+                GROUP BY r.session_id
+             ),
+             turn_agg AS (
+                SELECT t.session_id, COUNT(*) AS turns
+                FROM turns t
+                WHERE t.session_id IN (SELECT session_id FROM recent) AND {turns_where}
+                GROUP BY t.session_id
+             )
+             SELECT
+                recent.session_id,
+                recent.source,
+                recent.kind,
+                recent.title,
+                recent.first_seen_ns,
+                recent.last_seen_ns,
+                COALESCE(run_agg.runs, 0) AS runs,
+                COALESCE(turn_agg.turns, 0) AS turns,
+                COALESCE(run_agg.llm_calls, 0) AS llm_calls,
+                COALESCE(run_agg.tool_calls, 0) AS tool_calls,
+                COALESCE(run_agg.failed_tool_calls, 0) AS failed_tool_calls,
+                COALESCE(run_agg.input_tokens, 0) AS input_tokens,
+                COALESCE(run_agg.output_tokens, 0) AS output_tokens,
+                COALESCE(run_agg.cache_read_tokens, 0) AS cache_read_tokens,
+                COALESCE(run_agg.cache_write_tokens, 0) AS cache_write_tokens,
+                COALESCE(run_agg.total_cost_usd, 0) AS total_cost_usd,
+                COALESCE((
+                    SELECT COALESCE(NULLIF(l.model, ''), 'unknown')
+                    FROM llm_calls l
+                    WHERE l.session_id = recent.session_id AND {llm_where}
+                    ORDER BY l.started_at_ns DESC
+                    LIMIT 1
+                ), '') AS models
+             FROM recent
+             LEFT JOIN run_agg ON run_agg.session_id = recent.session_id
+             LEFT JOIN turn_agg ON turn_agg.session_id = recent.session_id
+             ORDER BY recent.last_seen_ns DESC"
+        )
+    };
     let mut statement = conn.prepare(&sql)?;
 
     let rows = statement.query_map([], |row| {
@@ -1403,6 +1910,222 @@ fn load_recent_sessions_scoped(
                 .filter(|model| !model.is_empty())
                 .map(str::to_string)
                 .collect(),
+        })
+    })?;
+
+    collect_rows(rows)
+}
+
+fn load_session_summary(conn: &Connection, session_id: &str) -> Result<Option<SessionSummary>> {
+    let sql = format!(
+        "WITH selected AS (
+            SELECT
+                s.session_id,
+                s.source,
+                s.kind,
+                s.title,
+                s.first_seen_ns,
+                s.last_seen_ns
+            FROM sessions s
+            WHERE s.session_id = ?1
+         ),
+         run_agg AS (
+            SELECT
+                r.session_id,
+                COUNT(*) AS runs,
+                COALESCE(SUM(r.llm_call_count), 0) AS llm_calls,
+                COALESCE(SUM(r.tool_call_count), 0) AS tool_calls,
+                COALESCE(SUM(r.failed_tool_count), 0) AS failed_tool_calls
+            FROM runs r
+            WHERE r.session_id = ?1
+            GROUP BY r.session_id
+         ),
+         turn_agg AS (
+            SELECT t.session_id, COUNT(*) AS turns
+            FROM turns t
+            WHERE t.session_id = ?1
+            GROUP BY t.session_id
+         ),
+         llm_agg AS (
+            SELECT
+                l.session_id,
+                COALESCE(SUM(l.input_tokens), 0) AS input_tokens,
+                COALESCE(SUM(l.output_tokens), 0) AS output_tokens,
+                COALESCE(SUM(l.cache_read_tokens), 0) AS cache_read_tokens,
+                COALESCE(SUM(l.cache_write_tokens), 0) AS cache_write_tokens,
+                COALESCE(SUM({LLM_COST_SQL}), 0) AS total_cost_usd,
+                COALESCE(GROUP_CONCAT(DISTINCT COALESCE(NULLIF(l.model, ''), 'unknown')), '') AS models
+            FROM llm_calls l
+            LEFT JOIN model_prices mp ON mp.model_name = l.model
+            WHERE l.session_id = ?1
+            GROUP BY l.session_id
+         )
+         SELECT
+            selected.session_id,
+            selected.source,
+            selected.kind,
+            selected.title,
+            selected.first_seen_ns,
+            selected.last_seen_ns,
+            COALESCE(run_agg.runs, 0),
+            COALESCE(turn_agg.turns, 0),
+            COALESCE(run_agg.llm_calls, 0),
+            COALESCE(run_agg.tool_calls, 0),
+            COALESCE(run_agg.failed_tool_calls, 0),
+            COALESCE(llm_agg.input_tokens, 0),
+            COALESCE(llm_agg.output_tokens, 0),
+            COALESCE(llm_agg.cache_read_tokens, 0),
+            COALESCE(llm_agg.cache_write_tokens, 0),
+            COALESCE(llm_agg.total_cost_usd, 0),
+            COALESCE(llm_agg.models, '')
+         FROM selected
+         LEFT JOIN run_agg ON run_agg.session_id = selected.session_id
+         LEFT JOIN turn_agg ON turn_agg.session_id = selected.session_id
+         LEFT JOIN llm_agg ON llm_agg.session_id = selected.session_id"
+    );
+
+    conn.query_row(&sql, params![session_id], |row| {
+        let models: String = row.get(16)?;
+        Ok(SessionSummary {
+            session_id: row.get(0)?,
+            source: row.get(1)?,
+            kind: row.get(2)?,
+            title: row.get(3)?,
+            first_seen_ns: row.get(4)?,
+            last_seen_ns: row.get(5)?,
+            runs: row.get(6)?,
+            turns: row.get(7)?,
+            llm_calls: row.get(8)?,
+            tool_calls: row.get(9)?,
+            failed_tool_calls: row.get(10)?,
+            input_tokens: row.get(11)?,
+            output_tokens: row.get(12)?,
+            cache_read_tokens: row.get(13)?,
+            cache_write_tokens: row.get(14)?,
+            total_cost_usd: row.get(15)?,
+            models: split_models(&models),
+        })
+    })
+    .optional()
+    .map_err(Into::into)
+}
+
+fn load_session_runs(conn: &Connection, session_id: &str) -> Result<Vec<RecentRun>> {
+    let sql = format!(
+        "SELECT
+            r.run_id,
+            r.source,
+            r.kind,
+            r.title,
+            r.status,
+            r.session_id,
+            r.started_at_ns,
+            r.ended_at_ns,
+            r.duration_ns,
+            r.llm_call_count,
+            r.tool_call_count,
+            r.failed_tool_count,
+            r.signal_count,
+            r.primary_signal,
+            r.input_tokens,
+            r.output_tokens,
+            r.cache_read_tokens,
+            COALESCE((
+                SELECT SUM({LLM_COST_SQL})
+                FROM llm_calls l
+                LEFT JOIN model_prices mp ON mp.model_name = l.model
+                WHERE l.run_id = r.run_id
+            ), r.total_cost_usd) AS total_cost_usd
+         FROM runs r
+         WHERE r.session_id = ?1
+         ORDER BY r.started_at_ns DESC, r.run_id
+         LIMIT 100"
+    );
+    let mut statement = conn.prepare(&sql)?;
+    let rows = statement.query_map(params![session_id], |row| {
+        Ok(RecentRun {
+            run_id: row.get(0)?,
+            source: row.get(1)?,
+            kind: row.get(2)?,
+            title: row.get(3)?,
+            status: row.get(4)?,
+            session_id: row.get(5)?,
+            started_at_ns: row.get(6)?,
+            ended_at_ns: row.get(7)?,
+            duration_ns: row.get(8)?,
+            llm_call_count: row.get(9)?,
+            tool_call_count: row.get(10)?,
+            failed_tool_count: row.get(11)?,
+            signal_count: row.get(12)?,
+            primary_signal: row.get(13)?,
+            input_tokens: row.get(14)?,
+            output_tokens: row.get(15)?,
+            cache_read_tokens: row.get(16)?,
+            total_cost_usd: row.get(17)?,
+        })
+    })?;
+
+    collect_rows(rows)
+}
+
+fn load_session_turns(conn: &Connection, session_id: &str) -> Result<Vec<TurnSummary>> {
+    let sql = format!(
+        "SELECT
+            t.turn_id,
+            t.run_id,
+            t.session_id,
+            t.source,
+            t.turn_index,
+            t.role,
+            t.status,
+            t.started_at_ns,
+            t.ended_at_ns,
+            t.duration_ns,
+            COALESCE(NULLIF(t.llm_call_count, 0), COUNT(l.llm_call_id), 0) AS llm_calls,
+            COALESCE(NULLIF(t.tool_call_count, 0), (
+                SELECT COUNT(*) FROM tool_calls tc WHERE tc.turn_id = t.turn_id
+            ), 0) AS tool_calls,
+            COALESCE(NULLIF(t.failed_tool_count, 0), (
+                SELECT COUNT(*) FROM tool_calls tc WHERE tc.turn_id = t.turn_id AND tc.status = 'failed'
+            ), 0) AS failed_tool_calls,
+            COALESCE(NULLIF(t.input_tokens, 0), COALESCE(SUM(l.input_tokens), 0)) AS input_tokens,
+            COALESCE(NULLIF(t.output_tokens, 0), COALESCE(SUM(l.output_tokens), 0)) AS output_tokens,
+            COALESCE(SUM(l.cache_read_tokens), 0) AS cache_read_tokens,
+            COALESCE(SUM({LLM_COST_SQL}), 0) AS total_cost_usd,
+            COALESCE(GROUP_CONCAT(DISTINCT COALESCE(NULLIF(l.model, ''), 'unknown')), '') AS models
+         FROM turns t
+         LEFT JOIN llm_calls l ON l.turn_id = t.turn_id
+         LEFT JOIN model_prices mp ON mp.model_name = l.model
+         WHERE t.session_id = ?1
+         GROUP BY
+            t.turn_id, t.run_id, t.session_id, t.source, t.turn_index, t.role, t.status,
+            t.started_at_ns, t.ended_at_ns, t.duration_ns, t.llm_call_count,
+            t.tool_call_count, t.failed_tool_count, t.input_tokens, t.output_tokens
+         ORDER BY COALESCE(t.turn_index, 9223372036854775807), t.started_at_ns, t.turn_id
+         LIMIT 200"
+    );
+    let mut statement = conn.prepare(&sql)?;
+    let rows = statement.query_map(params![session_id], |row| {
+        let models: String = row.get(17)?;
+        Ok(TurnSummary {
+            turn_id: row.get(0)?,
+            run_id: row.get(1)?,
+            session_id: row.get(2)?,
+            source: row.get(3)?,
+            turn_index: row.get(4)?,
+            role: row.get(5)?,
+            status: row.get(6)?,
+            started_at_ns: row.get(7)?,
+            ended_at_ns: row.get(8)?,
+            duration_ns: row.get(9)?,
+            llm_calls: row.get(10)?,
+            tool_calls: row.get(11)?,
+            failed_tool_calls: row.get(12)?,
+            input_tokens: row.get(13)?,
+            output_tokens: row.get(14)?,
+            cache_read_tokens: row.get(15)?,
+            total_cost_usd: row.get(16)?,
+            models: split_models(&models),
         })
     })?;
 
@@ -1446,9 +2169,8 @@ fn load_recent_runs_scoped(conn: &Connection, filters: &UsageFilters) -> Result<
                 COALESCE(SUM(l.cache_read_tokens), 0) AS cache_read_tokens,
                 COALESCE(SUM({LLM_COST_SQL}), 0) AS total_cost_usd
             FROM llm_calls l
-            JOIN recent rr ON rr.run_id = l.run_id
             LEFT JOIN model_prices mp ON mp.model_name = l.model
-            WHERE {llm_where}
+            WHERE l.run_id IN (SELECT run_id FROM recent) AND {llm_where}
             GROUP BY l.run_id
          ),
          tool_agg AS (
@@ -1457,8 +2179,7 @@ fn load_recent_runs_scoped(conn: &Connection, filters: &UsageFilters) -> Result<
                 COUNT(*) AS tool_call_count,
                 COALESCE(SUM(CASE WHEN tc.status = 'failed' THEN 1 ELSE 0 END), 0) AS failed_tool_count
             FROM tool_calls tc
-            JOIN recent rr ON rr.run_id = tc.run_id
-            WHERE {tool_where}
+            WHERE tc.run_id IN (SELECT run_id FROM recent) AND {tool_where}
             GROUP BY tc.run_id
          )
          SELECT
@@ -1625,6 +2346,46 @@ fn load_tool_failures_scoped(
     collect_rows(rows)
 }
 
+fn load_skill_summaries_scoped(
+    conn: &Connection,
+    filters: &UsageFilters,
+) -> Result<Vec<SkillSummary>> {
+    let skill_where = filters.skill_where("se");
+    let sql = format!(
+        "SELECT
+            se.source,
+            se.skill_name,
+            COALESCE(SUM(CASE WHEN se.event_type = 'loaded' THEN 1 ELSE 0 END), 0) AS loaded_count,
+            COALESCE(SUM(CASE WHEN se.event_type = 'invoked' THEN 1 ELSE 0 END), 0) AS invoked_count,
+            COALESCE(SUM(CASE WHEN se.event_type = 'attributed' THEN 1 ELSE 0 END), 0) AS attributed_count,
+            COUNT(DISTINCT se.session_id) AS sessions,
+            COUNT(DISTINCT se.run_id) AS runs,
+            COALESCE(MAX(se.occurred_at_ns), 0) AS last_used_at_ns,
+            COALESCE(AVG(se.confidence), 0) AS confidence
+         FROM skill_events se
+         WHERE {skill_where}
+         GROUP BY se.source, se.skill_name
+         ORDER BY runs DESC, sessions DESC, invoked_count DESC, loaded_count DESC,
+                  attributed_count DESC, last_used_at_ns DESC, se.source, se.skill_name"
+    );
+    let mut statement = conn.prepare(&sql)?;
+    let rows = statement.query_map([], |row| {
+        Ok(SkillSummary {
+            source: row.get(0)?,
+            skill_name: row.get(1)?,
+            loaded_count: row.get(2)?,
+            invoked_count: row.get(3)?,
+            attributed_count: row.get(4)?,
+            sessions: row.get(5)?,
+            runs: row.get(6)?,
+            last_used_at_ns: row.get(7)?,
+            confidence: row.get(8)?,
+        })
+    })?;
+
+    collect_rows(rows)
+}
+
 fn load_model_summaries(conn: &Connection) -> Result<Vec<ModelSummary>> {
     load_model_summaries_scoped(conn, &UsageFilters::all())
 }
@@ -1646,7 +2407,10 @@ fn load_model_summaries_scoped(
          LEFT JOIN model_prices mp ON mp.model_name = m.model
          WHERE {model_where}
          GROUP BY m.model
-         ORDER BY input_tokens + output_tokens + cache_read_tokens DESC, model
+         ORDER BY total_cost_usd DESC,
+                  COALESCE(SUM(m.input_tokens), 0) + COALESCE(SUM(m.output_tokens), 0) DESC,
+                  calls DESC,
+                  model
          LIMIT 20"
     );
     let mut statement = conn.prepare(&sql)?;
@@ -1721,29 +2485,81 @@ fn load_run(conn: &Connection, run_id: &str) -> Result<Option<RecentRun>> {
 }
 
 fn load_run_steps(conn: &Connection, run_id: &str) -> Result<Vec<RunStep>> {
-    let mut statement = conn.prepare(
-        "SELECT
-            step_id,
-            step_type,
-            name,
-            status,
-            error_type,
-            source_event_id,
-            source_ref,
-            started_at_ns,
-            ended_at_ns,
-            duration_ns,
-            order_index,
-            llm_call_id,
-            tool_call_id,
-            input_tokens,
-            output_tokens,
-            cost_usd,
-            metadata_json
-         FROM run_steps
-         WHERE run_id = ?1
-         ORDER BY COALESCE(order_index, 9223372036854775807), started_at_ns, step_id",
-    )?;
+    let sql = format!(
+        "SELECT *
+         FROM (
+            SELECT
+                step_id,
+                step_type,
+                name,
+                status,
+                error_type,
+                source_event_id,
+                source_ref,
+                started_at_ns,
+                ended_at_ns,
+                duration_ns,
+                order_index,
+                llm_call_id,
+                tool_call_id,
+                input_tokens,
+                output_tokens,
+                cost_usd,
+                metadata_json
+            FROM run_steps
+            WHERE run_id = ?1
+              AND llm_call_id IS NULL
+              AND tool_call_id IS NULL
+            UNION ALL
+            SELECT
+                l.llm_call_id AS step_id,
+                'llm' AS step_type,
+                COALESCE(NULLIF(l.model, ''), l.operation, 'llm') AS name,
+                l.status AS status,
+                l.error_type AS error_type,
+                NULL AS source_event_id,
+                NULL AS source_ref,
+                l.started_at_ns AS started_at_ns,
+                l.ended_at_ns AS ended_at_ns,
+                l.duration_ns AS duration_ns,
+                NULL AS order_index,
+                l.llm_call_id AS llm_call_id,
+                NULL AS tool_call_id,
+                l.input_tokens AS input_tokens,
+                l.output_tokens AS output_tokens,
+                {LLM_COST_SQL} AS cost_usd,
+                NULL AS metadata_json
+            FROM llm_calls l
+            LEFT JOIN model_prices mp ON mp.model_name = l.model
+            WHERE l.run_id = ?1
+            UNION ALL
+            SELECT
+                tc.tool_call_id AS step_id,
+                'tool' AS step_type,
+                tc.tool_name AS name,
+                tc.status AS status,
+                tc.error_type AS error_type,
+                NULL AS source_event_id,
+                NULL AS source_ref,
+                tc.started_at_ns AS started_at_ns,
+                tc.ended_at_ns AS ended_at_ns,
+                tc.duration_ns AS duration_ns,
+                NULL AS order_index,
+                NULL AS llm_call_id,
+                tc.tool_call_id AS tool_call_id,
+                0 AS input_tokens,
+                0 AS output_tokens,
+                0 AS cost_usd,
+                NULL AS metadata_json
+            FROM tool_calls tc
+            WHERE tc.run_id = ?1
+         )
+         ORDER BY started_at_ns,
+                  COALESCE(order_index, 9223372036854775807),
+                  step_type,
+                  step_id"
+    );
+    let mut statement = conn.prepare(&sql)?;
 
     let rows = statement.query_map(params![run_id], |row| {
         Ok(RunStep {
@@ -1919,6 +2735,354 @@ fn load_tool_calls(conn: &Connection, run_id: &str) -> Result<Vec<ToolCall>> {
     collect_rows(rows)
 }
 
+fn load_session_llm_calls(conn: &Connection, session_id: &str) -> Result<Vec<LlmCall>> {
+    let sql = format!(
+        "SELECT
+            l.llm_call_id,
+            l.provider,
+            l.model,
+            l.operation,
+            l.status,
+            l.error_type,
+            l.input_tokens,
+            l.output_tokens,
+            l.reasoning_tokens,
+            l.uncached_input_tokens,
+            l.cache_read_tokens,
+            l.cache_write_tokens,
+            l.cache_ratio,
+            l.model_context_window,
+            l.context_window_percent,
+            {LLM_COST_SQL} AS total_cost_usd,
+            l.pricing_status,
+            l.cost_confidence,
+            l.started_at_ns,
+            l.ended_at_ns,
+            l.duration_ns,
+            l.metadata_json
+         FROM llm_calls l
+         LEFT JOIN model_prices mp ON mp.model_name = l.model
+         WHERE l.session_id = ?1
+         ORDER BY l.started_at_ns, l.llm_call_id
+         LIMIT 300"
+    );
+    let mut statement = conn.prepare(&sql)?;
+
+    let rows = statement.query_map(params![session_id], |row| {
+        Ok(LlmCall {
+            llm_call_id: row.get(0)?,
+            provider: row.get(1)?,
+            model: row.get(2)?,
+            operation: row.get(3)?,
+            status: row.get(4)?,
+            error_type: row.get(5)?,
+            input_tokens: row.get(6)?,
+            output_tokens: row.get(7)?,
+            reasoning_tokens: row.get(8)?,
+            uncached_input_tokens: row.get(9)?,
+            cache_read_tokens: row.get(10)?,
+            cache_write_tokens: row.get(11)?,
+            cache_ratio: row.get(12)?,
+            model_context_window: row.get(13)?,
+            context_window_percent: row.get(14)?,
+            total_cost_usd: row.get(15)?,
+            pricing_status: row.get(16)?,
+            cost_confidence: row.get(17)?,
+            started_at_ns: row.get(18)?,
+            ended_at_ns: row.get(19)?,
+            duration_ns: row.get(20)?,
+            metadata_json: row.get(21)?,
+        })
+    })?;
+
+    collect_rows(rows)
+}
+
+fn load_session_tool_calls(conn: &Connection, session_id: &str) -> Result<Vec<ToolCall>> {
+    let mut statement = conn.prepare(
+        "SELECT
+            tool_call_id,
+            tool_name,
+            status,
+            error_type,
+            output_bytes,
+            started_at_ns,
+            ended_at_ns,
+            duration_ns,
+            metadata_json
+         FROM tool_calls
+         WHERE session_id = ?1
+         ORDER BY started_at_ns, tool_call_id
+         LIMIT 300",
+    )?;
+
+    let rows = statement.query_map(params![session_id], |row| {
+        Ok(ToolCall {
+            tool_call_id: row.get(0)?,
+            tool_name: row.get(1)?,
+            status: row.get(2)?,
+            error_type: row.get(3)?,
+            output_bytes: row.get(4)?,
+            started_at_ns: row.get(5)?,
+            ended_at_ns: row.get(6)?,
+            duration_ns: row.get(7)?,
+            metadata_json: row.get(8)?,
+        })
+    })?;
+
+    collect_rows(rows)
+}
+
+fn load_session_skill_events(conn: &Connection, session_id: &str) -> Result<Vec<SkillEventRecord>> {
+    let mut statement = conn.prepare(
+        "SELECT
+            skill_event_id,
+            source,
+            skill_name,
+            event_type,
+            confidence,
+            session_id,
+            run_id,
+            turn_id,
+            source_event_id,
+            source_ref,
+            occurred_at_ns,
+            metadata_json
+         FROM skill_events
+         WHERE session_id = ?1
+         ORDER BY occurred_at_ns, skill_name, event_type
+         LIMIT 300",
+    )?;
+
+    let rows = statement.query_map(params![session_id], |row| {
+        Ok(SkillEventRecord {
+            skill_event_id: row.get(0)?,
+            source: row.get(1)?,
+            skill_name: row.get(2)?,
+            event_type: row.get(3)?,
+            confidence: row.get(4)?,
+            session_id: row.get(5)?,
+            run_id: row.get(6)?,
+            turn_id: row.get(7)?,
+            source_event_id: row.get(8)?,
+            source_ref: row.get(9)?,
+            occurred_at_ns: row.get(10)?,
+            metadata_json: row.get(11)?,
+        })
+    })?;
+
+    collect_rows(rows)
+}
+
+fn load_session_timeline(conn: &Connection, session_id: &str) -> Result<Vec<SessionTimelineEvent>> {
+    let sql = format!(
+        "SELECT *
+         FROM (
+            SELECT *
+            FROM (
+            SELECT
+                l.llm_call_id AS event_id,
+                'llm' AS event_type,
+                l.run_id AS run_id,
+                l.turn_id AS turn_id,
+                COALESCE(NULLIF(l.model, ''), l.operation, 'llm') AS label,
+                l.status AS status,
+                l.error_type AS error_type,
+                l.started_at_ns AS started_at_ns,
+                l.ended_at_ns AS ended_at_ns,
+                l.duration_ns AS duration_ns,
+                l.input_tokens AS input_tokens,
+                l.output_tokens AS output_tokens,
+                l.cache_read_tokens AS cache_read_tokens,
+                {LLM_COST_SQL} AS total_cost_usd,
+                COALESCE(NULLIF(l.model, ''), 'unknown') AS model,
+                NULL AS tool_name,
+                NULL AS skill_name,
+                NULL AS skill_event_type
+            FROM llm_calls l
+            LEFT JOIN model_prices mp ON mp.model_name = l.model
+            WHERE l.session_id = ?1
+            UNION ALL
+            SELECT
+                tc.tool_call_id AS event_id,
+                'tool' AS event_type,
+                tc.run_id AS run_id,
+                tc.turn_id AS turn_id,
+                tc.tool_name AS label,
+                tc.status AS status,
+                tc.error_type AS error_type,
+                tc.started_at_ns AS started_at_ns,
+                tc.ended_at_ns AS ended_at_ns,
+                tc.duration_ns AS duration_ns,
+                0 AS input_tokens,
+                0 AS output_tokens,
+                0 AS cache_read_tokens,
+                0 AS total_cost_usd,
+                NULL AS model,
+                tc.tool_name AS tool_name,
+                NULL AS skill_name,
+                NULL AS skill_event_type
+            FROM tool_calls tc
+            WHERE tc.session_id = ?1
+            UNION ALL
+            SELECT
+                se.skill_event_id AS event_id,
+                'skill' AS event_type,
+                se.run_id AS run_id,
+                se.turn_id AS turn_id,
+                se.skill_name || ' ' || se.event_type AS label,
+                se.event_type AS status,
+                NULL AS error_type,
+                se.occurred_at_ns AS started_at_ns,
+                NULL AS ended_at_ns,
+                NULL AS duration_ns,
+                0 AS input_tokens,
+                0 AS output_tokens,
+                0 AS cache_read_tokens,
+                0 AS total_cost_usd,
+                NULL AS model,
+                NULL AS tool_name,
+                se.skill_name AS skill_name,
+                se.event_type AS skill_event_type
+            FROM skill_events se
+            WHERE se.session_id = ?1
+            )
+            ORDER BY started_at_ns DESC, event_type, event_id
+            LIMIT 300
+         )
+         ORDER BY started_at_ns, event_type, event_id
+         "
+    );
+    let mut statement = conn.prepare(&sql)?;
+
+    let rows = statement.query_map(params![session_id], |row| {
+        Ok(SessionTimelineEvent {
+            event_id: row.get(0)?,
+            event_type: row.get(1)?,
+            run_id: row.get(2)?,
+            turn_id: row.get(3)?,
+            label: row.get(4)?,
+            status: row.get(5)?,
+            error_type: row.get(6)?,
+            started_at_ns: row.get(7)?,
+            ended_at_ns: row.get(8)?,
+            duration_ns: row.get(9)?,
+            input_tokens: row.get(10)?,
+            output_tokens: row.get(11)?,
+            cache_read_tokens: row.get(12)?,
+            total_cost_usd: row.get(13)?,
+            model: row.get(14)?,
+            tool_name: row.get(15)?,
+            skill_name: row.get(16)?,
+            skill_event_type: row.get(17)?,
+        })
+    })?;
+
+    collect_rows(rows)
+}
+
+fn load_session_tool_summaries(conn: &Connection, session_id: &str) -> Result<Vec<ToolSummary>> {
+    let mut statement = conn.prepare(
+        "SELECT
+            tool_name,
+            COUNT(*) AS calls,
+            COALESCE(SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END), 0) AS success_calls,
+            COALESCE(SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END), 0) AS failed_calls,
+            COALESCE(MAX(started_at_ns), 0) AS last_called_at_ns
+         FROM tool_calls
+         WHERE session_id = ?1
+         GROUP BY tool_name
+         ORDER BY calls DESC, failed_calls DESC, tool_name
+         LIMIT 30",
+    )?;
+
+    let rows = statement.query_map(params![session_id], |row| {
+        let calls: i64 = row.get(1)?;
+        let failed_calls: i64 = row.get(3)?;
+        Ok(ToolSummary {
+            tool_name: row.get(0)?,
+            calls,
+            success_calls: row.get(2)?,
+            failed_calls,
+            failure_rate: ratio(failed_calls, calls),
+            last_called_at_ns: row.get(4)?,
+        })
+    })?;
+
+    collect_rows(rows)
+}
+
+fn load_session_skill_summaries(conn: &Connection, session_id: &str) -> Result<Vec<SkillSummary>> {
+    let mut statement = conn.prepare(
+        "SELECT
+            source,
+            skill_name,
+            COALESCE(SUM(CASE WHEN event_type = 'loaded' THEN 1 ELSE 0 END), 0) AS loaded_count,
+            COALESCE(SUM(CASE WHEN event_type = 'invoked' THEN 1 ELSE 0 END), 0) AS invoked_count,
+            COALESCE(SUM(CASE WHEN event_type = 'attributed' THEN 1 ELSE 0 END), 0) AS attributed_count,
+            COUNT(DISTINCT session_id) AS sessions,
+            COUNT(DISTINCT run_id) AS runs,
+            COALESCE(MAX(occurred_at_ns), 0) AS last_used_at_ns,
+            COALESCE(AVG(confidence), 0) AS confidence
+         FROM skill_events
+         WHERE session_id = ?1
+         GROUP BY source, skill_name
+         ORDER BY runs DESC, invoked_count DESC, loaded_count DESC, skill_name
+         LIMIT 30",
+    )?;
+
+    let rows = statement.query_map(params![session_id], |row| {
+        Ok(SkillSummary {
+            source: row.get(0)?,
+            skill_name: row.get(1)?,
+            loaded_count: row.get(2)?,
+            invoked_count: row.get(3)?,
+            attributed_count: row.get(4)?,
+            sessions: row.get(5)?,
+            runs: row.get(6)?,
+            last_used_at_ns: row.get(7)?,
+            confidence: row.get(8)?,
+        })
+    })?;
+
+    collect_rows(rows)
+}
+
+fn load_session_model_summaries(conn: &Connection, session_id: &str) -> Result<Vec<ModelSummary>> {
+    let sql = format!(
+        "SELECT
+            COALESCE(NULLIF(l.model, ''), 'unknown') AS model,
+            COUNT(*) AS calls,
+            COALESCE(SUM(l.input_tokens), 0) AS input_tokens,
+            COALESCE(SUM(l.output_tokens), 0) AS output_tokens,
+            COALESCE(SUM(l.cache_read_tokens), 0) AS cache_read_tokens,
+            COALESCE(SUM({LLM_COST_SQL}), 0) AS total_cost_usd
+         FROM llm_calls l
+         LEFT JOIN model_prices mp ON mp.model_name = l.model
+         WHERE l.session_id = ?1
+         GROUP BY COALESCE(NULLIF(l.model, ''), 'unknown')
+         ORDER BY total_cost_usd DESC,
+                  input_tokens + output_tokens DESC,
+                  calls DESC,
+                  model
+         LIMIT 30"
+    );
+    let mut statement = conn.prepare(&sql)?;
+
+    let rows = statement.query_map(params![session_id], |row| {
+        Ok(ModelSummary {
+            model: row.get(0)?,
+            calls: row.get(1)?,
+            input_tokens: row.get(2)?,
+            output_tokens: row.get(3)?,
+            cache_read_tokens: row.get(4)?,
+            total_cost_usd: row.get(5)?,
+        })
+    })?;
+
+    collect_rows(rows)
+}
+
 fn count(conn: &Connection, table: &str) -> Result<i64> {
     let sql = format!("SELECT COUNT(*) FROM {table}");
     Ok(conn.query_row(&sql, [], |row| row.get(0))?)
@@ -1957,10 +3121,6 @@ fn count_sql(conn: &Connection, sql: &str) -> Result<i64> {
     Ok(conn.query_row(sql, [], |row| row.get(0))?)
 }
 
-fn sum_i64_sql(conn: &Connection, sql: &str) -> Result<i64> {
-    Ok(conn.query_row(sql, [], |row| row.get(0))?)
-}
-
 fn normalize_filter_value(value: Option<String>) -> Option<String> {
     value.and_then(|value| {
         let value = value.trim();
@@ -1981,6 +3141,14 @@ fn normalize_date_value(value: Option<String>) -> Option<String> {
             None
         }
     })
+}
+
+fn split_models(models: &str) -> Vec<String> {
+    models
+        .split(',')
+        .filter(|model| !model.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 fn parse_date_parts(value: &str) -> Option<(i32, u32, u32)> {
@@ -2114,14 +3282,17 @@ mod tests {
         projection::{
             event::{
                 EntityHint, NormalizedEvent, Operation, OperationStatus, OperationType,
-                TraceContext, Usage,
+                SkillEventHint, SkillEventType, TraceContext, Usage,
             },
             projector::Projector,
         },
         rollup,
     };
 
-    use super::{UsageFilters, UsageQuery, load_overview, load_run_detail, load_usage};
+    use super::{
+        UsageFilters, UsageQuery, load_overview, load_run_detail, load_session_detail,
+        load_sessions, load_usage,
+    };
 
     #[test]
     fn overview_reads_sqlite_totals_and_recent_runs() -> Result<()> {
@@ -2175,6 +3346,7 @@ mod tests {
                 total_cost_usd: 0.01,
                 ..Usage::default()
             },
+            skill_events: Vec::new(),
             confidence: 1.0,
         };
         Projector::new(&db).project(&event)?;
@@ -2252,6 +3424,12 @@ mod tests {
                 total_cost_usd: 0.02,
                 ..Usage::default()
             },
+            skill_events: vec![SkillEventHint {
+                skill_name: "imagegen".to_string(),
+                event_type: SkillEventType::Loaded,
+                confidence: 0.75,
+                metadata: None,
+            }],
             confidence: 1.0,
         };
         Projector::new(&db).project(&event)?;
@@ -2275,6 +3453,11 @@ mod tests {
         assert_eq!(usage.buckets[0].bucket_key, "1970-01");
         assert_eq!(usage.buckets[0].input_tokens, 1000);
         assert_eq!(usage.buckets[0].output_tokens, 250);
+        assert_eq!(usage.skill_summaries.len(), 1);
+        assert_eq!(usage.skill_summaries[0].skill_name, "imagegen");
+        assert_eq!(usage.skill_summaries[0].loaded_count, 1);
+        assert_eq!(usage.skill_summaries[0].invoked_count, 0);
+        assert_eq!(usage.skill_summaries[0].confidence, 0.75);
 
         let custom = UsageFilters::from_query(UsageQuery {
             preset: Some("custom".to_string()),
@@ -2303,6 +3486,143 @@ mod tests {
             model: None,
         });
         assert_eq!(long_custom.usage_grain(), "month");
+
+        let _ = fs::remove_file(db_path);
+        Ok(())
+    }
+
+    #[test]
+    fn usage_month_sampling_keeps_range_totals_exact() -> Result<()> {
+        let db_path = temp_db_path("usage-month-range");
+        let db = Database::open(&db_path)?;
+        db.migrate()?;
+
+        let projector = Projector::new(&db);
+        projector.project(&usage_test_event("jan", epoch_day_noon_ns(14), 100, 10))?;
+        projector.project(&usage_test_event("feb", epoch_day_noon_ns(45), 200, 20))?;
+        rollup::refresh_all(&db)?;
+
+        let day_usage = load_usage(
+            &db_path,
+            UsageFilters::from_query(UsageQuery {
+                preset: Some("custom".to_string()),
+                range: None,
+                from: Some("1970-01-10".to_string()),
+                to: Some("1970-02-10".to_string()),
+                grain: Some("day".to_string()),
+                source: None,
+                model: None,
+            }),
+        )?;
+        let month_usage = load_usage(
+            &db_path,
+            UsageFilters::from_query(UsageQuery {
+                preset: Some("custom".to_string()),
+                range: None,
+                from: Some("1970-01-10".to_string()),
+                to: Some("1970-02-10".to_string()),
+                grain: Some("month".to_string()),
+                source: None,
+                model: None,
+            }),
+        )?;
+
+        assert_eq!(day_usage.summary.total_tokens, 110);
+        assert_eq!(
+            month_usage.summary.total_tokens,
+            day_usage.summary.total_tokens
+        );
+        assert_eq!(month_usage.buckets.len(), 1);
+        assert_eq!(month_usage.buckets[0].bucket_key, "1970-01");
+        assert_eq!(month_usage.buckets[0].input_tokens, 100);
+        assert_eq!(month_usage.buckets[0].output_tokens, 10);
+
+        let _ = fs::remove_file(db_path);
+        Ok(())
+    }
+
+    #[test]
+    fn sessions_api_reads_list_and_detail() -> Result<()> {
+        let db_path = temp_db_path("sessions-api");
+        let db = Database::open(&db_path)?;
+        db.migrate()?;
+
+        let mut event = usage_test_event("detail", epoch_day_noon_ns(20), 100, 20);
+        event.skill_events = vec![SkillEventHint {
+            skill_name: "cmux".to_string(),
+            event_type: SkillEventType::Loaded,
+            confidence: 0.75,
+            metadata: None,
+        }];
+        Projector::new(&db).project(&event)?;
+
+        let sessions = load_sessions(&db_path)?;
+        assert!(sessions.sessions.iter().any(|session| {
+            session.session_id == "codex:session-detail" && session.input_tokens == 100
+        }));
+
+        let detail =
+            load_session_detail(&db_path, "codex:session-detail")?.expect("session detail exists");
+        assert_eq!(detail.session.session_id, "codex:session-detail");
+        assert_eq!(detail.runs.len(), 1);
+        assert_eq!(detail.llm_calls.len(), 1);
+        assert_eq!(detail.skill_events.len(), 1);
+        assert!(
+            detail
+                .timeline
+                .iter()
+                .any(|event| event.event_type == "llm")
+        );
+        assert!(
+            detail
+                .timeline
+                .iter()
+                .any(|event| event.event_type == "skill")
+        );
+        assert_eq!(detail.model_summaries[0].model, "gpt-test");
+        assert!(load_session_detail(&db_path, "missing")?.is_none());
+
+        let _ = fs::remove_file(db_path);
+        Ok(())
+    }
+
+    #[test]
+    fn session_timeline_keeps_latest_events_when_limited() -> Result<()> {
+        let db_path = temp_db_path("session-timeline-limit");
+        let db = Database::open(&db_path)?;
+        db.migrate()?;
+
+        for index in 0..305 {
+            let mut event = usage_test_event(
+                &format!("timeline-{index}"),
+                epoch_day_noon_ns(20) + index * 1_000_000_000,
+                10,
+                1,
+            );
+            event.session = Some(EntityHint {
+                external_id: "timeline-limit".to_string(),
+                kind: "session".to_string(),
+                title: None,
+            });
+            Projector::new(&db).project(&event)?;
+        }
+
+        let detail =
+            load_session_detail(&db_path, "codex:timeline-limit")?.expect("session detail exists");
+
+        assert_eq!(detail.timeline.len(), 300);
+        assert!(
+            !detail
+                .timeline
+                .iter()
+                .any(|event| event.run_id == "codex:run-timeline-0")
+        );
+        assert!(
+            detail
+                .timeline
+                .iter()
+                .any(|event| event.run_id == "codex:run-timeline-304")
+        );
 
         let _ = fs::remove_file(db_path);
         Ok(())
@@ -2347,6 +3667,7 @@ mod tests {
                 metadata: None,
             },
             usage: Usage::default(),
+            skill_events: Vec::new(),
             confidence: 1.0,
         };
 
@@ -2381,5 +3702,58 @@ mod tests {
 
     fn temp_db_path(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("shirabe-{name}-{}.sqlite", std::process::id()))
+    }
+
+    fn epoch_day_noon_ns(day: i64) -> i64 {
+        (day * 86_400 + 12 * 3_600) * 1_000_000_000
+    }
+
+    fn usage_test_event(
+        id: &str,
+        timestamp_ns: i64,
+        input_tokens: i64,
+        output_tokens: i64,
+    ) -> NormalizedEvent {
+        NormalizedEvent {
+            source: "codex".to_string(),
+            source_kind: "session_jsonl_event".to_string(),
+            source_event_id: Some(format!("event-{id}")),
+            observed_at_ns: timestamp_ns,
+            occurred_at_ns: timestamp_ns,
+            source_ref: Some(format!("{id}.jsonl:1")),
+            cwd: None,
+            project_id: None,
+            trace: TraceContext::default(),
+            session: Some(EntityHint {
+                external_id: format!("session-{id}"),
+                kind: "session".to_string(),
+                title: None,
+            }),
+            run: EntityHint {
+                external_id: format!("run-{id}"),
+                kind: "session".to_string(),
+                title: None,
+            },
+            turn: None,
+            operation: Operation {
+                operation_type: OperationType::LlmCall,
+                name: "assistant".to_string(),
+                status: OperationStatus::Success,
+                error_type: None,
+                started_at_ns: timestamp_ns,
+                ended_at_ns: Some(timestamp_ns),
+                duration_ns: Some(0),
+                order_index: Some(0),
+                metadata: None,
+            },
+            usage: Usage {
+                model: Some("gpt-test".to_string()),
+                input_tokens,
+                output_tokens,
+                ..Usage::default()
+            },
+            skill_events: Vec::new(),
+            confidence: 1.0,
+        }
     }
 }

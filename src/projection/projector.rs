@@ -9,7 +9,7 @@ use crate::{
     projection::ids,
 };
 
-use super::event::{NormalizedEvent, OperationType};
+use super::event::{NormalizedEvent, OperationStatus, OperationType};
 
 pub struct Projector<'a> {
     conn: &'a Connection,
@@ -54,7 +54,7 @@ impl<'a> Projector<'a> {
         event: &NormalizedEvent,
         cache: &mut ProjectionCache,
     ) -> Result<ProjectionResult> {
-        self.project_inner(event, Some(cache), false, false, false, false)
+        self.project_inner(event, Some(cache), true, false, true, false)
     }
 
     fn project_inner(
@@ -108,6 +108,8 @@ impl<'a> Projector<'a> {
             self.upsert_turn(event, &run_id, session_id.as_deref(), turn_id.as_deref())?;
         }
 
+        self.upsert_skill_events(event, &run_id, session_id.as_deref(), turn_id.as_deref())?;
+
         let llm_call_id = if event.operation.operation_type == OperationType::LlmCall {
             let id = ids::event_scoped_id(
                 &event.source,
@@ -146,6 +148,9 @@ impl<'a> Projector<'a> {
                 &id,
                 store_call_metadata,
             )?;
+            if emit_signals {
+                self.upsert_tool_signals(event, &run_id, &id)?;
+            }
             Some(id)
         } else {
             None
@@ -187,6 +192,73 @@ impl<'a> Projector<'a> {
         for run_id in run_ids {
             self.refresh_run_summary(run_id)?;
         }
+        Ok(())
+    }
+
+    fn upsert_skill_events(
+        &self,
+        event: &NormalizedEvent,
+        run_id: &str,
+        session_id: Option<&str>,
+        turn_id: Option<&str>,
+    ) -> Result<()> {
+        for (index, skill_event) in event.skill_events.iter().enumerate() {
+            let source_event_id = event.source_event_id.as_deref().unwrap_or_default();
+            let identity = format!(
+                "{}:{}:{}:{}:{}",
+                run_id,
+                source_event_id,
+                skill_event.skill_name,
+                skill_event.event_type.as_str(),
+                index
+            );
+            let skill_event_id = format!("{}:skill:{}", event.source, stable_hash(&identity));
+            let metadata_json = skill_event
+                .metadata
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()?;
+
+            execute_cached(
+                self.conn,
+                "INSERT INTO skill_events (
+                    skill_event_id, source, skill_name, event_type, confidence,
+                    session_id, run_id, turn_id, source_event_id, source_ref,
+                    occurred_at_ns, occurred_day, occurred_month, metadata_json
+                 )
+                 VALUES (
+                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
+                    date(?11 / 1000000000, 'unixepoch', 'localtime'),
+                    strftime('%Y-%m', ?11 / 1000000000, 'unixepoch', 'localtime'),
+                    ?12
+                 )
+                 ON CONFLICT(skill_event_id) DO UPDATE SET
+                    confidence = excluded.confidence,
+                    session_id = COALESCE(excluded.session_id, skill_events.session_id),
+                    run_id = excluded.run_id,
+                    turn_id = COALESCE(excluded.turn_id, skill_events.turn_id),
+                    source_ref = COALESCE(excluded.source_ref, skill_events.source_ref),
+                    occurred_at_ns = excluded.occurred_at_ns,
+                    occurred_day = excluded.occurred_day,
+                    occurred_month = excluded.occurred_month,
+                    metadata_json = COALESCE(excluded.metadata_json, skill_events.metadata_json)",
+                params![
+                    skill_event_id,
+                    event.source,
+                    skill_event.skill_name,
+                    skill_event.event_type.as_str(),
+                    skill_event.confidence,
+                    session_id,
+                    run_id,
+                    turn_id,
+                    event.source_event_id,
+                    event.source_ref,
+                    event.occurred_at_ns,
+                    metadata_json
+                ],
+            )?;
+        }
+
         Ok(())
     }
 
@@ -339,6 +411,8 @@ impl<'a> Projector<'a> {
                 ?9, ?10, ?11, ?12, ?13, ?14, ?15
              )
              ON CONFLICT(turn_id) DO UPDATE SET
+                turn_index = COALESCE(excluded.turn_index, turns.turn_index),
+                role = COALESCE(excluded.role, turns.role),
                 status = COALESCE(excluded.status, turns.status),
                 started_day = CASE WHEN excluded.started_at_ns <= turns.started_at_ns THEN excluded.started_day ELSE turns.started_day END,
                 started_month = CASE WHEN excluded.started_at_ns <= turns.started_at_ns THEN excluded.started_month ELSE turns.started_month END,
@@ -397,6 +471,8 @@ impl<'a> Projector<'a> {
              )
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, 0, ?22, ?23)
              ON CONFLICT(step_id) DO UPDATE SET
+                session_id = COALESCE(excluded.session_id, run_steps.session_id),
+                turn_id = COALESCE(excluded.turn_id, run_steps.turn_id),
                 status = excluded.status,
                 error_type = COALESCE(excluded.error_type, run_steps.error_type),
                 ended_at_ns = COALESCE(excluded.ended_at_ns, run_steps.ended_at_ns),
@@ -471,6 +547,8 @@ impl<'a> Projector<'a> {
                 ?26, ?27, ?28
              )
              ON CONFLICT(llm_call_id) DO UPDATE SET
+                session_id = COALESCE(excluded.session_id, llm_calls.session_id),
+                turn_id = COALESCE(excluded.turn_id, llm_calls.turn_id),
                 provider = COALESCE(excluded.provider, llm_calls.provider),
                 model = COALESCE(excluded.model, llm_calls.model),
                 operation = COALESCE(excluded.operation, llm_calls.operation),
@@ -490,6 +568,8 @@ impl<'a> Projector<'a> {
                 cost_confidence = COALESCE(excluded.cost_confidence, llm_calls.cost_confidence),
                 started_day = excluded.started_day,
                 started_month = excluded.started_month,
+                trace_id = COALESCE(excluded.trace_id, llm_calls.trace_id),
+                span_id = COALESCE(excluded.span_id, llm_calls.span_id),
                 ended_at_ns = COALESCE(excluded.ended_at_ns, llm_calls.ended_at_ns),
                 duration_ns = COALESCE(excluded.duration_ns, llm_calls.duration_ns),
                 metadata_json = COALESCE(excluded.metadata_json, llm_calls.metadata_json)",
@@ -558,11 +638,15 @@ impl<'a> Projector<'a> {
                 ?13, ?14, ?15
              )
              ON CONFLICT(tool_call_id) DO UPDATE SET
+                session_id = COALESCE(excluded.session_id, tool_calls.session_id),
+                turn_id = COALESCE(excluded.turn_id, tool_calls.turn_id),
                 status = excluded.status,
                 error_type = COALESCE(excluded.error_type, tool_calls.error_type),
                 output_bytes = COALESCE(excluded.output_bytes, tool_calls.output_bytes),
                 started_day = excluded.started_day,
                 started_month = excluded.started_month,
+                trace_id = COALESCE(excluded.trace_id, tool_calls.trace_id),
+                span_id = COALESCE(excluded.span_id, tool_calls.span_id),
                 ended_at_ns = COALESCE(excluded.ended_at_ns, tool_calls.ended_at_ns),
                 duration_ns = COALESCE(excluded.duration_ns, tool_calls.duration_ns),
                 metadata_json = COALESCE(excluded.metadata_json, tool_calls.metadata_json)",
@@ -604,6 +688,34 @@ impl<'a> Projector<'a> {
                 cache_read_tokens = COALESCE((SELECT SUM(cache_read_tokens) FROM llm_calls WHERE run_id = ?1), 0),
                 cache_write_tokens = COALESCE((SELECT SUM(cache_write_tokens) FROM llm_calls WHERE run_id = ?1), 0),
                 total_cost_usd = COALESCE((SELECT SUM(total_cost_usd) FROM llm_calls WHERE run_id = ?1), 0)
+             WHERE run_id = ?1",
+            params![run_id],
+        )?;
+        execute_cached(
+            self.conn,
+            "WITH bounds AS (
+                SELECT
+                    MIN(started_at_ns) AS started_at_ns,
+                    MAX(COALESCE(ended_at_ns, started_at_ns)) AS ended_at_ns
+                FROM (
+                    SELECT started_at_ns, ended_at_ns FROM run_steps WHERE run_id = ?1
+                    UNION ALL
+                    SELECT started_at_ns, ended_at_ns FROM llm_calls WHERE run_id = ?1
+                    UNION ALL
+                    SELECT started_at_ns, ended_at_ns FROM tool_calls WHERE run_id = ?1
+                )
+             )
+             UPDATE runs SET
+                started_at_ns = COALESCE((SELECT started_at_ns FROM bounds), started_at_ns),
+                started_day = COALESCE(date((SELECT started_at_ns FROM bounds) / 1000000000, 'unixepoch', 'localtime'), started_day),
+                started_month = COALESCE(strftime('%Y-%m', (SELECT started_at_ns FROM bounds) / 1000000000, 'unixepoch', 'localtime'), started_month),
+                ended_at_ns = COALESCE((SELECT ended_at_ns FROM bounds), ended_at_ns),
+                duration_ns = CASE
+                    WHEN (SELECT started_at_ns FROM bounds) IS NOT NULL
+                     AND (SELECT ended_at_ns FROM bounds) IS NOT NULL
+                    THEN MAX(0, (SELECT ended_at_ns FROM bounds) - (SELECT started_at_ns FROM bounds))
+                    ELSE duration_ns
+                END
              WHERE run_id = ?1",
             params![run_id],
         )?;
@@ -740,6 +852,31 @@ impl<'a> Projector<'a> {
         }
 
         Ok(())
+    }
+
+    fn upsert_tool_signals(
+        &self,
+        event: &NormalizedEvent,
+        run_id: &str,
+        tool_call_id: &str,
+    ) -> Result<()> {
+        if event.operation.status != OperationStatus::Failed {
+            return Ok(());
+        }
+
+        self.upsert_signal(
+            run_id,
+            &event.source,
+            "tool_failure",
+            "medium",
+            "Tool call failed",
+            &json!({
+                "tool_call_id": tool_call_id,
+                "tool_name": event.operation.name,
+                "error_type": event.operation.error_type,
+            }),
+            "Review the tool input and retry pattern for this run.",
+        )
     }
 
     fn upsert_signal(
@@ -919,6 +1056,7 @@ mod tests {
                 model_context_window: Some(200000),
                 context_window_percent: Some(0.9),
             },
+            skill_events: Vec::new(),
             confidence: 1.0,
         };
 

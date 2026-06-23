@@ -1,7 +1,7 @@
-import type { Overview, RunDetail, Usage, UsageFilters } from "./types";
+import type { Overview, RunDetail, SessionDetail, SessionList, SyncStatus, Usage, UsageFilters } from "./types";
 
-async function fetchJson<T>(path: string): Promise<T> {
-  const response = await fetch(path);
+async function fetchJson<T>(path: string, init?: RequestInit): Promise<T> {
+  const response = await fetch(path, init);
   if (!response.ok) {
     throw new Error(await response.text());
   }
@@ -27,4 +27,20 @@ export function fetchUsage(filters: UsageFilters) {
 
 export function fetchRunDetail(runId: string) {
   return fetchJson<RunDetail>(`/api/runs/${encodeURIComponent(runId)}`);
+}
+
+export function fetchSessions() {
+  return fetchJson<SessionList>("/api/sessions");
+}
+
+export function fetchSessionDetail(sessionId: string) {
+  return fetchJson<SessionDetail>(`/api/sessions/${encodeURIComponent(sessionId)}`);
+}
+
+export function fetchSyncStatus() {
+  return fetchJson<SyncStatus>("/api/sync/status");
+}
+
+export function startSync() {
+  return fetchJson<SyncStatus>("/api/sync", { method: "POST" });
 }

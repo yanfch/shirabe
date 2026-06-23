@@ -18,10 +18,27 @@ use crate::projection::{
     },
     projector::{ProjectionCache, Projector},
 };
+use crate::skills;
 
 use super::{ImportReport, ImportTiming};
 
 pub fn import(db: &Database, path: Option<PathBuf>) -> Result<ImportReport> {
+    import_with_modified_since(db, path, None)
+}
+
+pub fn import_recent(
+    db: &Database,
+    path: Option<PathBuf>,
+    modified_since_ns: i64,
+) -> Result<ImportReport> {
+    import_with_modified_since(db, path, Some(modified_since_ns))
+}
+
+fn import_with_modified_since(
+    db: &Database,
+    path: Option<PathBuf>,
+    modified_since_ns: Option<i64>,
+) -> Result<ImportReport> {
     let total_started = Instant::now();
     let root_path = path.unwrap_or_else(default_codex_sessions_dir);
     let source_kind = if root_path.is_file() {
@@ -33,7 +50,7 @@ pub fn import(db: &Database, path: Option<PathBuf>) -> Result<ImportReport> {
 
     let scan_started = Instant::now();
     let tx = db.begin_batch()?;
-    let scan = scan_sessions(db, &source_id, &root_path)?;
+    let scan = scan_sessions(db, &source_id, &root_path, modified_since_ns)?;
     tx.commit()?;
     let scan_elapsed_ms = scan_started.elapsed().as_millis();
 
@@ -88,10 +105,18 @@ fn default_codex_sessions_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(".codex").join("sessions"))
 }
 
-fn scan_sessions(db: &Database, source_id: &str, root: &Path) -> Result<ScanSize> {
+fn scan_sessions(
+    db: &Database,
+    source_id: &str,
+    root: &Path,
+    modified_since_ns: Option<i64>,
+) -> Result<ScanSize> {
     if root.is_file() {
         let metadata = fs::metadata(root).with_context(|| format!("stat {}", root.display()))?;
         let modified_ns = metadata.modified().map(system_time_ns).unwrap_or_default();
+        if modified_since_ns.is_some_and(|since| modified_ns < since) {
+            return Ok(ScanSize::default());
+        }
         let prepared = db.prepare_import_file(source_id, root, metadata.len(), modified_ns)?;
         let imported = if prepared.should_import {
             import_session_file(db, &prepared.file_id, root)?
@@ -130,9 +155,12 @@ fn scan_sessions(db: &Database, source_id: &str, root: &Path) -> Result<ScanSize
         let entry = entry.with_context(|| format!("scan {}", root.display()))?;
         if entry.file_type().is_file() && is_jsonl(entry.path()) {
             let metadata = entry.metadata()?;
+            let modified_ns = metadata.modified().map(system_time_ns).unwrap_or_default();
+            if modified_since_ns.is_some_and(|since| modified_ns < since) {
+                continue;
+            }
             files_seen += 1;
             bytes = bytes.saturating_add(metadata.len());
-            let modified_ns = metadata.modified().map(system_time_ns).unwrap_or_default();
             let prepared =
                 db.prepare_import_file(source_id, entry.path(), metadata.len(), modified_ns)?;
             if !prepared.should_import {
@@ -299,8 +327,9 @@ fn parse_session_line(
                 .unwrap_or_else(|| format!("line-{line_number}"));
             let tool_name =
                 string_field(&payload, "name").unwrap_or_else(|| payload_type.to_string());
+            let skill_events = skills::codex::skill_events_from_function_call(&payload);
             state.tool_names.insert(call_id.clone(), tool_name.clone());
-            Ok(vec![state.event(
+            let mut event = state.event(
                 path,
                 line_number,
                 timestamp_ns,
@@ -310,7 +339,9 @@ fn parse_session_line(
                 OperationStatus::Running,
                 Usage::default(),
                 metadata_without_content(&payload),
-            )])
+            );
+            event.skill_events = skill_events;
+            Ok(vec![event])
         }
         "function_call_output" | "custom_tool_call_output" => {
             let call_id = string_field(&payload, "call_id")
@@ -490,6 +521,7 @@ impl SessionState {
                 metadata,
             },
             usage,
+            skill_events: Vec::new(),
             confidence: 0.9,
         }
     }
@@ -694,6 +726,7 @@ fn file_len(path: &Path) -> Result<u64> {
     }
 }
 
+#[derive(Default)]
 struct ScanSize {
     files_seen: usize,
     files_imported: usize,
@@ -758,7 +791,7 @@ mod tests {
         assert_eq!(count(&db, "sessions")?, 1);
         assert_eq!(count(&db, "runs")?, 1);
         assert_eq!(count(&db, "turns")?, 1);
-        assert_eq!(count(&db, "run_steps")?, 1);
+        assert_eq!(count(&db, "run_steps")?, 3);
         assert_eq!(count(&db, "llm_calls")?, 1);
         assert_eq!(count(&db, "tool_calls")?, 1);
 

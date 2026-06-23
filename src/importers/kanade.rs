@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     env, fs,
     io::{BufRead, BufReader},
     path::{Path, PathBuf},
@@ -13,7 +13,8 @@ use walkdir::WalkDir;
 use crate::db::{Database, now_ns, system_time_ns};
 use crate::projection::{
     event::{
-        EntityHint, NormalizedEvent, Operation, OperationStatus, OperationType, TraceContext, Usage,
+        EntityHint, NormalizedEvent, Operation, OperationStatus, OperationType, TraceContext,
+        TurnHint, Usage,
     },
     projector::{ProjectionCache, Projector},
 };
@@ -21,6 +22,22 @@ use crate::projection::{
 use super::{ImportReport, ImportTiming};
 
 pub fn import(db: &Database, path: Option<PathBuf>) -> Result<ImportReport> {
+    import_with_modified_since(db, path, None)
+}
+
+pub fn import_recent(
+    db: &Database,
+    path: Option<PathBuf>,
+    modified_since_ns: i64,
+) -> Result<ImportReport> {
+    import_with_modified_since(db, path, Some(modified_since_ns))
+}
+
+fn import_with_modified_since(
+    db: &Database,
+    path: Option<PathBuf>,
+    modified_since_ns: Option<i64>,
+) -> Result<ImportReport> {
     let total_started = Instant::now();
     let trace_path = path.unwrap_or_else(default_kanade_traces_dir);
     let source_kind = if trace_path.is_file() {
@@ -32,7 +49,7 @@ pub fn import(db: &Database, path: Option<PathBuf>) -> Result<ImportReport> {
 
     let scan_started = Instant::now();
     let tx = db.begin_batch()?;
-    let scan = scan_trace_path(db, &source_id, &trace_path)?;
+    let scan = scan_trace_path(db, &source_id, &trace_path, modified_since_ns)?;
     tx.commit()?;
     let scan_elapsed_ms = scan_started.elapsed().as_millis();
 
@@ -88,10 +105,18 @@ fn default_kanade_traces_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(".kanade").join("traces"))
 }
 
-fn scan_trace_path(db: &Database, source_id: &str, path: &Path) -> Result<ScanSize> {
+fn scan_trace_path(
+    db: &Database,
+    source_id: &str,
+    path: &Path,
+    modified_since_ns: Option<i64>,
+) -> Result<ScanSize> {
     if path.is_file() {
         let metadata = fs::metadata(path).with_context(|| format!("stat {}", path.display()))?;
         let modified_ns = metadata.modified().map(system_time_ns).unwrap_or_default();
+        if modified_since_ns.is_some_and(|since| modified_ns < since) {
+            return Ok(ScanSize::default());
+        }
         let prepared = db.prepare_import_file(source_id, path, metadata.len(), modified_ns)?;
         let imported = if prepared.should_import {
             import_trace_file(db, &prepared.file_id, path)?
@@ -131,9 +156,12 @@ fn scan_trace_path(db: &Database, source_id: &str, path: &Path) -> Result<ScanSi
         let entry = entry.with_context(|| format!("scan {}", path.display()))?;
         if entry.file_type().is_file() && is_jsonl(entry.path()) {
             let metadata = entry.metadata()?;
+            let modified_ns = metadata.modified().map(system_time_ns).unwrap_or_default();
+            if modified_since_ns.is_some_and(|since| modified_ns < since) {
+                continue;
+            }
             files_seen += 1;
             bytes = bytes.saturating_add(metadata.len());
-            let modified_ns = metadata.modified().map(system_time_ns).unwrap_or_default();
             let prepared =
                 db.prepare_import_file(source_id, entry.path(), metadata.len(), modified_ns)?;
             if !prepared.should_import {
@@ -172,6 +200,7 @@ fn import_trace_file(db: &Database, file_id: &str, path: &Path) -> Result<Import
     let mut projection_cache = ProjectionCache::default();
     let mut touched_session_ids = HashSet::new();
     let mut touched_run_ids = HashSet::new();
+    let mut turn_indexes = HashMap::<String, i64>::new();
 
     loop {
         line.clear();
@@ -186,7 +215,14 @@ fn import_trace_file(db: &Database, file_id: &str, path: &Path) -> Result<Import
         offset = offset.saturating_add(bytes_read as u64);
 
         match parse_span_line(&line, path, line_number) {
-            Ok(Some(event)) => {
+            Ok(Some(mut event)) => {
+                if let Some(turn) = event.turn.as_mut() {
+                    let index = turn_indexes
+                        .entry(event.run.external_id.clone())
+                        .and_modify(|value| *value += 1)
+                        .or_insert(1);
+                    turn.index = Some(*index);
+                }
                 let occurred_at_ns = event.occurred_at_ns;
                 let projection = projector.project_with_cache(&event, &mut projection_cache)?;
                 if let Some(session_id) = projection.session_id.as_ref() {
@@ -242,10 +278,8 @@ fn parse_span_line(line: &str, path: &Path, line_number: usize) -> Result<Option
     let started_at_ns = time_ns(value.get("startTime")).unwrap_or_default();
     let ended_at_ns = time_ns(value.get("endTime"));
     let duration_ns = ended_at_ns.map(|end| end.saturating_sub(started_at_ns));
-    let source_event_id = value
-        .get("spanId")
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned);
+    let span_id = value.get("spanId").and_then(Value::as_str);
+    let source_event_id = span_id.map(ToOwned::to_owned);
     let source_ref = Some(format!("{}:{line_number}", path.display()));
     let usage = usage_from_attributes(&attributes);
     let operation_type = operation_type(&name, &attributes, &usage);
@@ -275,10 +309,7 @@ fn parse_span_line(line: &str, path: &Path, line_number: usize) -> Result<Option
                 .get("traceId")
                 .and_then(Value::as_str)
                 .map(ToOwned::to_owned),
-            span_id: value
-                .get("spanId")
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned),
+            span_id: span_id.map(ToOwned::to_owned),
             parent_span_id: value
                 .get("parentSpanId")
                 .and_then(Value::as_str)
@@ -287,12 +318,7 @@ fn parse_span_line(line: &str, path: &Path, line_number: usize) -> Result<Option
                 .get("parentSpanId")
                 .and_then(Value::as_str)
                 .is_none()
-                .then(|| {
-                    value
-                        .get("spanId")
-                        .and_then(Value::as_str)
-                        .map(ToOwned::to_owned)
-                })
+                .then(|| span_id.map(ToOwned::to_owned))
                 .flatten(),
         },
         session: Some(EntityHint {
@@ -301,11 +327,11 @@ fn parse_span_line(line: &str, path: &Path, line_number: usize) -> Result<Option
             title: title.clone(),
         }),
         run: EntityHint {
-            external_id: task_id,
+            external_id: task_id.clone(),
             kind: "workflow_task".to_string(),
             title,
         },
-        turn: None,
+        turn: kanade_turn_hint(&task_id, &name, &attributes, span_id, line_number),
         operation: Operation {
             operation_type,
             name,
@@ -320,6 +346,7 @@ fn parse_span_line(line: &str, path: &Path, line_number: usize) -> Result<Option
             metadata: Some(Value::Object(metadata)),
         },
         usage,
+        skill_events: Vec::new(),
         confidence: 1.0,
     }))
 }
@@ -357,21 +384,102 @@ fn operation_status(status: Option<&Value>, attributes: &Map<String, Value>) -> 
 }
 
 fn usage_from_attributes(attributes: &Map<String, Value>) -> Usage {
+    let uncached_input_tokens =
+        int_attr(attributes, "gen_ai.usage.input_tokens").unwrap_or_default();
+    let output_tokens = int_attr(attributes, "gen_ai.usage.output_tokens").unwrap_or_default();
+    let cache_read_tokens =
+        int_attr(attributes, "gen_ai.usage.cache_read.input_tokens").unwrap_or_default();
+    let cache_write_tokens =
+        int_attr(attributes, "gen_ai.usage.cache_creation.input_tokens").unwrap_or_default();
+    let reported_total_tokens = int_attr(attributes, "gen_ai.usage.total_tokens");
+    let input_tokens = reported_total_tokens
+        .map(|total| total.saturating_sub(output_tokens).max(0))
+        .unwrap_or_else(|| {
+            uncached_input_tokens
+                .saturating_add(cache_read_tokens)
+                .saturating_add(cache_write_tokens)
+        });
+    let (provider, model) = normalize_kanade_model(
+        non_empty_string_attr(attributes, "kanade.agent.model")
+            .or_else(|| non_empty_string_attr(attributes, "kanade.author.model")),
+    );
+
     Usage {
-        provider: Some("kanade".to_string()),
-        model: string_attr(attributes, "kanade.agent.model")
-            .or_else(|| string_attr(attributes, "kanade.author.model")),
-        input_tokens: int_attr(attributes, "gen_ai.usage.input_tokens").unwrap_or_default(),
-        output_tokens: int_attr(attributes, "gen_ai.usage.output_tokens").unwrap_or_default(),
-        cache_read_tokens: int_attr(attributes, "gen_ai.usage.cache_read.input_tokens")
-            .unwrap_or_default(),
-        cache_write_tokens: int_attr(attributes, "gen_ai.usage.cache_creation.input_tokens")
-            .unwrap_or_default(),
+        provider,
+        model,
+        input_tokens,
+        output_tokens,
+        uncached_input_tokens,
+        cache_read_tokens,
+        cache_write_tokens,
         total_cost_usd: float_attr(attributes, "gen_ai.usage.cost_usd").unwrap_or_default(),
         pricing_status: Some("reported".to_string()),
         cost_confidence: Some("reported".to_string()),
         ..Usage::default()
     }
+}
+
+fn kanade_turn_hint(
+    task_id: &str,
+    name: &str,
+    attributes: &Map<String, Value>,
+    span_id: Option<&str>,
+    line_number: usize,
+) -> Option<TurnHint> {
+    let is_turn_span = name == "workflow.agent"
+        || name == "workflow.author"
+        || attributes.contains_key("kanade.agent.label")
+        || attributes.contains_key("kanade.author.model")
+        || attributes.contains_key("gen_ai.usage.input_tokens")
+        || attributes.contains_key("gen_ai.usage.output_tokens");
+    if !is_turn_span {
+        return None;
+    }
+
+    let external_id = span_id
+        .map(|span_id| format!("{task_id}:span:{span_id}"))
+        .unwrap_or_else(|| format!("{task_id}:line:{line_number}"));
+    let role = non_empty_string_attr(attributes, "kanade.agent.role")
+        .or_else(|| non_empty_string_attr(attributes, "kanade.agent.label"))
+        .or_else(|| (name == "workflow.author").then(|| "author".to_string()))
+        .or_else(|| (name == "workflow.agent").then(|| "agent".to_string()));
+
+    Some(TurnHint {
+        external_id,
+        index: None,
+        role,
+    })
+}
+
+fn normalize_kanade_model(raw: Option<String>) -> (Option<String>, Option<String>) {
+    let Some(raw) = raw else {
+        return (Some("kanade".to_string()), None);
+    };
+
+    if let Some((provider, model)) = raw.split_once('/') {
+        return (
+            non_empty(provider).or_else(|| Some("kanade".to_string())),
+            non_empty(model),
+        );
+    }
+
+    if let Some((provider, model)) = raw.split_once(':') {
+        return (
+            non_empty(provider).or_else(|| Some("kanade".to_string())),
+            non_empty(model),
+        );
+    }
+
+    (Some("kanade".to_string()), Some(raw))
+}
+
+fn non_empty_string_attr(attributes: &Map<String, Value>, key: &str) -> Option<String> {
+    string_attr(attributes, key).and_then(|value| non_empty(&value))
+}
+
+fn non_empty(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
 fn string_attr(attributes: &Map<String, Value>, key: &str) -> Option<String> {
@@ -429,6 +537,7 @@ fn file_len(path: &Path) -> Result<u64> {
     }
 }
 
+#[derive(Default)]
 struct ScanSize {
     files_seen: usize,
     files_imported: usize,
@@ -472,7 +581,7 @@ mod tests {
             r#"{"traceId":"trace-1","spanId":"root","name":"workflow.task","kind":1,"startTime":[100,0],"endTime":[101,0],"status":{"code":1},"attributes":{"kanade.task.id":"T-1","kanade.task.source":"test","kanade.task.status":"success"},"events":[],"resource":{"service.name":"kanade"}}"#
                 .to_string()
                 + "\n"
-                + r#"{"traceId":"trace-1","spanId":"llm-1","parentSpanId":"root","name":"workflow.agent","kind":1,"startTime":[100,100],"endTime":[100,200],"status":{"code":1},"attributes":{"kanade.task.id":"T-1","kanade.agent.label":"writer","kanade.agent.role":"author","kanade.agent.model":"test-model","gen_ai.usage.input_tokens":100,"gen_ai.usage.output_tokens":20,"gen_ai.usage.cache_read.input_tokens":10,"gen_ai.usage.cache_creation.input_tokens":5,"gen_ai.usage.cost_usd":0.001},"events":[],"resource":{"service.name":"kanade"}}"#
+                + r#"{"traceId":"trace-1","spanId":"llm-1","parentSpanId":"root","name":"workflow.agent","kind":1,"startTime":[100,100],"endTime":[100,200],"status":{"code":1},"attributes":{"kanade.task.id":"T-1","kanade.agent.label":"writer","kanade.agent.role":"author","kanade.agent.model":"xiaomi/mimo-v2.5-pro","gen_ai.usage.input_tokens":100,"gen_ai.usage.output_tokens":20,"gen_ai.usage.cache_read.input_tokens":10,"gen_ai.usage.cache_creation.input_tokens":5,"gen_ai.usage.total_tokens":135,"gen_ai.usage.cost_usd":0.001},"events":[],"resource":{"service.name":"kanade"}}"#
                 + "\n",
         )?;
 
@@ -486,8 +595,42 @@ mod tests {
         assert_eq!(count(&db, "import_files")?, 1);
         assert_eq!(count(&db, "sessions")?, 1);
         assert_eq!(count(&db, "runs")?, 1);
-        assert_eq!(count(&db, "run_steps")?, 1);
+        assert_eq!(count(&db, "turns")?, 1);
+        assert_eq!(count(&db, "run_steps")?, 2);
         assert_eq!(count(&db, "llm_calls")?, 1);
+        let turn_index = db
+            .connection()
+            .query_row("SELECT turn_index FROM turns", [], |row| {
+                row.get::<_, i64>(0)
+            })?;
+        assert_eq!(turn_index, 1);
+        let usage = db.connection().query_row(
+            "SELECT provider, model, input_tokens, uncached_input_tokens, cache_read_tokens, cache_write_tokens, turn_id FROM llm_calls",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                ))
+            },
+        )?;
+        assert_eq!(
+            usage,
+            (
+                "xiaomi".to_string(),
+                "mimo-v2.5-pro".to_string(),
+                115,
+                100,
+                10,
+                5,
+                Some("kanade:T-1:span:llm-1".to_string())
+            )
+        );
 
         let _ = fs::remove_dir_all(root);
         Ok(())
