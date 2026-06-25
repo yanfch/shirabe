@@ -31,6 +31,7 @@
   let error: string | null = null;
   let syncPoll: number | null = null;
   let refreshTimer: number | null = null;
+  let loadRequestId = 0;
   let trendHover:
     | {
         index: number;
@@ -43,13 +44,14 @@
   $: trend = [...(data?.trend ?? [])].reverse();
   $: sourceUsage = data?.source_usage ?? [];
   $: recentRuns = data?.recent_runs ?? [];
+  $: trendRange = normalizeRange(data?.range ?? range);
   $: totalTokens = summary?.total_tokens ?? 0;
   $: cacheHit = summary?.cache_hit_rate ?? null;
   $: failedRate = summary?.tool_failure_rate ?? null;
   $: hiddenSources = Math.max(sourceUsage.length - 2, 0);
   $: syncRunning = data?.sync.state === "running" || syncing;
   $: hoveredTrend = trendHover ? trend[trendHover.index] : null;
-  $: isHourlyTrend = range === "today";
+  $: isHourlyTrend = trendRange === "today";
   $: hasUsage =
     (summary?.sessions ?? 0) > 0 ||
     (summary?.runs ?? 0) > 0 ||
@@ -89,15 +91,20 @@
   }
 
   async function load(nextRange = range) {
+    const requestId = ++loadRequestId;
+    const requestedRange = normalizeRange(nextRange);
     loading = !data;
     error = null;
     try {
-      data = await fetchMenubarUsage(nextRange);
-      range = normalizeRange(data.range);
+      const nextData = await fetchMenubarUsage(requestedRange);
+      if (requestId !== loadRequestId) return;
+      data = nextData;
+      range = normalizeRange(nextData.range);
     } catch (err) {
+      if (requestId !== loadRequestId) return;
       error = err instanceof Error ? err.message : String(err);
     } finally {
-      loading = false;
+      if (requestId === loadRequestId) loading = false;
     }
   }
 
@@ -192,9 +199,9 @@
     return point.date.length > 7 ? point.date.slice(5) : point.date;
   }
 
-  function trendSubtitle() {
-    if (range === "today") return "Today (24h view)";
-    return rangeCaption(range);
+  function trendSubtitle(value: RangeOption) {
+    if (value === "today") return "Today (24h view)";
+    return value === "7d" ? "7d view" : "30d view";
   }
 
   function sourceShare(tokens: number) {
@@ -281,7 +288,7 @@
       <section class="section-frame hero-block">
         <span class="corner tl"></span><span class="corner tr"></span>
         <span class="corner bl"></span><span class="corner br"></span>
-        <div class="hero-kicker">{rangeCaption(range)}</div>
+        <div class="hero-kicker">{rangeCaption(trendRange)}</div>
         {#if isRangeEmpty}
           <div class="hero-value empty-value">No usage</div>
           <div class="hero-caption">{emptyCaption}</div>
@@ -336,7 +343,7 @@
         <span class="corner bl"></span><span class="corner br"></span>
         <div class="section-heading">
           <span>Token trend</span>
-          <em>{trendSubtitle()}</em>
+          <em>{trendSubtitle(trendRange)}</em>
         </div>
         {#if trend.length > 0}
           <div
