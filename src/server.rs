@@ -3353,7 +3353,11 @@ fn count(conn: &Connection, table: &str) -> Result<i64> {
 }
 
 fn latest_import_scan_ns(conn: &Connection) -> Result<Option<i64>> {
-    Ok(conn.query_row("SELECT MAX(last_scan_ns) FROM import_sources", [], |row| row.get(0))?)
+    Ok(
+        conn.query_row("SELECT MAX(last_scan_ns) FROM import_sources", [], |row| {
+            row.get(0)
+        })?,
+    )
 }
 
 fn count_where(conn: &Connection, table: &str, predicate: &str) -> Result<i64> {
