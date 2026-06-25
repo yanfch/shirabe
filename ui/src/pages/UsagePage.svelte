@@ -3,6 +3,7 @@
   import Database from "@lucide/svelte/icons/database";
   import MessagesSquare from "@lucide/svelte/icons/messages-square";
   import TrendingUp from "@lucide/svelte/icons/trending-up";
+  import LatencyInsightPanel from "../components/LatencyInsightPanel.svelte";
   import SortableHeader from "../components/SortableHeader.svelte";
   import TokenTrendChart from "../components/TokenTrendChart.svelte";
   import {
@@ -154,6 +155,7 @@
 
   $: summary = usage?.summary;
   $: bucketUsage = usage?.buckets ?? [];
+  $: latencyBuckets = usage?.latency_buckets ?? [];
   $: usageGrain = usage?.usage_grain ?? "day";
   $: sourceUsage = usage?.source_usage ?? [];
   $: recentSessions = usage?.recent_sessions ?? [];
@@ -316,6 +318,13 @@
     </div>
     </section>
   </section>
+
+  <LatencyInsightPanel
+    latency={usage?.latency ?? null}
+    panel={usage?.latency_panel ?? null}
+    buckets={latencyBuckets}
+    {filters}
+  />
 
   <section class="stats-grid usage-stats-grid">
     <section class="panel stats-panel skill-usage-panel">

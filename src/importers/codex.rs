@@ -249,6 +249,7 @@ fn import_session_file(
     }
 
     projector.refresh_run_summaries(touched_run_ids.iter().map(String::as_str))?;
+    db.refresh_observed_llm_latency_for_runs(touched_run_ids.iter().map(String::as_str))?;
     projector.refresh_session_summaries(touched_session_ids.iter().map(String::as_str))?;
 
     let status = if warnings > 0 { "partial" } else { "imported" };

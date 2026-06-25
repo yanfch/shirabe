@@ -19,6 +19,9 @@ export type Usage = {
   source_options: string[];
   model_options: string[];
   summary: UsageSummary;
+  latency: LatencySummary;
+  latency_panel: LatencyPanel;
+  latency_buckets: LatencyBucketSummary[];
   buckets: UsageBucketSummary[];
   source_usage: SourceUsageSummary[];
   recent_sessions: SessionSummary[];
@@ -33,6 +36,8 @@ export type MenubarUsage = {
   status: string;
   range: "today" | "7d" | "30d" | string;
   summary: UsageSummary;
+  latency: LatencySummary;
+  latency_panel: LatencyPanel;
   trend: UsageBucketSummary[];
   source_usage: SourceUsageSummary[];
   recent_runs: Run[];
@@ -139,6 +144,85 @@ export type UsageBucketSummary = {
   cache_read_tokens: number;
   cache_write_tokens: number;
   total_cost_usd: number;
+};
+
+export type LatencySummary = {
+  llm_calls: number;
+  observed_calls: number;
+  good_calls: number;
+  subsecond_calls: number;
+  outlier_calls: number;
+  missing_calls: number;
+  p50_response_delay_ns: number | null;
+  p90_response_delay_ns: number | null;
+  avg_observed_output_tps: number | null;
+  p50_observed_output_tps: number | null;
+};
+
+export type LatencyBucketSummary = {
+  bucket_key: string;
+  date: string;
+  bucket_count: number;
+  good_calls: number;
+  p50_response_delay_ns: number | null;
+  p90_response_delay_ns: number | null;
+  avg_observed_output_tps: number | null;
+  p50_observed_output_tps: number | null;
+};
+
+export type LatencyPanel = {
+  mode: "today" | "pattern" | string;
+  status: "learning" | "normal" | "slower" | "very_slow" | "pattern" | string;
+  baseline: LatencyBaseline;
+  current: LatencyCurrent | null;
+  slow_hours: LatencyHour[];
+  best_windows: LatencyWindow[];
+  slow_windows: LatencyWindow[];
+  provider_patterns: ProviderLatencyPattern[];
+};
+
+export type LatencyBaseline = {
+  p50_response_delay_ns: number | null;
+  good_calls: number;
+  active_good_hours: number;
+};
+
+export type LatencyCurrent = {
+  hour: string;
+  p50_response_delay_ns: number | null;
+  ratio_to_baseline: number | null;
+  good_calls: number;
+  slowest_provider: LatencyProviderNow | null;
+};
+
+export type LatencyProviderNow = {
+  provider: string;
+  p50_response_delay_ns: number;
+  ratio_to_baseline: number | null;
+  good_calls: number;
+};
+
+export type LatencyHour = {
+  hour: string;
+  p50_response_delay_ns: number;
+  ratio_to_baseline: number | null;
+  good_calls: number;
+  is_current: boolean;
+};
+
+export type LatencyWindow = {
+  label: string;
+  p50_response_delay_ns: number;
+  good_calls: number;
+};
+
+export type ProviderLatencyPattern = {
+  provider: string;
+  good_calls: number;
+  best_hour: string | null;
+  best_p50_response_delay_ns: number | null;
+  slow_hour: string | null;
+  slow_p50_response_delay_ns: number | null;
 };
 
 export type SourceUsageSummary = {

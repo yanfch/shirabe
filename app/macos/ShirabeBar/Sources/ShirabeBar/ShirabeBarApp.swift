@@ -12,7 +12,7 @@ private final class MenuPanel: NSPanel {
 final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate {
     private enum Layout {
         static let panelWidth: CGFloat = 348
-        static let preferredPanelHeight: CGFloat = 810
+        static let preferredPanelHeight: CGFloat = 860
         static let screenInset: CGFloat = 8
         static let panelGap: CGFloat = 8
         static let cornerRadius: CGFloat = 18

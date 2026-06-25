@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     net::SocketAddr,
     path::PathBuf,
     sync::{Arc, Mutex},
@@ -201,6 +202,9 @@ struct UsageResponse {
     source_options: Vec<String>,
     model_options: Vec<String>,
     summary: UsageSummary,
+    latency: LatencySummary,
+    latency_panel: LatencyPanel,
+    latency_buckets: Vec<LatencyBucketSummary>,
     buckets: Vec<UsageBucketSummary>,
     source_usage: Vec<SourceUsageSummary>,
     recent_sessions: Vec<SessionSummary>,
@@ -216,6 +220,8 @@ struct MenubarResponse {
     status: &'static str,
     range: String,
     summary: UsageSummary,
+    latency: LatencySummary,
+    latency_panel: LatencyPanel,
     trend: Vec<UsageBucketSummary>,
     source_usage: Vec<SourceUsageSummary>,
     recent_runs: Vec<RecentRun>,
@@ -418,6 +424,94 @@ struct UsageBucketSummary {
     cache_read_tokens: i64,
     cache_write_tokens: i64,
     total_cost_usd: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct LatencySummary {
+    llm_calls: i64,
+    observed_calls: i64,
+    good_calls: i64,
+    subsecond_calls: i64,
+    outlier_calls: i64,
+    missing_calls: i64,
+    p50_response_delay_ns: Option<i64>,
+    p90_response_delay_ns: Option<i64>,
+    avg_observed_output_tps: Option<f64>,
+    p50_observed_output_tps: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct LatencyBucketSummary {
+    bucket_key: String,
+    date: String,
+    bucket_count: i64,
+    good_calls: i64,
+    p50_response_delay_ns: Option<i64>,
+    p90_response_delay_ns: Option<i64>,
+    avg_observed_output_tps: Option<f64>,
+    p50_observed_output_tps: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct LatencyPanel {
+    mode: String,
+    status: String,
+    baseline: LatencyBaseline,
+    current: Option<LatencyCurrent>,
+    slow_hours: Vec<LatencyHour>,
+    best_windows: Vec<LatencyWindow>,
+    slow_windows: Vec<LatencyWindow>,
+    provider_patterns: Vec<ProviderLatencyPattern>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct LatencyBaseline {
+    p50_response_delay_ns: Option<i64>,
+    good_calls: i64,
+    active_good_hours: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct LatencyCurrent {
+    hour: String,
+    p50_response_delay_ns: Option<i64>,
+    ratio_to_baseline: Option<f64>,
+    good_calls: i64,
+    slowest_provider: Option<LatencyProviderNow>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct LatencyProviderNow {
+    provider: String,
+    p50_response_delay_ns: i64,
+    ratio_to_baseline: Option<f64>,
+    good_calls: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct LatencyHour {
+    hour: String,
+    p50_response_delay_ns: i64,
+    ratio_to_baseline: Option<f64>,
+    good_calls: i64,
+    is_current: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct LatencyWindow {
+    label: String,
+    p50_response_delay_ns: i64,
+    good_calls: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ProviderLatencyPattern {
+    provider: String,
+    good_calls: i64,
+    best_hour: Option<String>,
+    best_p50_response_delay_ns: Option<i64>,
+    slow_hour: Option<String>,
+    slow_p50_response_delay_ns: Option<i64>,
 }
 
 const MAX_USAGE_BUCKETS: usize = 72;
@@ -1068,6 +1162,10 @@ fn load_usage(db_path: &PathBuf, filters: UsageFilters) -> Result<UsageResponse>
         compact_usage_buckets(load_usage_buckets(&conn, &filters)?)
     };
     let summary = UsageSummary::from_totals(&totals);
+    let latency_observations = load_latency_observations(&conn, &filters)?;
+    let latency = latency_summary_from_observations(&latency_observations);
+    let latency_panel = latency_panel_from_observations(&conn, &filters, &latency_observations)?;
+    let latency_buckets = latency_buckets_from_observations(&filters, &latency_observations);
 
     Ok(UsageResponse {
         status: "ok",
@@ -1076,6 +1174,9 @@ fn load_usage(db_path: &PathBuf, filters: UsageFilters) -> Result<UsageResponse>
         source_options: load_source_options(&conn)?,
         model_options: load_model_options(&conn)?,
         summary,
+        latency,
+        latency_panel,
+        latency_buckets,
         buckets,
         source_usage: load_source_usage_scoped(&conn, &filters)?,
         recent_sessions: load_recent_sessions_scoped(&conn, &filters)?,
@@ -1097,6 +1198,9 @@ fn load_menubar(
     let range = normalize_menubar_range(query.range.as_deref());
     let filters = menubar_filters(range);
     let summary = UsageSummary::from_totals(&load_usage_totals(&conn, &filters)?);
+    let latency_observations = load_latency_observations(&conn, &filters)?;
+    let latency = latency_summary_from_observations(&latency_observations);
+    let latency_panel = latency_panel_from_observations(&conn, &filters, &latency_observations)?;
     let mut recent_runs = load_recent_runs_scoped(&conn, &filters)?;
     recent_runs.truncate(6);
     let latest_run = if recent_runs.is_empty() {
@@ -1115,6 +1219,8 @@ fn load_menubar(
         status: "ok",
         range: range.to_string(),
         summary,
+        latency,
+        latency_panel,
         trend: if range == "today" {
             load_today_hourly_usage_buckets(&conn, &filters)?
         } else {
@@ -1483,6 +1589,532 @@ fn load_usage_totals(conn: &Connection, filters: &UsageFilters) -> Result<Overvi
         cache_write_tokens,
         total_cost_usd,
     })
+}
+
+fn load_latency_observations(
+    conn: &Connection,
+    filters: &UsageFilters,
+) -> Result<Vec<LatencyObservation>> {
+    let bucket_expr = if filters.preset == "today" {
+        "printf('%02d:00', CAST(strftime('%H', l.started_at_ns / 1000000000, 'unixepoch', 'localtime') AS INTEGER))"
+    } else if filters.usage_grain() == "month" {
+        "strftime('%Y-%m', l.started_at_ns / 1000000000, 'unixepoch', 'localtime')"
+    } else {
+        "date(l.started_at_ns / 1000000000, 'unixepoch', 'localtime')"
+    };
+    let sql = format!(
+        "SELECT
+            COALESCE(NULLIF(l.provider, ''), 'unknown') AS provider,
+            CAST(strftime('%H', l.started_at_ns / 1000000000, 'unixepoch', 'localtime') AS INTEGER) AS hour,
+            {bucket_expr} AS bucket_key,
+            l.observed_response_delay_ns,
+            l.observed_output_tps,
+            l.observed_latency_quality
+         FROM llm_calls l
+         WHERE {}",
+        filters.llm_where("l")
+    );
+    let mut statement = conn.prepare(&sql)?;
+    let rows = statement.query_map([], |row| {
+        Ok(LatencyObservation {
+            provider: row.get(0)?,
+            hour: row.get::<_, i64>(1)?.clamp(0, 23) as usize,
+            bucket_key: row.get(2)?,
+            delay_ns: row.get(3)?,
+            tps: row.get(4)?,
+            quality: row.get(5)?,
+        })
+    })?;
+    collect_rows(rows)
+}
+
+fn latency_summary_from_observations(observations: &[LatencyObservation]) -> LatencySummary {
+    let mut llm_calls = 0i64;
+    let mut observed_calls = 0i64;
+    let mut good_calls = 0i64;
+    let mut subsecond_calls = 0i64;
+    let mut outlier_calls = 0i64;
+    let mut missing_calls = 0i64;
+    let mut delays = Vec::new();
+    let mut tps_values = Vec::new();
+
+    for observation in observations {
+        llm_calls += 1;
+        match observation.quality.as_deref() {
+            Some("good") => {
+                good_calls += 1;
+                observed_calls += 1;
+            }
+            Some("subsecond") => {
+                subsecond_calls += 1;
+                observed_calls += 1;
+            }
+            Some("outlier") => {
+                outlier_calls += 1;
+                observed_calls += 1;
+            }
+            Some("missing") | None => missing_calls += 1,
+            Some(_) => missing_calls += 1,
+        }
+        if let Some(delay_ns) = observation.delay_ns {
+            delays.push(delay_ns);
+        }
+        if let Some(tps) = observation.tps {
+            tps_values.push(tps);
+        }
+    }
+
+    delays.sort_unstable();
+    tps_values.sort_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal));
+
+    LatencySummary {
+        llm_calls,
+        observed_calls,
+        good_calls,
+        subsecond_calls,
+        outlier_calls,
+        missing_calls,
+        p50_response_delay_ns: percentile_i64(&delays, 0.5),
+        p90_response_delay_ns: percentile_i64(&delays, 0.9),
+        avg_observed_output_tps: mean_f64(&tps_values),
+        p50_observed_output_tps: percentile_f64(&tps_values, 0.5),
+    }
+}
+
+fn latency_buckets_from_observations(
+    filters: &UsageFilters,
+    observations: &[LatencyObservation],
+) -> Vec<LatencyBucketSummary> {
+    let mut grouped = if filters.preset == "today" {
+        (0..24)
+            .map(|hour| (hour_label(hour), LatencyBucketAccumulator::default()))
+            .collect::<HashMap<_, _>>()
+    } else {
+        HashMap::new()
+    };
+
+    for observation in observations {
+        if observation.quality.as_deref() != Some("good") {
+            continue;
+        }
+        let Some(delay_ns) = observation.delay_ns else {
+            continue;
+        };
+        let bucket_key = if filters.preset == "today" {
+            hour_label(observation.hour)
+        } else {
+            observation.bucket_key.clone()
+        };
+        grouped
+            .entry(bucket_key)
+            .or_default()
+            .push(delay_ns, observation.tps);
+    }
+
+    let mut buckets = grouped
+        .into_iter()
+        .map(|(bucket_key, accumulator)| latency_bucket_summary(bucket_key, accumulator))
+        .collect::<Vec<_>>();
+    buckets.sort_by(|left, right| right.bucket_key.cmp(&left.bucket_key));
+    buckets
+}
+
+#[derive(Default)]
+struct LatencyBucketAccumulator {
+    delays: Vec<i64>,
+    tps_values: Vec<f64>,
+}
+
+impl LatencyBucketAccumulator {
+    fn push(&mut self, delay_ns: i64, tps: Option<f64>) {
+        self.delays.push(delay_ns);
+        if let Some(tps) = tps
+            && tps.is_finite()
+        {
+            self.tps_values.push(tps);
+        }
+    }
+}
+
+fn latency_bucket_summary(
+    bucket_key: String,
+    mut accumulator: LatencyBucketAccumulator,
+) -> LatencyBucketSummary {
+    accumulator.delays.sort_unstable();
+    accumulator
+        .tps_values
+        .sort_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal));
+    let avg_tps = if accumulator.tps_values.is_empty() {
+        None
+    } else {
+        Some(accumulator.tps_values.iter().sum::<f64>() / accumulator.tps_values.len() as f64)
+    };
+
+    LatencyBucketSummary {
+        date: bucket_key.clone(),
+        bucket_key,
+        bucket_count: 1,
+        good_calls: accumulator.delays.len().min(i64::MAX as usize) as i64,
+        p50_response_delay_ns: percentile_i64(&accumulator.delays, 0.5),
+        p90_response_delay_ns: percentile_i64(&accumulator.delays, 0.9),
+        avg_observed_output_tps: avg_tps,
+        p50_observed_output_tps: percentile_f64(&accumulator.tps_values, 0.5),
+    }
+}
+
+#[derive(Debug, Clone)]
+struct LatencyObservation {
+    provider: String,
+    hour: usize,
+    bucket_key: String,
+    delay_ns: Option<i64>,
+    tps: Option<f64>,
+    quality: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct LatencySample {
+    provider: String,
+    hour: usize,
+    delay_ns: i64,
+}
+
+fn latency_panel_from_observations(
+    conn: &Connection,
+    filters: &UsageFilters,
+    observations: &[LatencyObservation],
+) -> Result<LatencyPanel> {
+    let samples = observations
+        .iter()
+        .filter_map(|observation| {
+            if observation.quality.as_deref() != Some("good") {
+                return None;
+            }
+            Some(LatencySample {
+                provider: observation.provider.clone(),
+                hour: observation.hour,
+                delay_ns: observation.delay_ns?,
+            })
+        })
+        .collect::<Vec<_>>();
+    if filters.preset == "today" {
+        load_today_latency_panel(conn, samples)
+    } else {
+        Ok(load_pattern_latency_panel(samples))
+    }
+}
+
+fn load_today_latency_panel(
+    conn: &Connection,
+    samples: Vec<LatencySample>,
+) -> Result<LatencyPanel> {
+    let current_hour = current_local_hour(conn)?;
+    let baseline = latency_baseline(&samples);
+    let baseline_p50 = baseline.p50_response_delay_ns;
+    let current_samples = samples
+        .iter()
+        .filter(|sample| sample.hour == current_hour)
+        .cloned()
+        .collect::<Vec<_>>();
+    let current_delays = current_samples
+        .iter()
+        .map(|sample| sample.delay_ns)
+        .collect::<Vec<_>>();
+    let current_p50 = percentile_i64_sorted_copy(&current_delays, 0.5);
+    let ratio_to_baseline = ratio_i64(current_p50, baseline_p50);
+
+    let status = if baseline.good_calls < 20 || baseline.active_good_hours < 3 {
+        "learning"
+    } else if current_samples.len() < 5 {
+        "normal"
+    } else {
+        latency_status(ratio_to_baseline)
+    };
+
+    let current = Some(LatencyCurrent {
+        hour: hour_label(current_hour),
+        p50_response_delay_ns: current_p50,
+        ratio_to_baseline,
+        good_calls: current_samples.len().min(i64::MAX as usize) as i64,
+        slowest_provider: slowest_provider_now(&current_samples, baseline_p50),
+    });
+
+    Ok(LatencyPanel {
+        mode: "today".to_string(),
+        status: status.to_string(),
+        baseline,
+        current,
+        slow_hours: if status == "learning" {
+            Vec::new()
+        } else {
+            slow_latency_hours(&samples, baseline_p50, current_hour)
+        },
+        best_windows: Vec::new(),
+        slow_windows: Vec::new(),
+        provider_patterns: Vec::new(),
+    })
+}
+
+fn load_pattern_latency_panel(samples: Vec<LatencySample>) -> LatencyPanel {
+    let baseline = latency_baseline(&samples);
+    let learning = baseline.good_calls < 20 || baseline.active_good_hours < 3;
+    let (best_windows, slow_windows) = if learning {
+        (Vec::new(), Vec::new())
+    } else {
+        latency_windows(&samples)
+    };
+
+    LatencyPanel {
+        mode: "pattern".to_string(),
+        status: if learning {
+            "learning".to_string()
+        } else {
+            "pattern".to_string()
+        },
+        baseline,
+        current: None,
+        slow_hours: Vec::new(),
+        best_windows,
+        slow_windows,
+        provider_patterns: provider_latency_patterns(&samples),
+    }
+}
+
+fn latency_baseline(samples: &[LatencySample]) -> LatencyBaseline {
+    let delays = samples
+        .iter()
+        .map(|sample| sample.delay_ns)
+        .collect::<Vec<_>>();
+    let mut calls_by_hour = [0usize; 24];
+    for sample in samples {
+        calls_by_hour[sample.hour] += 1;
+    }
+
+    LatencyBaseline {
+        p50_response_delay_ns: percentile_i64_sorted_copy(&delays, 0.5),
+        good_calls: samples.len().min(i64::MAX as usize) as i64,
+        active_good_hours: calls_by_hour
+            .into_iter()
+            .filter(|calls| *calls >= 5)
+            .count()
+            .min(i64::MAX as usize) as i64,
+    }
+}
+
+fn slow_latency_hours(
+    samples: &[LatencySample],
+    baseline_p50: Option<i64>,
+    current_hour: usize,
+) -> Vec<LatencyHour> {
+    let Some(baseline_p50) = baseline_p50 else {
+        return Vec::new();
+    };
+    let threshold = baseline_p50 as f64 * 1.3;
+    let mut by_hour = vec![Vec::<i64>::new(); 24];
+    for sample in samples {
+        by_hour[sample.hour].push(sample.delay_ns);
+    }
+
+    let mut hours = by_hour
+        .iter()
+        .enumerate()
+        .filter_map(|(hour, delays)| {
+            if delays.len() < 5 {
+                return None;
+            }
+            let p50 = percentile_i64_sorted_copy(delays, 0.5)?;
+            (p50 as f64 >= threshold).then(|| LatencyHour {
+                hour: hour_label(hour),
+                p50_response_delay_ns: p50,
+                ratio_to_baseline: ratio_i64(Some(p50), Some(baseline_p50)),
+                good_calls: delays.len().min(i64::MAX as usize) as i64,
+                is_current: hour == current_hour,
+            })
+        })
+        .collect::<Vec<_>>();
+    hours.sort_by(|left, right| {
+        right
+            .p50_response_delay_ns
+            .cmp(&left.p50_response_delay_ns)
+            .then(left.hour.cmp(&right.hour))
+    });
+    hours.truncate(3);
+    hours
+}
+
+fn slowest_provider_now(
+    samples: &[LatencySample],
+    baseline_p50: Option<i64>,
+) -> Option<LatencyProviderNow> {
+    let mut by_provider = HashMap::<String, Vec<i64>>::new();
+    for sample in samples {
+        by_provider
+            .entry(sample.provider.clone())
+            .or_default()
+            .push(sample.delay_ns);
+    }
+
+    by_provider
+        .into_iter()
+        .filter_map(|(provider, delays)| {
+            let p50 = percentile_i64_sorted_copy(&delays, 0.5)?;
+            Some(LatencyProviderNow {
+                provider,
+                p50_response_delay_ns: p50,
+                ratio_to_baseline: ratio_i64(Some(p50), baseline_p50),
+                good_calls: delays.len().min(i64::MAX as usize) as i64,
+            })
+        })
+        .max_by(|left, right| {
+            left.p50_response_delay_ns
+                .cmp(&right.p50_response_delay_ns)
+                .then(left.good_calls.cmp(&right.good_calls))
+        })
+}
+
+fn latency_windows(samples: &[LatencySample]) -> (Vec<LatencyWindow>, Vec<LatencyWindow>) {
+    let mut by_hour = vec![Vec::<i64>::new(); 24];
+    for sample in samples {
+        by_hour[sample.hour].push(sample.delay_ns);
+    }
+
+    let mut windows = Vec::new();
+    for hour in 0..23 {
+        let mut delays = by_hour[hour].clone();
+        delays.extend_from_slice(&by_hour[hour + 1]);
+        if delays.len() < 10 {
+            continue;
+        }
+        if let Some(p50) = percentile_i64_sorted_copy(&delays, 0.5) {
+            windows.push(LatencyWindow {
+                label: format!("{:02}-{:02}", hour, hour + 2),
+                p50_response_delay_ns: p50,
+                good_calls: delays.len().min(i64::MAX as usize) as i64,
+            });
+        }
+    }
+
+    let mut best = windows.clone();
+    best.sort_by(|left, right| {
+        left.p50_response_delay_ns
+            .cmp(&right.p50_response_delay_ns)
+            .then(right.good_calls.cmp(&left.good_calls))
+    });
+    best.truncate(2);
+
+    let mut slow = windows;
+    slow.sort_by(|left, right| {
+        right
+            .p50_response_delay_ns
+            .cmp(&left.p50_response_delay_ns)
+            .then(right.good_calls.cmp(&left.good_calls))
+    });
+    slow.truncate(2);
+
+    (best, slow)
+}
+
+fn provider_latency_patterns(samples: &[LatencySample]) -> Vec<ProviderLatencyPattern> {
+    let mut by_provider = HashMap::<String, Vec<&LatencySample>>::new();
+    for sample in samples {
+        by_provider
+            .entry(sample.provider.clone())
+            .or_default()
+            .push(sample);
+    }
+
+    let mut providers = by_provider.into_iter().collect::<Vec<_>>();
+    providers.sort_by(|left, right| right.1.len().cmp(&left.1.len()).then(left.0.cmp(&right.0)));
+    providers.truncate(2);
+
+    providers
+        .into_iter()
+        .map(|(provider, provider_samples)| {
+            let mut by_hour = vec![Vec::<i64>::new(); 24];
+            for sample in &provider_samples {
+                by_hour[sample.hour].push(sample.delay_ns);
+            }
+            let mut hour_stats = by_hour
+                .iter()
+                .enumerate()
+                .filter_map(|(hour, delays)| {
+                    if delays.len() < 3 {
+                        return None;
+                    }
+                    Some((hour, percentile_i64_sorted_copy(delays, 0.5)?))
+                })
+                .collect::<Vec<_>>();
+            hour_stats.sort_by(|left, right| left.1.cmp(&right.1));
+            let best = hour_stats.first().copied();
+            let slow = hour_stats.last().copied();
+
+            ProviderLatencyPattern {
+                provider,
+                good_calls: provider_samples.len().min(i64::MAX as usize) as i64,
+                best_hour: best.map(|(hour, _)| hour_label(hour)),
+                best_p50_response_delay_ns: best.map(|(_, p50)| p50),
+                slow_hour: slow.map(|(hour, _)| hour_label(hour)),
+                slow_p50_response_delay_ns: slow.map(|(_, p50)| p50),
+            }
+        })
+        .collect()
+}
+
+fn current_local_hour(conn: &Connection) -> Result<usize> {
+    let hour: i64 = conn.query_row(
+        "SELECT CAST(strftime('%H', 'now', 'localtime') AS INTEGER)",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(hour.clamp(0, 23) as usize)
+}
+
+fn hour_label(hour: usize) -> String {
+    format!("{:02}:00", hour.min(23))
+}
+
+fn latency_status(ratio: Option<f64>) -> &'static str {
+    match ratio {
+        Some(ratio) if ratio >= 2.0 => "very_slow",
+        Some(ratio) if ratio >= 1.3 => "slower",
+        Some(_) => "normal",
+        None => "learning",
+    }
+}
+
+fn ratio_i64(value: Option<i64>, baseline: Option<i64>) -> Option<f64> {
+    let value = value?;
+    let baseline = baseline?;
+    (baseline > 0).then(|| value as f64 / baseline as f64)
+}
+
+fn percentile_i64_sorted_copy(values: &[i64], percentile: f64) -> Option<i64> {
+    if values.is_empty() {
+        return None;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_unstable();
+    percentile_i64(&sorted, percentile)
+}
+
+fn percentile_i64(values: &[i64], percentile: f64) -> Option<i64> {
+    percentile_index(values.len(), percentile).map(|index| values[index])
+}
+
+fn percentile_f64(values: &[f64], percentile: f64) -> Option<f64> {
+    percentile_index(values.len(), percentile).map(|index| values[index])
+}
+
+fn percentile_index(len: usize, percentile: f64) -> Option<usize> {
+    if len == 0 {
+        return None;
+    }
+    let clamped = percentile.clamp(0.0, 1.0);
+    Some(((len - 1) as f64 * clamped).round() as usize)
+}
+
+fn mean_f64(values: &[f64]) -> Option<f64> {
+    (!values.is_empty()).then(|| values.iter().sum::<f64>() / values.len() as f64)
 }
 
 fn load_import_summaries(conn: &Connection) -> Result<Vec<ImportSourceSummary>> {

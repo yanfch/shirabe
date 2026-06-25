@@ -7,11 +7,10 @@
     cacheRate,
     fmtCompact,
     fmtCost,
-    fmtPercent,
     fmtTime,
-    shortId,
+    fmtPercent,
   } from "../lib/format";
-  import type { MenubarUsage, UsageBucketSummary } from "../lib/types";
+  import type { MenubarUsage, ProviderLatencyPattern, UsageBucketSummary } from "../lib/types";
 
   type RangeOption = "today" | "7d" | "30d";
 
@@ -43,11 +42,10 @@
   $: summary = data?.summary;
   $: trend = [...(data?.trend ?? [])].reverse();
   $: sourceUsage = data?.source_usage ?? [];
-  $: recentRuns = data?.recent_runs ?? [];
+  $: latencyPanel = data?.latency_panel ?? null;
   $: trendRange = normalizeRange(data?.range ?? range);
   $: totalTokens = summary?.total_tokens ?? 0;
   $: cacheHit = summary?.cache_hit_rate ?? null;
-  $: failedRate = summary?.tool_failure_rate ?? null;
   $: hiddenSources = Math.max(sourceUsage.length - 2, 0);
   $: syncRunning = data?.sync.state === "running" || syncing;
   $: hoveredTrend = trendHover ? trend[trendHover.index] : null;
@@ -67,6 +65,11 @@
   $: emptyCaption = latestRun
     ? `Last active ${fmtTime(latestRun.started_at_ns)} · ${latestRun.source}`
     : "No local runs in this range.";
+  $: latencyStatus = latencyPanel ? latencyStatusLabel(latencyPanel.status, trendRange) : "-";
+  $: latencyCurrent = latencyPanel?.current ?? null;
+  $: latencyBaseline = latencyPanel?.baseline ?? null;
+  $: latencySlowestProvider = latencyCurrent?.slowest_provider ?? null;
+  $: latencyProviderDrag = providerDrag(latencyPanel?.provider_patterns ?? []);
 
   function normalizeRange(value: string | null): RangeOption {
     return value === "7d" || value === "30d" ? value : "today";
@@ -157,10 +160,6 @@
     window.location.href = "/?page=usage";
   }
 
-  function openRun(runId: string) {
-    window.location.href = `/?run=${encodeURIComponent(runId)}`;
-  }
-
   function totalFor(point: UsageBucketSummary) {
     return point.input_tokens + point.output_tokens;
   }
@@ -231,6 +230,63 @@
     if (value == null) return "-";
     if (Math.abs(value) >= 1000) return `$${fmtCompact(value)}`;
     return fmtCost(value);
+  }
+
+  function fmtLatency(value: number | null | undefined) {
+    if (value == null) return "-";
+    if (value < 1_000_000_000) return "<1s";
+    const seconds = value / 1_000_000_000;
+    if (seconds < 100) return `${seconds.toFixed(1)}s`;
+    const minutes = Math.floor(seconds / 60);
+    const remaining = Math.round(seconds % 60);
+    return remaining > 0 ? `${minutes}m ${remaining}s` : `${minutes}m`;
+  }
+
+  function fmtLatencyRatio(value: number | null | undefined) {
+    if (value == null || !Number.isFinite(value)) return "-";
+    const percent = Math.round((value - 1) * 100);
+    return `${percent >= 0 ? "+" : ""}${percent}%`;
+  }
+
+  function hourNumber(value: string | null | undefined) {
+    if (!value) return null;
+    const hour = Number.parseInt(value.slice(0, 2), 10);
+    return Number.isFinite(hour) ? hour : null;
+  }
+
+  function fmtHourLabel(value: string | null | undefined) {
+    const hour = hourNumber(value);
+    if (hour == null) return "--";
+    const period = hour >= 12 ? "PM" : "AM";
+    const hour12 = hour % 12 || 12;
+    return `${hour12}${period}`;
+  }
+
+  function fmtWindowLabel(value: string | null | undefined) {
+    if (!value) return "-";
+    const [startRaw, endRaw] = value.split("-");
+    const start = Number.parseInt(startRaw, 10);
+    const end = Number.parseInt(endRaw, 10);
+    if (!Number.isFinite(start) || !Number.isFinite(end)) return value;
+
+    const startPeriod = start >= 12 ? "PM" : "AM";
+    const endPeriod = end % 24 >= 12 ? "PM" : "AM";
+    const start12 = start % 12 || 12;
+    const end12 = end % 12 || 12;
+    if (startPeriod === endPeriod) return `${start12}-${end12}${endPeriod}`;
+    return `${start12}${startPeriod}-${end12}${endPeriod}`;
+  }
+
+  function latencyStatusLabel(status: string, currentRange: RangeOption) {
+    if (status === "pattern") return currentRange === "7d" ? "7D PATTERN" : "30D PATTERN";
+    if (status === "very_slow") return "VERY SLOW";
+    return status.toUpperCase().replaceAll("_", " ");
+  }
+
+  function providerDrag(patterns: ProviderLatencyPattern[]) {
+    return [...patterns]
+      .filter((pattern) => pattern.slow_p50_response_delay_ns != null)
+      .sort((left, right) => (right.slow_p50_response_delay_ns ?? 0) - (left.slow_p50_response_delay_ns ?? 0))[0] ?? null;
   }
 
   onMount(() => {
@@ -436,33 +492,98 @@
         </div>
       </section>
 
-      <section class="section-frame recent-block">
+      <section class="section-frame recent-block latency-block">
         <span class="corner tl"></span><span class="corner tr"></span>
         <span class="corner bl"></span><span class="corner br"></span>
         <div class="section-heading">
-          <span>Recent runs</span>
-          <em>{fmtPercent(failedRate)} failed tools</em>
+          <span>AI Latency</span>
+          <em class:attention={latencyPanel?.status === "slower" || latencyPanel?.status === "very_slow"}>{latencyStatus}</em>
         </div>
-        <div class="mini-table recent-list">
-          <div class="mini-table-head recent-row">
-            <span>Run</span>
-            <span>Usage</span>
+
+        {#if !latencyPanel}
+          <div class="latency-empty">
+            <strong>-</strong>
+            <span>Latency data unavailable</span>
+            <em>Refresh backend</em>
           </div>
-          {#each recentRuns.slice(0, 2) as run}
-            <button type="button" class="recent-row" on:click={() => openRun(run.run_id)}>
-              <div>
-                <strong>{shortId(run.run_id)}</strong>
-                <span>{run.source} / {run.status}</span>
+        {:else if latencyPanel.status === "learning"}
+          <div class="latency-empty">
+            <strong>{fmtLatency(latencyBaseline?.p50_response_delay_ns)}</strong>
+            <span>{latencyBaseline?.good_calls ?? 0} calls observed</span>
+            <em>Need more samples</em>
+          </div>
+        {:else if latencyPanel.mode === "today"}
+          <div class="latency-grid">
+            <div>
+              <strong>{fmtLatency(latencyCurrent?.p50_response_delay_ns ?? latencyBaseline?.p50_response_delay_ns)}</strong>
+              <span>{(latencyCurrent?.good_calls ?? 0) >= 5 ? "p50 response" : "today p50"}</span>
+            </div>
+            <div>
+              <strong class:attention={(latencyCurrent?.ratio_to_baseline ?? 0) >= 1.3}>
+                {fmtLatencyRatio(latencyCurrent?.ratio_to_baseline)}
+              </strong>
+              <span>{(latencyCurrent?.good_calls ?? 0) >= 5 ? "vs today" : "no calls this hour"}</span>
+            </div>
+          </div>
+          <div class="latency-provider">
+            <span>Slowest now</span>
+            {#if latencySlowestProvider}
+              <strong>{latencySlowestProvider.provider} {fmtLatency(latencySlowestProvider.p50_response_delay_ns)}</strong>
+            {:else}
+              <strong>No calls this hour</strong>
+            {/if}
+          </div>
+          <div class="latency-list">
+            <div class="latency-list-label">Slow hours</div>
+            {#each latencyPanel.slow_hours.slice(0, 3) as hour}
+              <div class:current={hour.is_current}>
+                <span>{fmtHourLabel(hour.hour)}</span>
+                <strong>{fmtLatency(hour.p50_response_delay_ns)}</strong>
+                <em style={`--latency-fill: ${Math.min(1, (hour.ratio_to_baseline ?? 1) / 3).toFixed(2)}`}></em>
               </div>
+            {:else}
+              <div class="latency-muted">Stable today · no slow spikes</div>
+            {/each}
+          </div>
+        {:else}
+          <div class="latency-pattern">
+            <div>
+              <span>Best window</span>
+              {#if latencyPanel.best_windows[0]}
+                <strong>{fmtWindowLabel(latencyPanel.best_windows[0].label)} {fmtLatency(latencyPanel.best_windows[0].p50_response_delay_ns)}</strong>
+              {:else}
+                <strong>-</strong>
+              {/if}
+            </div>
+            <div>
+              <span>Slow window</span>
+              {#if latencyPanel.slow_windows[0]}
+                <strong class="attention">{fmtWindowLabel(latencyPanel.slow_windows[0].label)} {fmtLatency(latencyPanel.slow_windows[0].p50_response_delay_ns)}</strong>
+              {:else}
+                <strong>-</strong>
+              {/if}
+            </div>
+            <div>
+              <span>Provider drag</span>
+              {#if latencyProviderDrag}
+                <strong>{latencyProviderDrag.provider} {fmtLatency(latencyProviderDrag.slow_p50_response_delay_ns)}</strong>
+              {:else}
+                <strong>-</strong>
+              {/if}
+            </div>
+          </div>
+          <div class="latency-list compact">
+            <div class="latency-list-label">Fast providers</div>
+            {#each latencyPanel.provider_patterns.slice(0, 2) as provider}
               <div>
-                <strong>{fmtCompact(run.input_tokens + run.output_tokens)}</strong>
-                <span title={fmtCost(run.total_cost_usd)}>{fmtMenubarCost(run.total_cost_usd)}</span>
+                <span>{provider.provider}</span>
+                <strong>{fmtHourLabel(provider.best_hour)} {fmtLatency(provider.best_p50_response_delay_ns)}</strong>
               </div>
-            </button>
-          {:else}
-            <div class="empty-line">No recent runs.</div>
-          {/each}
-        </div>
+            {:else}
+              <div class="latency-muted">No provider pattern</div>
+            {/each}
+          </div>
+        {/if}
       </section>
 
       <footer class="menubar-footer">
@@ -508,7 +629,7 @@
   .menubar-root {
     width: 100%;
     height: 100vh;
-    min-height: 0;
+    min-height: 860px;
     overflow: hidden;
     margin: 0 auto;
     padding: 0;
@@ -584,8 +705,7 @@
   .range-tabs,
   .mini-metrics,
   .detail-strip,
-  .source-row,
-  .recent-row {
+  .source-row {
     display: flex;
     align-items: center;
   }
@@ -693,6 +813,7 @@
 
   .section-frame {
     position: relative;
+    flex: 0 0 auto;
     overflow: hidden;
     border: 1px solid var(--border);
     border-radius: 6px;
@@ -744,7 +865,6 @@
   .detail-strip span,
   .mini-metrics span,
   .source-row span,
-  .recent-row span,
   .menubar-footer {
     color: var(--muted);
   }
@@ -997,8 +1117,7 @@
     font-size: 10px;
   }
 
-  .source-list,
-  .recent-list {
+  .source-list {
     display: grid;
     gap: 0;
   }
@@ -1009,12 +1128,157 @@
     overflow: hidden;
   }
 
-  .recent-list {
-    min-height: 78px;
+  .latency-block {
+    height: 196px;
+    min-height: 196px;
+    padding-bottom: 14px;
   }
 
-  .source-list .empty-line,
-  .recent-list .empty-line {
+  .latency-grid,
+  .latency-pattern {
+    display: grid;
+    gap: 0;
+    border-top: 1px solid rgba(231, 224, 210, 0.08);
+    border-bottom: 1px solid rgba(231, 224, 210, 0.08);
+    background:
+      repeating-linear-gradient(90deg, transparent 0, transparent 23px, rgba(231, 224, 210, 0.014) 24px),
+      transparent;
+  }
+
+  .latency-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .latency-grid > div,
+  .latency-pattern > div {
+    min-width: 0;
+    padding: 7px 8px 8px;
+    border-right: 1px solid rgba(231, 224, 210, 0.08);
+  }
+
+  .latency-grid > div:last-child,
+  .latency-pattern > div:last-child {
+    border-right: 0;
+  }
+
+  .latency-grid strong,
+  .latency-provider strong,
+  .latency-pattern strong,
+  .latency-empty strong,
+  .latency-list strong {
+    color: var(--text);
+    font-size: 13px;
+    font-weight: 650;
+    white-space: nowrap;
+  }
+
+  .latency-grid span,
+  .latency-provider span,
+  .latency-pattern span,
+  .latency-empty span,
+  .latency-empty em,
+  .latency-list-label,
+  .latency-muted {
+    display: block;
+    margin-top: 1px;
+    color: var(--muted);
+    font-size: 9px;
+    font-style: normal;
+    text-transform: none;
+  }
+
+  .latency-grid .attention,
+  .latency-pattern .attention,
+  .section-heading em.attention {
+    color: var(--amber);
+  }
+
+  .latency-provider {
+    display: grid;
+    grid-template-columns: 96px minmax(0, 1fr);
+    align-items: baseline;
+    gap: 8px;
+    padding: 7px 8px;
+    border-bottom: 1px solid rgba(231, 224, 210, 0.08);
+  }
+
+  .latency-provider strong {
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .latency-provider span {
+    text-transform: uppercase;
+  }
+
+  .latency-list {
+    padding: 7px 8px 0;
+  }
+
+  .latency-list.compact {
+    padding-top: 4px;
+  }
+
+  .latency-list > div:not(.latency-list-label):not(.latency-muted) {
+    display: grid;
+    grid-template-columns: 48px 60px minmax(0, 1fr);
+    align-items: center;
+    gap: 8px;
+    min-height: 17px;
+    color: var(--muted);
+    font-size: 10px;
+  }
+
+  .latency-list.compact > div:not(.latency-list-label):not(.latency-muted) {
+    grid-template-columns: 72px minmax(0, 1fr);
+  }
+
+  .latency-list .current span,
+  .latency-list .current strong {
+    color: var(--amber);
+  }
+
+  .latency-list em {
+    display: block;
+    height: 6px;
+    border-radius: 1px;
+    background: linear-gradient(90deg, rgba(232, 154, 54, 0.86), rgba(232, 154, 54, 0.26));
+    opacity: calc(0.35 + var(--latency-fill, 0.5) * 0.65);
+    transform-origin: left center;
+    transform: scaleX(var(--latency-fill, 0.5));
+  }
+
+  .latency-pattern {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .latency-pattern > div:nth-child(2) {
+    border-right: 0;
+  }
+
+  .latency-pattern > div:nth-child(3) {
+    grid-column: 1 / -1;
+    border-top: 1px solid rgba(231, 224, 210, 0.08);
+    border-right: 0;
+  }
+
+  .latency-pattern strong {
+    display: block;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .latency-empty {
+    min-height: 78px;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    border-top: 1px solid rgba(231, 224, 210, 0.08);
+    border-bottom: 1px solid rgba(231, 224, 210, 0.08);
+    padding: 8px 6px;
+  }
+
+  .source-list .empty-line {
     display: flex;
     align-items: center;
     min-height: 50px;
@@ -1052,13 +1316,11 @@
     border-bottom: 1px solid rgba(231, 224, 210, 0.08);
   }
 
-  .source-row:last-child,
-  .recent-row:last-child {
+  .source-row:last-child {
     border-bottom: 0;
   }
 
-  .source-row strong,
-  .recent-row strong {
+  .source-row strong {
     display: block;
     color: var(--text);
     font-size: 12px;
@@ -1068,8 +1330,7 @@
     text-overflow: ellipsis;
   }
 
-  .source-row span,
-  .recent-row span {
+  .source-row span {
     display: block;
     margin-top: 1px;
     font-size: 9px;
@@ -1078,25 +1339,7 @@
     text-overflow: ellipsis;
   }
 
-  .recent-row {
-    width: 100%;
-    display: grid;
-    grid-template-columns: minmax(0, 1fr) auto;
-    gap: 10px;
-    padding: 4px 3px;
-    border: 0;
-    border-bottom: 1px solid rgba(231, 224, 210, 0.08);
-    background: transparent;
-    text-align: left;
-    cursor: pointer;
-  }
-
-  .recent-row:hover strong {
-    color: var(--green);
-  }
-
-  .source-row:hover,
-  .recent-row:hover {
+  .source-row:hover {
     background: rgba(231, 224, 210, 0.025);
   }
 
@@ -1104,14 +1347,11 @@
     background: transparent;
   }
 
-  .recent-row > div:last-child {
-    text-align: right;
-  }
-
   .menubar-footer {
+    flex: 0 0 auto;
     justify-content: space-between;
     gap: 6px;
-    margin-top: 5px;
+    margin-top: 10px;
     padding: 4px 9px 0;
     font-size: 10px;
   }

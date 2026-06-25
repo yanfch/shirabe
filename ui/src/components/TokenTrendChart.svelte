@@ -139,11 +139,6 @@
     return index % interval === 0;
   }
 
-  function shouldShowValueLabel(index: number) {
-    if (displayBuckets.length <= 12) return true;
-    return hover?.index === index;
-  }
-
   function showTooltip(event: MouseEvent, index: number) {
     const stage = event.currentTarget instanceof HTMLElement
       ? event.currentTarget.closest(".token-chart-stage")
@@ -248,9 +243,6 @@
               on:mouseenter={(event) => showTooltip(event, index)}
               on:mouseleave={() => (hover = null)}
             >
-              {#if shouldShowValueLabel(index)}
-                <span class="token-bar-label" class:active={hover?.index === index}>{fmtCompact(total)}</span>
-              {/if}
               <span class="token-bar-fill"></span>
             </button>
           {/each}

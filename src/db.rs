@@ -1,4 +1,5 @@
 use std::{
+    collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
@@ -8,7 +9,7 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
 
-pub const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 5;
 
 pub struct Database {
     path: PathBuf,
@@ -88,7 +89,13 @@ impl Database {
             self.ensure_column(table, "started_day", "TEXT")?;
             self.ensure_column(table, "started_month", "TEXT")?;
         }
+        self.ensure_column("llm_calls", "observed_response_delay_ns", "INTEGER")?;
+        self.ensure_column("llm_calls", "observed_output_tps", "REAL")?;
+        self.ensure_column("llm_calls", "observed_trigger_step_id", "TEXT")?;
+        self.ensure_column("llm_calls", "observed_trigger_step_type", "TEXT")?;
+        self.ensure_column("llm_calls", "observed_latency_quality", "TEXT")?;
         self.backfill_time_buckets()?;
+        self.backfill_observed_llm_latency()?;
 
         self.conn.execute(
             "INSERT INTO meta (key, value, updated_at_ns)
@@ -98,6 +105,214 @@ impl Database {
         )?;
 
         Ok(())
+    }
+
+    pub fn refresh_observed_llm_latency_for_runs<'a, I>(&self, run_ids: I) -> Result<()>
+    where
+        I: IntoIterator<Item = &'a str>,
+    {
+        let run_ids = run_ids
+            .into_iter()
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>();
+        let started_transaction = self.conn.is_autocommit();
+        if started_transaction {
+            self.conn
+                .execute_batch("BEGIN IMMEDIATE")
+                .context("begin observed latency refresh transaction")?;
+        }
+
+        let result = self.refresh_observed_llm_latency_for_run_ids(&run_ids);
+        if started_transaction {
+            match result {
+                Ok(()) => self
+                    .conn
+                    .execute_batch("COMMIT")
+                    .context("commit observed latency refresh transaction")?,
+                Err(error) => {
+                    let _ = self.conn.execute_batch("ROLLBACK");
+                    return Err(error);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn refresh_observed_llm_latency_for_run_ids(&self, run_ids: &[String]) -> Result<()> {
+        const NS_PER_SECOND: i64 = 1_000_000_000;
+        const OUTLIER_NS: i64 = 30 * 60 * NS_PER_SECOND;
+
+        #[derive(Debug)]
+        struct TriggerStep {
+            step_id: String,
+            step_type: String,
+            trigger_at_ns: i64,
+            order_index: i64,
+        }
+
+        #[derive(Debug)]
+        struct LlmCall {
+            llm_call_id: String,
+            started_at_ns: i64,
+            order_index: i64,
+            output_tokens: i64,
+        }
+
+        let mut unique_run_ids = Vec::new();
+        let mut seen = HashSet::new();
+        for run_id in run_ids {
+            if seen.insert(run_id.clone()) {
+                unique_run_ids.push(run_id.clone());
+            }
+        }
+
+        if unique_run_ids.is_empty() {
+            return Ok(());
+        }
+
+        self.conn
+            .execute_batch(
+                "CREATE TEMP TABLE IF NOT EXISTS selected_observed_latency_runs (
+                    run_id TEXT PRIMARY KEY
+                 );
+                 DELETE FROM selected_observed_latency_runs;",
+            )
+            .context("prepare observed latency run selection")?;
+        {
+            let mut insert_run = self
+                .conn
+                .prepare("INSERT INTO selected_observed_latency_runs(run_id) VALUES (?1)")?;
+            for run_id in &unique_run_ids {
+                insert_run.execute(params![run_id])?;
+            }
+        }
+
+        let mut triggers_by_run = HashMap::<String, Vec<TriggerStep>>::new();
+        {
+            let mut trigger_stmt = self.conn.prepare(
+                "SELECT s.run_id, s.step_id, s.step_type,
+                    COALESCE(s.ended_at_ns, s.started_at_ns),
+                    COALESCE(s.order_index, 0)
+                 FROM run_steps s
+                 INNER JOIN selected_observed_latency_runs r ON r.run_id = s.run_id
+                 WHERE s.step_type IN ('user', 'tool', 'approval', 'system')
+                 ORDER BY s.run_id, COALESCE(s.ended_at_ns, s.started_at_ns), COALESCE(s.order_index, 0)",
+            )?;
+            let trigger_rows = trigger_stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        TriggerStep {
+                            step_id: row.get(1)?,
+                            step_type: row.get(2)?,
+                            trigger_at_ns: row.get(3)?,
+                            order_index: row.get(4)?,
+                        },
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            for (run_id, trigger) in trigger_rows {
+                triggers_by_run.entry(run_id).or_default().push(trigger);
+            }
+        }
+
+        let llm_calls = {
+            let mut llm_stmt = self.conn.prepare(
+                "SELECT l.run_id, l.llm_call_id, l.started_at_ns,
+                    COALESCE(rs.order_index, 0), l.output_tokens
+                 FROM llm_calls l
+                 INNER JOIN selected_observed_latency_runs r ON r.run_id = l.run_id
+                 LEFT JOIN run_steps rs ON rs.llm_call_id = l.llm_call_id
+                 ORDER BY l.run_id, l.started_at_ns, COALESCE(rs.order_index, 0)",
+            )?;
+            llm_stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        LlmCall {
+                            llm_call_id: row.get(1)?,
+                            started_at_ns: row.get(2)?,
+                            order_index: row.get(3)?,
+                            output_tokens: row.get(4)?,
+                        },
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+
+        let mut update_stmt = self.conn.prepare(
+            "UPDATE llm_calls
+             SET observed_response_delay_ns = ?2,
+                 observed_output_tps = ?3,
+                 observed_trigger_step_id = ?4,
+                 observed_trigger_step_type = ?5,
+                 observed_latency_quality = ?6
+             WHERE llm_call_id = ?1",
+        )?;
+
+        for (run_id, llm_call) in llm_calls {
+            let trigger = triggers_by_run.get(&run_id).and_then(|triggers| {
+                let index = triggers
+                    .partition_point(|trigger| {
+                        trigger.trigger_at_ns < llm_call.started_at_ns
+                            || (trigger.trigger_at_ns == llm_call.started_at_ns
+                                && trigger.order_index < llm_call.order_index)
+                    })
+                    .checked_sub(1)?;
+                triggers.get(index)
+            });
+
+            let Some(trigger) = trigger else {
+                update_stmt.execute(params![
+                    llm_call.llm_call_id,
+                    Option::<i64>::None,
+                    Option::<f64>::None,
+                    Option::<String>::None,
+                    Option::<String>::None,
+                    "missing",
+                ])?;
+                continue;
+            };
+
+            let delay_ns = llm_call.started_at_ns.saturating_sub(trigger.trigger_at_ns);
+            let quality = if delay_ns < NS_PER_SECOND {
+                "subsecond"
+            } else if delay_ns > OUTLIER_NS {
+                "outlier"
+            } else {
+                "good"
+            };
+            let observed_output_tps = if quality == "good" && llm_call.output_tokens > 0 {
+                Some(llm_call.output_tokens as f64 / (delay_ns as f64 / NS_PER_SECOND as f64))
+            } else {
+                None
+            };
+
+            update_stmt.execute(params![
+                llm_call.llm_call_id,
+                delay_ns,
+                observed_output_tps,
+                trigger.step_id,
+                trigger.step_type,
+                quality,
+            ])?;
+        }
+
+        Ok(())
+    }
+
+    fn backfill_observed_llm_latency(&self) -> Result<()> {
+        let run_ids = self
+            .conn
+            .prepare(
+                "SELECT DISTINCT run_id
+                 FROM llm_calls
+                 WHERE observed_latency_quality IS NULL",
+            )?
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        self.refresh_observed_llm_latency_for_runs(run_ids.iter().map(String::as_str))
     }
 
     fn ensure_column(&self, table: &str, column: &str, definition: &str) -> Result<()> {
@@ -682,6 +897,11 @@ CREATE TABLE IF NOT EXISTS llm_calls (
     started_month TEXT,
     ended_at_ns INTEGER,
     duration_ns INTEGER,
+    observed_response_delay_ns INTEGER,
+    observed_output_tps REAL,
+    observed_trigger_step_id TEXT,
+    observed_trigger_step_type TEXT,
+    observed_latency_quality TEXT,
     trace_id TEXT,
     span_id TEXT,
     metadata_json TEXT,

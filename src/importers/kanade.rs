@@ -241,6 +241,7 @@ fn import_trace_file(db: &Database, file_id: &str, path: &Path) -> Result<Import
     }
 
     projector.refresh_run_summaries(touched_run_ids.iter().map(String::as_str))?;
+    db.refresh_observed_llm_latency_for_runs(touched_run_ids.iter().map(String::as_str))?;
     projector.refresh_session_summaries(touched_session_ids.iter().map(String::as_str))?;
 
     let status = if warnings > 0 { "partial" } else { "imported" };

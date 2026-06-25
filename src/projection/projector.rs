@@ -1088,6 +1088,119 @@ mod tests {
     }
 
     #[test]
+    fn refreshes_observed_llm_latency_from_previous_trigger_step() -> Result<()> {
+        let db_path = temp_db_path("refreshes_observed_llm_latency");
+        let db = Database::open(&db_path)?;
+        db.migrate()?;
+        let projector = Projector::new(&db);
+
+        let user = test_event(
+            "user-1",
+            OperationType::User,
+            "user_message",
+            1_000_000_000,
+            Some(1),
+            0,
+            OperationStatus::Success,
+        );
+        let first_llm = test_event(
+            "llm-1",
+            OperationType::LlmCall,
+            "gpt-test",
+            4_000_000_000,
+            Some(2),
+            20,
+            OperationStatus::Success,
+        );
+        let generated_tool = test_event(
+            "tool-1",
+            OperationType::ToolCall,
+            "bash",
+            4_000_000_000,
+            Some(3),
+            0,
+            OperationStatus::Running,
+        );
+        let tool_result = test_event(
+            "tool-1",
+            OperationType::ToolCall,
+            "bash",
+            6_000_000_000,
+            Some(4),
+            0,
+            OperationStatus::Success,
+        );
+        let second_llm = test_event(
+            "llm-2",
+            OperationType::LlmCall,
+            "gpt-test",
+            10_000_000_000,
+            Some(5),
+            40,
+            OperationStatus::Success,
+        );
+
+        for event in [
+            &user,
+            &first_llm,
+            &generated_tool,
+            &tool_result,
+            &second_llm,
+        ] {
+            projector.project(event)?;
+        }
+
+        db.refresh_observed_llm_latency_for_runs(["test:run-1"].into_iter())?;
+
+        let first: (Option<i64>, Option<f64>, Option<String>, Option<String>) =
+            db.connection().query_row(
+                "SELECT observed_response_delay_ns, observed_output_tps,
+                    observed_trigger_step_type, observed_latency_quality
+                 FROM llm_calls
+                 WHERE operation = 'gpt-test'
+                 ORDER BY started_at_ns
+                 LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )?;
+        assert_eq!(first.0, Some(3_000_000_000));
+        assert_eq!(first.1, Some(20.0 / 3.0));
+        assert_eq!(first.2.as_deref(), Some("user"));
+        assert_eq!(first.3.as_deref(), Some("good"));
+
+        let second: (Option<i64>, Option<f64>, Option<String>, Option<String>) =
+            db.connection().query_row(
+                "SELECT observed_response_delay_ns, observed_output_tps,
+                    observed_trigger_step_type, observed_latency_quality
+                 FROM llm_calls
+                 WHERE operation = 'gpt-test'
+                 ORDER BY started_at_ns
+                 LIMIT 1 OFFSET 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )?;
+        assert_eq!(second.0, Some(4_000_000_000));
+        assert_eq!(second.1, Some(10.0));
+        assert_eq!(second.2.as_deref(), Some("tool"));
+        assert_eq!(second.3.as_deref(), Some("good"));
+
+        let trigger_name: String = db.connection().query_row(
+            "SELECT rs.name
+             FROM llm_calls l
+             JOIN run_steps rs ON rs.step_id = l.observed_trigger_step_id
+             WHERE l.operation = 'gpt-test'
+             ORDER BY l.started_at_ns
+             LIMIT 1 OFFSET 1",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(trigger_name, "bash");
+
+        let _ = fs::remove_file(db_path);
+        Ok(())
+    }
+
+    #[test]
     fn operation_enums_map_to_storage_strings() {
         assert_eq!(OperationType::LlmCall.as_step_type(), "llm");
         assert_eq!(OperationType::ToolCall.as_step_type(), "tool");
@@ -1127,6 +1240,62 @@ mod tests {
     fn count(db: &Database, table: &str) -> Result<i64> {
         let sql = format!("SELECT COUNT(*) FROM {table}");
         Ok(db.connection().query_row(&sql, [], |row| row.get(0))?)
+    }
+
+    fn test_event(
+        source_event_id: &str,
+        operation_type: OperationType,
+        name: &str,
+        started_at_ns: i64,
+        order_index: Option<i64>,
+        output_tokens: i64,
+        status: OperationStatus,
+    ) -> NormalizedEvent {
+        NormalizedEvent {
+            source: "test".to_string(),
+            source_kind: "test".to_string(),
+            source_event_id: Some(source_event_id.to_string()),
+            observed_at_ns: started_at_ns,
+            occurred_at_ns: started_at_ns,
+            source_ref: None,
+            cwd: None,
+            project_id: None,
+            trace: TraceContext::default(),
+            session: Some(EntityHint {
+                external_id: "session-1".to_string(),
+                kind: "test".to_string(),
+                title: None,
+            }),
+            run: EntityHint {
+                external_id: "run-1".to_string(),
+                kind: "test".to_string(),
+                title: None,
+            },
+            turn: Some(TurnHint {
+                external_id: "turn-1".to_string(),
+                index: Some(0),
+                role: Some("user".to_string()),
+            }),
+            operation: Operation {
+                operation_type,
+                name: name.to_string(),
+                status,
+                error_type: None,
+                started_at_ns,
+                ended_at_ns: (status != OperationStatus::Running).then_some(started_at_ns),
+                duration_ns: None,
+                order_index,
+                metadata: None,
+            },
+            usage: Usage {
+                provider: (operation_type == OperationType::LlmCall).then(|| "test".to_string()),
+                model: (operation_type == OperationType::LlmCall).then(|| name.to_string()),
+                output_tokens,
+                ..Usage::default()
+            },
+            skill_events: Vec::new(),
+            confidence: 1.0,
+        }
     }
 
     fn temp_db_path(name: &str) -> PathBuf {
