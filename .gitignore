@@ -11,10 +11,15 @@
 /ui/node_modules/
 /ui/dist/
 
+# macOS app build output
+/dist/
+/app/macos/ShirabeBar/.build/
+
 # Logs and local environment
 *.log
 .env
 .env.*
+.codex/
 
 # Local design notes and generated visual assets
 /assets/

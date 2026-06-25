@@ -25,6 +25,7 @@
     | null = null;
 
   $: ordered = [...points].reverse();
+  $: isHourly = ordered.length > 0 && ordered.every((point) => isHourBucket(point.bucket_key));
   $: displayBuckets = buildDisplayBuckets(ordered);
   $: maxValue = Math.max(
     1,
@@ -40,16 +41,22 @@
   );
   $: singlePoint = ordered.length === 1 ? ordered[0] : null;
   $: hoveredBucket = hover ? displayBuckets[hover.index] : null;
-  $: nextChartKey = `${grain}:${displayBuckets.map((bucket) => bucket.bucket_key).join("|")}`;
+  $: nextChartKey = `${grain}:${isHourly ? "hour" : "date"}:${displayBuckets.map((bucket) => bucket.bucket_key).join("|")}`;
   $: if (nextChartKey !== chartKey) {
     chartKey = nextChartKey;
     hover = null;
   }
+
+  function isHourBucket(value: string) {
+    return /^\d{2}:00$/.test(value);
+  }
+
   function totalFor(point: UsageBucketSummary) {
     return point.input_tokens + point.output_tokens;
   }
 
   function labelFor(value: string) {
+    if (isHourBucket(value)) return value;
     return grain === "month" ? value : value.slice(5);
   }
 
@@ -153,9 +160,22 @@
     };
   }
 
-  $: axisLabels = displayBuckets
-    .map((bucket, index) => ({ index, label: labelFor(bucket.startDate) }))
-    .filter((item) => shouldShowLabel(item.index));
+  $: axisLabels = isHourly
+    ? [
+        { key: "00:00", label: "00:00", left: 0 },
+        { key: "06:00", label: "06:00", left: 25 },
+        { key: "12:00", label: "12:00", left: 50 },
+        { key: "18:00", label: "18:00", left: 75 },
+        { key: "24:00", label: "24:00", left: 100 },
+      ]
+    : displayBuckets
+        .map((bucket, index) => ({
+          key: bucket.bucket_key,
+          label: labelFor(bucket.startDate),
+          left: leftPercent(index),
+          index,
+        }))
+        .filter((item) => shouldShowLabel(item.index));
 
   function leftPercent(index: number) {
     if (displayBuckets.length <= 0) return 50;
@@ -165,10 +185,32 @@
   function barHeight(point: UsageBucketSummary) {
     return Math.max(2, (totalFor(point) / maxValue) * 88);
   }
+
+  function barIntensity(point: UsageBucketSummary) {
+    const ratio = totalFor(point) / maxValue;
+    if (ratio <= 0) return 0;
+    return Math.max(0.2, Math.min(1, ratio));
+  }
+
+  function barStyle(point: UsageBucketSummary) {
+    const intensity = barIntensity(point);
+    const topAlpha = 0.16 + intensity * 0.58;
+    const bottomAlpha = 0.06 + intensity * 0.24;
+    const borderAlpha = 0.22 + intensity * 0.42;
+    const glowAlpha = 0.03 + intensity * 0.16;
+    return [
+      `--bar-height: ${barHeight(point)}%`,
+      `--fill-top: ${topAlpha}`,
+      `--fill-bottom: ${bottomAlpha}`,
+      `--border-alpha: ${borderAlpha}`,
+      `--glow-alpha: ${glowAlpha}`,
+    ].join("; ");
+  }
 </script>
 
 <section
   class="panel token-trend-panel"
+  class:hourly={isHourly}
   class:sparse={ordered.length > 1 && ordered.length <= 4}
   class:compact={ordered.length > 1 && ordered.length <= 7}
   class:single={ordered.length === 1}
@@ -179,8 +221,8 @@
 
   <div class="chart-title-row">
     <div>
-      <div class="panel-title">{grain === "month" ? "MONTHLY TOKEN TREND" : "DAILY TOKEN TREND"}</div>
-      <p class="chart-note">{fmtCompact(totalTokens)} consumed tokens across {totalBucketCount} {grain === "month" ? "months" : "days"}.</p>
+      <div class="panel-title">{isHourly ? "HOURLY TOKEN TREND" : grain === "month" ? "MONTHLY TOKEN TREND" : "DAILY TOKEN TREND"}</div>
+      <p class="chart-note">{fmtCompact(totalTokens)} consumed tokens across {totalBucketCount} {isHourly ? "hours" : grain === "month" ? "months" : "days"}.</p>
     </div>
     <div class="legend"><i class="legend-context"></i>Input + output</div>
   </div>
@@ -200,7 +242,8 @@
               type="button"
               tabindex="-1"
               aria-label={`${bucket.date}: ${fmtCompact(total)} tokens`}
-              style={`--bar-height: ${barHeight(bucket.summary)}%;`}
+              style={barStyle(bucket.summary)}
+              class:quiet={total === 0}
               on:mousemove={(event) => showTooltip(event, index)}
               on:mouseenter={(event) => showTooltip(event, index)}
               on:mouseleave={() => (hover = null)}
@@ -214,7 +257,7 @@
         </div>
         {#if hover && hoveredBucket}
           <div class="token-tooltip" style={`left: ${hover.x}px; top: ${hover.y}px;`}>
-            <div class="token-tooltip-date">{hoveredBucket.date}</div>
+            <div class="token-tooltip-date">{isHourly ? hoveredBucket.bucket_key : hoveredBucket.date}</div>
             <strong>Total {fmtCompact(totalFor(hoveredBucket.summary))}</strong>
             <span>Input {fmtCompact(hoveredBucket.summary.input_tokens)} / Output {fmtCompact(hoveredBucket.summary.output_tokens)}</span>
             <span>{hoveredBucket.summary.sessions} sessions / {hoveredBucket.summary.turns} turns</span>
@@ -223,8 +266,8 @@
           </div>
         {/if}
         <div class="token-chart-axis">
-          {#each axisLabels as item (displayBuckets[item.index]?.bucket_key ?? item.index)}
-            <span style={`left: ${leftPercent(item.index)}%`}>{item.label}</span>
+          {#each axisLabels as item (item.key)}
+            <span style={`left: ${item.left}%`}>{item.label}</span>
           {/each}
         </div>
       </div>

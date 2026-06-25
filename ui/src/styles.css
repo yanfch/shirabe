@@ -1500,7 +1500,7 @@ button {
 }
 
 .legend-context {
-  background: var(--amber);
+  background: var(--green);
 }
 
 .chart {
@@ -1596,7 +1596,7 @@ button {
   height: 100%;
   border: 0;
   background: transparent;
-  cursor: crosshair;
+  cursor: default;
   padding: 0;
   transition: opacity 140ms ease, transform 160ms cubic-bezier(0.2, 0.8, 0.2, 1);
 }
@@ -1612,9 +1612,14 @@ button {
   width: min(48%, 22px);
   height: var(--bar-height);
   min-height: 2px;
-  border: 1px solid rgba(232, 154, 54, 0.92);
+  border: 1px solid rgb(143 185 105 / var(--border-alpha, 0.58));
   border-radius: 3px 3px 1px 1px;
-  background: rgba(232, 154, 54, 0.31);
+  background: linear-gradient(
+    180deg,
+    rgb(143 185 105 / var(--fill-top, 0.72)),
+    rgb(143 185 105 / var(--fill-bottom, 0.24))
+  );
+  box-shadow: 0 0 12px rgb(143 185 105 / var(--glow-alpha, 0.1));
   transition:
     height 180ms cubic-bezier(0.2, 0.8, 0.2, 1),
     background 120ms ease,
@@ -1623,8 +1628,25 @@ button {
 }
 
 .token-bar-button.active .token-bar-fill {
-  border-color: var(--amber);
-  background: rgba(232, 154, 54, 0.42);
+  border-color: var(--text);
+  box-shadow:
+    0 0 0 1px rgba(231, 224, 210, 0.42),
+    0 0 16px rgba(143, 185, 105, 0.22);
+}
+
+.token-bar-button.quiet .token-bar-fill {
+  border-color: rgba(231, 224, 210, 0.18);
+  background: rgba(231, 224, 210, 0.08);
+  box-shadow: none;
+}
+
+.token-trend-panel.hourly .token-bars {
+  gap: 3px;
+}
+
+.token-trend-panel.hourly .token-bar-fill {
+  width: min(70%, 14px);
+  border-radius: 2px 2px 1px 1px;
 }
 
 .token-bar-label {
@@ -1641,7 +1663,7 @@ button {
 }
 
 .token-bar-label.active {
-  color: var(--amber);
+  color: var(--green);
 }
 
 .token-tooltip {

@@ -29,6 +29,17 @@ export type Usage = {
   model_summaries: ModelSummary[];
 };
 
+export type MenubarUsage = {
+  status: string;
+  range: "today" | "7d" | "30d" | string;
+  summary: UsageSummary;
+  trend: UsageBucketSummary[];
+  source_usage: SourceUsageSummary[];
+  recent_runs: Run[];
+  latest_run: Run | null;
+  sync: SyncStatus;
+};
+
 export type UsageGrain = "auto" | "day" | "month";
 
 export type UsageFilters = {

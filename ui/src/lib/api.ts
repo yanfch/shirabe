@@ -1,4 +1,4 @@
-import type { Overview, RunDetail, SessionDetail, SessionList, SyncStatus, Usage, UsageFilters } from "./types";
+import type { MenubarUsage, Overview, RunDetail, SessionDetail, SessionList, SyncStatus, Usage, UsageFilters } from "./types";
 
 async function fetchJson<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, init);
@@ -23,6 +23,12 @@ export function fetchUsage(filters: UsageFilters) {
   if (filters.source) params.set("source", filters.source);
   if (filters.model) params.set("model", filters.model);
   return fetchJson<Usage>(`/api/usage?${params.toString()}`);
+}
+
+export function fetchMenubarUsage(range: string) {
+  const params = new URLSearchParams();
+  params.set("range", range);
+  return fetchJson<MenubarUsage>(`/api/menubar?${params.toString()}`);
 }
 
 export function fetchRunDetail(runId: string) {

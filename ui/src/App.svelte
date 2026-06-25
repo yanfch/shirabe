@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import AppShell from "./components/AppShell.svelte";
+  import MenubarPage from "./pages/MenubarPage.svelte";
   import OverviewPage from "./pages/OverviewPage.svelte";
   import RunDetailPage from "./pages/RunDetailPage.svelte";
   import SessionDetailPage from "./pages/SessionDetailPage.svelte";
@@ -18,6 +19,7 @@
   let syncStatus: SyncStatus | null = null;
   let syncPoll: number | null = null;
   const initialParams = new URLSearchParams(location.search);
+  const isMenubarView = initialParams.get("view") === "menubar";
   let selectedRunId: string | null = initialParams.get("run");
   let selectedSessionId: string | null = selectedRunId ? null : initialParams.get("session");
   let activePage: "overview" | "usage" | "sessions" = pageFromParams(initialParams);
@@ -129,6 +131,11 @@
   }
 
   async function loadCurrent() {
+    if (isMenubarView) {
+      initialLoading = false;
+      return;
+    }
+
     initialLoading = true;
     refreshing = false;
     error = null;
@@ -385,6 +392,9 @@
   $: usageModelOptions = usage?.model_options ?? [];
 </script>
 
+{#if isMenubarView}
+  <MenubarPage />
+{:else}
 <AppShell {overview} {syncStatus} {selectedRunId} {selectedSessionId} {activePage} onOverview={showOverview} onUsage={showUsage} onSessions={showSessions} onSync={triggerSync}>
   <svelte:fragment slot="topbar-extra">
     {#if activePage === "usage" && !selectedRunId}
@@ -432,3 +442,4 @@
     {/key}
   {/if}
 </AppShell>
+{/if}

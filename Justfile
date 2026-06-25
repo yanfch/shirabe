@@ -80,3 +80,12 @@ restart bind=bind: build ui-build
 
 ui-dev port=ui_port:
     cd ui && npm run dev -- --port "{{port}}"
+
+macos-build:
+    cd app/macos/ShirabeBar && swift build
+
+macos-run:
+    ./script/build_and_run.sh
+
+macos-verify:
+    ./script/build_and_run.sh --verify

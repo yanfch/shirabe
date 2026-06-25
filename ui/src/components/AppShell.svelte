@@ -41,7 +41,7 @@
 <div class="app-shell">
   <aside class="sidebar">
     <div class="brand">
-      <div class="brand-name">shirabe</div>
+      <div class="brand-name">Shirabe</div>
       <div class="brand-subtitle">AI OPERATIONS DIAGNOSTICS</div>
     </div>
     <nav class="nav-list">

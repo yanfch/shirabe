@@ -41,6 +41,7 @@ pub async fn serve(db_path: PathBuf, bind: String, ui_dir: PathBuf) -> Result<()
         .route("/api/health", get(health))
         .route("/api/overview", get(overview))
         .route("/api/usage", get(usage))
+        .route("/api/menubar", get(menubar))
         .route("/api/sync", post(start_sync))
         .route("/api/sync/status", get(sync_status))
         .route("/api/sessions", get(sessions))
@@ -75,6 +76,16 @@ async fn overview(State(state): State<Arc<AppState>>) -> Response {
 async fn usage(State(state): State<Arc<AppState>>, Query(query): Query<UsageQuery>) -> Response {
     let filters = UsageFilters::from_query(query);
     match load_usage(&state.db_path, filters) {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => api_error(error),
+    }
+}
+
+async fn menubar(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<MenubarQuery>,
+) -> Response {
+    match load_menubar(&state.db_path, query, current_sync_status(&state)) {
         Ok(response) => Json(response).into_response(),
         Err(error) => api_error(error),
     }
@@ -176,6 +187,18 @@ struct UsageResponse {
     model_summaries: Vec<ModelSummary>,
 }
 
+#[derive(Debug, Serialize)]
+struct MenubarResponse {
+    status: &'static str,
+    range: String,
+    summary: UsageSummary,
+    trend: Vec<UsageBucketSummary>,
+    source_usage: Vec<SourceUsageSummary>,
+    recent_runs: Vec<RecentRun>,
+    latest_run: Option<RecentRun>,
+    sync: SyncStatus,
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct SyncStatus {
     status: &'static str,
@@ -274,6 +297,11 @@ struct UsageQuery {
     grain: Option<String>,
     source: Option<String>,
     model: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MenubarQuery {
+    range: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1009,7 +1037,11 @@ fn load_usage(db_path: &PathBuf, filters: UsageFilters) -> Result<UsageResponse>
     let conn =
         Connection::open(db_path).with_context(|| format!("open sqlite {}", db_path.display()))?;
     let totals = load_usage_totals(&conn, &filters)?;
-    let buckets = compact_usage_buckets(load_usage_buckets(&conn, &filters)?);
+    let buckets = if filters.preset == "today" {
+        load_today_hourly_usage_buckets(&conn, &filters)?
+    } else {
+        compact_usage_buckets(load_usage_buckets(&conn, &filters)?)
+    };
     let summary = UsageSummary::from_totals(&totals);
 
     Ok(UsageResponse {
@@ -1028,6 +1060,62 @@ fn load_usage(db_path: &PathBuf, filters: UsageFilters) -> Result<UsageResponse>
         skill_summaries: load_skill_summaries_scoped(&conn, &filters)?,
         model_summaries: load_model_summaries_scoped(&conn, &filters)?,
     })
+}
+
+fn load_menubar(
+    db_path: &PathBuf,
+    query: MenubarQuery,
+    sync: SyncStatus,
+) -> Result<MenubarResponse> {
+    let conn =
+        Connection::open(db_path).with_context(|| format!("open sqlite {}", db_path.display()))?;
+    let range = normalize_menubar_range(query.range.as_deref());
+    let filters = menubar_filters(range);
+    let summary = UsageSummary::from_totals(&load_usage_totals(&conn, &filters)?);
+    let mut recent_runs = load_recent_runs_scoped(&conn, &filters)?;
+    recent_runs.truncate(6);
+    let latest_run = if recent_runs.is_empty() {
+        load_recent_runs_scoped(&conn, &UsageFilters::all())?
+            .into_iter()
+            .next()
+    } else {
+        None
+    };
+
+    Ok(MenubarResponse {
+        status: "ok",
+        range: range.to_string(),
+        summary,
+        trend: if range == "today" {
+            load_today_hourly_usage_buckets(&conn, &filters)?
+        } else {
+            load_usage_buckets(&conn, &filters)?
+        },
+        source_usage: load_source_usage_scoped(&conn, &filters)?,
+        recent_runs,
+        latest_run,
+        sync,
+    })
+}
+
+fn normalize_menubar_range(value: Option<&str>) -> &'static str {
+    match value {
+        Some("7d") => "7d",
+        Some("30d") => "30d",
+        _ => "today",
+    }
+}
+
+fn menubar_filters(range: &str) -> UsageFilters {
+    UsageFilters {
+        preset: range.to_string(),
+        range: range.to_string(),
+        from: None,
+        to: None,
+        grain: "day".to_string(),
+        source: None,
+        model: None,
+    }
 }
 
 fn load_sessions(db_path: &PathBuf) -> Result<SessionListResponse> {
@@ -1531,6 +1619,142 @@ fn load_usage_buckets(
              ORDER BY sb.bucket_key DESC"
         )
     };
+    let mut statement = conn.prepare(&sql)?;
+
+    let rows = statement.query_map([], |row| {
+        let bucket_key: String = row.get(0)?;
+        Ok(UsageBucketSummary {
+            date: bucket_key.clone(),
+            bucket_key,
+            bucket_count: 1,
+            sessions: row.get(1)?,
+            runs: row.get(2)?,
+            turns: row.get(3)?,
+            llm_calls: row.get(4)?,
+            tool_calls: row.get(5)?,
+            failed_tool_calls: row.get(6)?,
+            input_tokens: row.get(7)?,
+            output_tokens: row.get(8)?,
+            cache_read_tokens: row.get(9)?,
+            cache_write_tokens: row.get(10)?,
+            total_cost_usd: row.get(11)?,
+        })
+    })?;
+
+    collect_rows(rows)
+}
+
+fn load_today_hourly_usage_buckets(
+    conn: &Connection,
+    filters: &UsageFilters,
+) -> Result<Vec<UsageBucketSummary>> {
+    let source_llm_condition = filters
+        .source
+        .as_ref()
+        .map(|source| format!("AND l.source = {}", sql_literal(source)))
+        .unwrap_or_default();
+    let source_tool_condition = filters
+        .source
+        .as_ref()
+        .map(|source| format!("AND tc.source = {}", sql_literal(source)))
+        .unwrap_or_default();
+    let model_llm_condition = filters
+        .model
+        .as_ref()
+        .map(|model| {
+            format!(
+                "AND COALESCE(NULLIF(l.model, ''), 'unknown') = {}",
+                sql_literal(model)
+            )
+        })
+        .unwrap_or_default();
+    let model_tool_condition = filters
+        .model
+        .as_ref()
+        .map(|model| {
+            format!(
+                "AND EXISTS (
+                    SELECT 1
+                    FROM llm_calls lm
+                    WHERE lm.run_id = tc.run_id
+                      AND lm.source = tc.source
+                      AND COALESCE(NULLIF(lm.model, ''), 'unknown') = {}
+                )",
+                sql_literal(model)
+            )
+        })
+        .unwrap_or_default();
+    let sql = format!(
+        "WITH RECURSIVE hours(hour) AS (
+            SELECT 0
+            UNION ALL
+            SELECT hour + 1 FROM hours WHERE hour < 23
+         ),
+         hour_bounds AS (
+            SELECT
+                hour,
+                datetime(date('now', 'localtime', 'start of day'), printf('+%d hours', hour)) AS hour_start,
+                datetime(date('now', 'localtime', 'start of day'), printf('+%d hours', hour + 1)) AS hour_end
+            FROM hours
+         ),
+         llm_buckets AS (
+            SELECT
+                CAST(strftime('%H', l.started_at_ns / 1000000000, 'unixepoch', 'localtime') AS INTEGER) AS hour,
+                COUNT(DISTINCT l.session_id) AS sessions,
+                COUNT(DISTINCT l.run_id) AS runs,
+                COUNT(DISTINCT l.turn_id) AS turns,
+                COUNT(*) AS llm_calls,
+                COALESCE(SUM(l.input_tokens), 0) AS input_tokens,
+                COALESCE(SUM(l.output_tokens), 0) AS output_tokens,
+                COALESCE(SUM(l.cache_read_tokens), 0) AS cache_read_tokens,
+                COALESCE(SUM(l.cache_write_tokens), 0) AS cache_write_tokens,
+                COALESCE(SUM({LLM_COST_SQL}), 0) AS total_cost_usd
+            FROM llm_calls l
+            LEFT JOIN model_prices mp ON mp.model_name = l.model
+            WHERE l.started_at_ns >= {today_start_ns}
+              AND l.started_at_ns < {tomorrow_start_ns}
+              {source_llm_condition}
+              {model_llm_condition}
+            GROUP BY hour
+         ),
+         tool_buckets AS (
+            SELECT
+                CAST(strftime('%H', tc.started_at_ns / 1000000000, 'unixepoch', 'localtime') AS INTEGER) AS hour,
+                COUNT(*) AS tool_calls,
+                COALESCE(SUM(CASE WHEN tc.status = 'failed' THEN 1 ELSE 0 END), 0) AS failed_tool_calls
+            FROM tool_calls tc
+            WHERE tc.started_at_ns >= {today_start_ns}
+              AND tc.started_at_ns < {tomorrow_start_ns}
+              {source_tool_condition}
+              {model_tool_condition}
+            GROUP BY hour
+         )
+         SELECT
+            printf('%02d:00', hb.hour) AS bucket_key,
+            COALESCE(lb.sessions, 0),
+            COALESCE(lb.runs, 0),
+            COALESCE(lb.turns, 0),
+            COALESCE(lb.llm_calls, 0),
+            COALESCE(tb.tool_calls, 0),
+            COALESCE(tb.failed_tool_calls, 0),
+            COALESCE(lb.input_tokens, 0),
+            COALESCE(lb.output_tokens, 0),
+            COALESCE(lb.cache_read_tokens, 0),
+            COALESCE(lb.cache_write_tokens, 0),
+            COALESCE(lb.total_cost_usd, 0)
+         FROM hour_bounds hb
+         LEFT JOIN llm_buckets lb ON lb.hour = hb.hour
+         LEFT JOIN tool_buckets tb ON tb.hour = hb.hour
+         ORDER BY hb.hour DESC",
+        today_start_ns =
+            date_expr_start_ns_sql("date('now', 'localtime', 'start of day')"),
+        tomorrow_start_ns =
+            date_expr_start_ns_sql("date('now', 'localtime', 'start of day', '+1 day')"),
+        source_llm_condition = source_llm_condition,
+        source_tool_condition = source_tool_condition,
+        model_llm_condition = model_llm_condition,
+        model_tool_condition = model_tool_condition,
+    );
     let mut statement = conn.prepare(&sql)?;
 
     let rows = statement.query_map([], |row| {
@@ -3217,7 +3441,7 @@ fn sql_literal(value: &str) -> String {
 
 fn date_expr_start_ns_sql(date_expr: &str) -> String {
     format!(
-        "(CAST(strftime('%s', {}) AS INTEGER) * 1000000000)",
+        "(CAST(strftime('%s', {}, 'utc') AS INTEGER) * 1000000000)",
         date_expr
     )
 }
