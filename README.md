@@ -1,62 +1,151 @@
-# shirabe（調べ）
+# Shirabe
 
-> TraceLocal for personal AI operations.
+Local-first usage and tracing console for personal AI coding workflows.
 
-shirabe is a local-first tracing and diagnostics console for personal AI work:
-LLM calls, system prompts, tool calls, cache hits, retries, token waste, latency,
-cost, and cross-tool traces.
+Shirabe imports local agent logs into SQLite, normalizes them into common
+operation records, computes usage rollups, and exposes both a full web dashboard
+and a compact macOS menu bar view.
 
-The first target integrations are:
+## Current Support
 
-- `pi` agent sessions
-- `kanade` workflow tasks and subagents
-- `tsutae` STT/TTS/VAD and voice dispatch flows
+| Source | Status | Notes |
+| --- | --- | --- |
+| Codex | Supported | Sessions, runs, turns, token usage, cache, tools, skills, and trace detail from local Codex data. |
+| pi | Supported | Sessions, runs, token usage, cache, tools, failures, skills, and trace detail from local pi data. |
+| Claude Code | Supported | Local usage/session import and cost estimation from Claude logs. |
+| Kanade | Supported | Workflow/task import, spans, token usage, model/tool summaries, and trace detail where Kanade data provides it. |
+| Tsutae | Not integrated | Planned, not connected yet. |
 
-## Direction
+Cost is estimated from cached model unit prices. Cache hit, tool failure, and
+trace quality depend on what each source records locally.
 
-shirabe is not a prompt management platform, eval platform, or cloud LLMOps tool.
-It focuses on collecting and analyzing local AI operation data so we can answer:
+## Surfaces
 
-- Which tool calls fail often and waste tokens?
-- Which system prompts or roles are expensive or unstable?
-- Where does latency come from in a full trace?
-- How often do provider caches and local caches actually hit?
-- Which models, agents, and workflows are worth their cost?
+Shirabe has two UI surfaces over the same local API and database:
 
-## Architecture
+- Web dashboard: full usage, sessions, run detail, and trace workspace.
+- macOS menu bar: compact usage monitor for daily token, cost, cache, source,
+  and recent run checks.
 
-Initial shape:
+They are independent views. You can use the browser dashboard without the menu
+bar app, or run only the menu bar app while the local Shirabe server is running.
 
-```text
-tracelocald / shirabed
-  Rust server
-  OTLP / local event ingest
-  SQLite storage
-  rollup metrics
-  Web API
-  serves Web UI
+## Screenshots
 
-web
-  browser-first dashboard
-  trace tree / waterfall
-  tool success analysis
-  cache and prompt analysis
+### Usage Dashboard
 
-optional macOS shell
-  SwiftUI menubar app
-  starts/stops server
-  opens the same Web UI
+![Usage dashboard](script/usage.png)
+
+### macOS Menu Bar
+
+![macOS menu bar usage panel](script/menubar.png)
+
+## Quick Start
+
+Prerequisites:
+
+- Rust stable
+- Node.js 22+
+- macOS and SwiftPM for the menu bar app
+- `just` for the command shortcuts
+
+Initialize the local database:
+
+```bash
+just init
 ```
 
-The server must run independently. The macOS app is only a later convenience
-shell, not part of the core data pipeline.
+Import local data:
 
-See [docs/01-v1-design.md](docs/01-v1-design.md).
+```bash
+just import-codex
+just import-pi
+just import-claude
+just import-kanade
+```
 
-Current design notes:
+Or import everything and refresh rollups:
 
-- [AI operations model](docs/02-ai-operations-model.md)
-- [Projection pipeline](docs/04-projection-pipeline.md)
-- [Importers](docs/06-importers.md)
-- [Source shapes and import plan](docs/10-source-shapes-and-import-plan.md)
-- [Agent handoff](docs/11-agent-handoff.md)
+```bash
+just import-all
+```
+
+Refresh model pricing:
+
+```bash
+just pricing
+```
+
+Start the local server and web dashboard:
+
+```bash
+just restart
+```
+
+Then open:
+
+```text
+http://127.0.0.1:7778
+```
+
+Run the macOS menu bar shell:
+
+```bash
+just macos-run
+```
+
+The menu bar app expects the local server at `http://127.0.0.1:7778`. If the
+popover shows offline, run `just restart`.
+
+## Development
+
+Useful commands:
+
+```bash
+just build
+just test
+just ui-build
+just macos-build
+just check
+```
+
+CI runs:
+
+- `cargo fmt --all -- --check`
+- `cargo clippy --all-targets --all-features -- -D warnings -A clippy::too_many_arguments`
+- `cargo test --all-targets --all-features`
+- `npm ci && npm run build` in `ui/`
+- `swift build --package-path app/macos/ShirabeBar`
+
+## Layout
+
+```text
+src/
+  importers/      local source parsers
+  projection/     normalized operation model
+  skills/         skill usage extraction
+  server.rs       local API and static UI server
+  rollup.rs       usage rollup generation
+
+ui/
+  src/            Svelte dashboard and menu bar web views
+
+app/macos/
+  ShirabeBar/     native macOS menu bar shell
+
+script/
+  build_and_run.sh
+  usage.png
+  menubar.png
+```
+
+## Data
+
+By default Shirabe stores local data under its configured data directory. You can
+override it with:
+
+```bash
+SHIRABE_DIR=/path/to/data cargo run -- init
+```
+
+The project is local-only today. It does not upload agent logs or usage data.
