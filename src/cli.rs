@@ -28,6 +28,10 @@ pub enum Commands {
         /// Directory containing built UI assets.
         #[arg(long)]
         ui_dir: Option<PathBuf>,
+
+        /// Exit when this parent process is no longer alive.
+        #[arg(long, hide = true)]
+        exit_when_parent_exits: Option<u32>,
     },
 
     /// Import historical local AI data.

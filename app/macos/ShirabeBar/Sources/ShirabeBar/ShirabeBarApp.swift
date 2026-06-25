@@ -1,4 +1,5 @@
 import AppKit
+import Foundation
 import SwiftUI
 import WebKit
 
@@ -19,6 +20,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate {
 
     private static var retainedDelegate: AppDelegate?
 
+    private let serverBind = "127.0.0.1:7778"
     private let appURL = URL(string: "http://127.0.0.1:7778/?view=menubar")!
     private let dashboardURL = URL(string: "http://127.0.0.1:7778/?page=usage")!
     private let healthURL = URL(string: "http://127.0.0.1:7778/api/health")!
@@ -27,6 +29,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate {
     private var statusItem: NSStatusItem?
     private var panel: NSPanel?
     private var webView: WKWebView?
+    private var serverProcess: Process?
+    private var serverLogFile: FileHandle?
     private var outsideClickMonitor: Any?
     private var hasLoadedWebView = false
 
@@ -43,13 +47,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate {
         configureStatusItem()
         configurePanel()
         prepareWebView()
-        Task { await checkServerAndShowContentIfNeeded() }
+        Task { await ensureServerAndShowContentIfNeeded() }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
         if let outsideClickMonitor {
             NSEvent.removeMonitor(outsideClickMonitor)
         }
+        stopBundledServer()
     }
 
     private func configureStatusItem() {
@@ -57,11 +62,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate {
         statusItem = item
 
         guard let button = item.button else { return }
-        button.image = NSImage(systemSymbolName: "chart.bar.xaxis", accessibilityDescription: "Shirabe")
+        button.image = menuBarIcon()
         button.image?.isTemplate = true
         button.target = self
         button.action = #selector(handleStatusItemClick(_:))
         button.sendAction(on: [.leftMouseUp, .rightMouseUp])
+    }
+
+    private func menuBarIcon() -> NSImage? {
+        if let image = bundledImage(named: "MenuBarIconTemplate") {
+            image.size = NSSize(width: 18, height: 18)
+            image.isTemplate = true
+            image.accessibilityDescription = "Shirabe"
+            return image
+        }
+
+        let image = NSImage(systemSymbolName: "chart.bar.xaxis", accessibilityDescription: "Shirabe")
+        image?.isTemplate = true
+        return image
+    }
+
+    private func bundledImage(named name: String) -> NSImage? {
+        if let url = Bundle.main.url(forResource: name, withExtension: "png"),
+           let image = NSImage(contentsOf: url) {
+            return image
+        }
+
+        #if SWIFT_PACKAGE
+        if let url = Bundle.module.url(forResource: name, withExtension: "png"),
+           let image = NSImage(contentsOf: url) {
+            return image
+        }
+        #endif
+
+        return nil
     }
 
     private func configurePanel() {
@@ -119,7 +153,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate {
         guard let panel else { return }
         updatePanelFrame()
         if !hasLoadedWebView {
-            Task { await checkServerAndShowContentIfNeeded() }
+            Task { await ensureServerAndShowContentIfNeeded() }
         }
         NSApp.activate(ignoringOtherApps: true)
         panel.makeKeyAndOrderFront(nil)
@@ -168,6 +202,110 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate {
     }
 
     @MainActor
+    private func ensureServerAndShowContentIfNeeded() async {
+        await ensureServerAvailable()
+        await checkServerAndShowContentIfNeeded()
+    }
+
+    private func ensureServerAvailable() async {
+        if await isServerHealthy() {
+            return
+        }
+
+        startBundledServerIfPossible()
+        for _ in 0..<50 {
+            try? await Task.sleep(nanoseconds: 200_000_000)
+            if await isServerHealthy() {
+                return
+            }
+        }
+    }
+
+    private func startBundledServerIfPossible() {
+        if serverProcess?.isRunning == true {
+            return
+        }
+
+        guard let serverURL = bundledServerURL(),
+              let uiDirectoryURL = Bundle.main.resourceURL?.appendingPathComponent("ui", isDirectory: true),
+              FileManager.default.fileExists(atPath: uiDirectoryURL.path) else {
+            return
+        }
+
+        let process = Process()
+        process.executableURL = serverURL
+        process.arguments = [
+            "serve",
+            "--bind",
+            serverBind,
+            "--ui-dir",
+            uiDirectoryURL.path,
+            "--exit-when-parent-exits",
+            String(ProcessInfo.processInfo.processIdentifier),
+        ]
+        process.environment = ProcessInfo.processInfo.environment
+
+        if let logFile = openServerLogFile() {
+            process.standardOutput = logFile
+            process.standardError = logFile
+            serverLogFile = logFile
+        }
+
+        process.terminationHandler = { [weak self, weak process] _ in
+            DispatchQueue.main.async {
+                guard let self, let process, self.serverProcess === process else { return }
+                self.serverProcess = nil
+            }
+        }
+
+        do {
+            try process.run()
+            serverProcess = process
+        } catch {
+            serverLogFile?.closeFile()
+            serverLogFile = nil
+        }
+    }
+
+    private func bundledServerURL() -> URL? {
+        guard let executableDirectory = Bundle.main.executableURL?.deletingLastPathComponent() else {
+            return nil
+        }
+
+        let url = executableDirectory.appendingPathComponent("ShirabeServer")
+        guard FileManager.default.isExecutableFile(atPath: url.path) else {
+            return nil
+        }
+        return url
+    }
+
+    private func openServerLogFile() -> FileHandle? {
+        let logDirectory = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".shirabe", isDirectory: true)
+        let logURL = logDirectory.appendingPathComponent("shirabe-server.log")
+
+        do {
+            try FileManager.default.createDirectory(at: logDirectory, withIntermediateDirectories: true)
+            if !FileManager.default.fileExists(atPath: logURL.path) {
+                FileManager.default.createFile(atPath: logURL.path, contents: nil)
+            }
+            let handle = try FileHandle(forWritingTo: logURL)
+            try handle.seekToEnd()
+            return handle
+        } catch {
+            return nil
+        }
+    }
+
+    private func stopBundledServer() {
+        if serverProcess?.isRunning == true {
+            serverProcess?.terminate()
+        }
+        serverProcess = nil
+        serverLogFile?.closeFile()
+        serverLogFile = nil
+    }
+
+    @MainActor
     private func checkServerAndShowContentIfNeeded() async {
         if await isServerHealthy() {
             showWebView()
@@ -203,7 +341,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate {
         guard let panel else { return }
         let offlineView = OfflineView(
             retry: { [weak self] in
-                Task { await self?.checkServerAndShowContentIfNeeded() }
+                Task { await self?.ensureServerAndShowContentIfNeeded() }
             },
             openDashboard: { [weak self] in
                 self?.openDashboard()

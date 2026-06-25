@@ -8,6 +8,8 @@ mod rollup;
 mod server;
 mod skills;
 
+use std::time::Duration;
+
 use anyhow::Result;
 use clap::Parser;
 use cli::{Cli, Commands, ImportSource, PricingCommand, RollupCommand};
@@ -28,7 +30,11 @@ async fn main() -> Result<()> {
             println!("initialized {}", paths.data_dir.display());
             println!("catalog {}", paths.catalog_db.display());
         }
-        Commands::Serve { bind, ui_dir } => {
+        Commands::Serve {
+            bind,
+            ui_dir,
+            exit_when_parent_exits,
+        } => {
             database.migrate()?;
             if let Some(report) = rollup::refresh_if_missing(&database)? {
                 tracing::info!(
@@ -36,6 +42,9 @@ async fn main() -> Result<()> {
                     model_rollups = report.model_rollups,
                     "created missing usage rollups"
                 );
+            }
+            if let Some(parent_pid) = exit_when_parent_exits {
+                spawn_parent_exit_watchdog(parent_pid);
             }
             let ui_dir = ui_dir.unwrap_or(paths.ui_dist);
             server::serve(paths.catalog_db, bind, ui_dir).await?;
@@ -91,4 +100,35 @@ fn init_tracing() {
         .with_target(false)
         .compact()
         .init();
+}
+
+fn spawn_parent_exit_watchdog(parent_pid: u32) {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            if !process_exists(parent_pid) {
+                tracing::info!(parent_pid, "parent process exited; stopping bundled server");
+                std::process::exit(0);
+            }
+        }
+    });
+}
+
+#[cfg(unix)]
+fn process_exists(pid: u32) -> bool {
+    unsafe extern "C" {
+        fn kill(pid: i32, sig: i32) -> i32;
+    }
+
+    let result = unsafe { kill(pid as i32, 0) };
+    if result == 0 {
+        return true;
+    }
+
+    std::io::Error::last_os_error().raw_os_error() == Some(1)
+}
+
+#[cfg(not(unix))]
+fn process_exists(_pid: u32) -> bool {
+    true
 }

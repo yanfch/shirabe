@@ -12,25 +12,38 @@ DIST_DIR="$ROOT_DIR/dist"
 APP_BUNDLE="$DIST_DIR/$APP_NAME.app"
 APP_CONTENTS="$APP_BUNDLE/Contents"
 APP_MACOS="$APP_CONTENTS/MacOS"
+APP_RESOURCES="$APP_CONTENTS/Resources"
 APP_BINARY="$APP_MACOS/$APP_NAME"
+SERVER_BINARY="$APP_MACOS/ShirabeServer"
 INFO_PLIST="$APP_CONTENTS/Info.plist"
+SOURCE_RESOURCES="$APP_DIR/Sources/ShirabeBar/Resources"
 
 pkill -x "$APP_NAME" >/dev/null 2>&1 || true
+pkill -x "ShirabeServer" >/dev/null 2>&1 || true
 
+(cd "$ROOT_DIR" && cargo build)
+(cd "$ROOT_DIR/ui" && npm run build)
 (cd "$APP_DIR" && swift build)
 BUILD_DIR="$(cd "$APP_DIR" && swift build --show-bin-path)"
 BUILD_BINARY="$BUILD_DIR/$APP_NAME"
 
 rm -rf "$APP_BUNDLE"
-mkdir -p "$APP_MACOS"
+mkdir -p "$APP_MACOS" "$APP_RESOURCES"
 cp "$BUILD_BINARY" "$APP_BINARY"
 chmod +x "$APP_BINARY"
+cp "$ROOT_DIR/target/debug/shirabe" "$SERVER_BINARY"
+chmod +x "$SERVER_BINARY"
+cp "$SOURCE_RESOURCES/AppIcon.icns" "$APP_RESOURCES/AppIcon.icns"
+cp "$SOURCE_RESOURCES/MenuBarIconTemplate.png" "$APP_RESOURCES/MenuBarIconTemplate.png"
+cp -R "$ROOT_DIR/ui/dist" "$APP_RESOURCES/ui"
 
 cat >"$INFO_PLIST" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+  <key>CFBundleIconFile</key>
+  <string>AppIcon</string>
   <key>CFBundleExecutable</key>
   <string>$APP_NAME</string>
   <key>CFBundleIdentifier</key>
@@ -53,8 +66,8 @@ PLIST
 
 open_app() {
   if ! curl -fs "http://127.0.0.1:7778/api/health" >/dev/null 2>&1; then
-    echo "warning: shirabe server is not running at http://127.0.0.1:7778"
-    echo "         run 'just restart' if the popover shows offline"
+    echo "info: no external shirabe server at http://127.0.0.1:7778"
+    echo "      ShirabeBar will start the bundled server if available"
   fi
   /usr/bin/open -n "$APP_BUNDLE"
 }

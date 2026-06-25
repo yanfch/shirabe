@@ -61,8 +61,10 @@ import-all: import-codex import-pi import-claude import-kanade
 
 stop:
     pkill -x shirabe || true
+    pkill -x ShirabeServer || true
 
 start bind=bind: build ui-build
+    pkill -x ShirabeServer || true
     log_path="${SHIRABE_DIR:-$HOME/.shirabe}/shirabe.log"; mkdir -p "$(dirname "$log_path")"; python3 -c 'import os, subprocess, sys; log = open(sys.argv[1], "ab"); subprocess.Popen(["./target/debug/shirabe", "serve", "--bind", "{{bind}}", "--ui-dir", "ui/dist"], cwd=os.getcwd(), stdout=log, stderr=subprocess.STDOUT, start_new_session=True)' "$log_path"
     log_path="${SHIRABE_DIR:-$HOME/.shirabe}/shirabe.log"; for _ in {1..50}; do curl -fs "http://{{bind}}/api/health" >/dev/null && { echo "shirabe is running at http://{{bind}}"; exit 0; }; sleep 0.2; done; tail -40 "$log_path"; exit 1
 
@@ -74,6 +76,7 @@ serve bind=bind: ui-build
 
 restart bind=bind: build ui-build
     pkill -x shirabe || true
+    pkill -x ShirabeServer || true
     sleep 0.2
     log_path="${SHIRABE_DIR:-$HOME/.shirabe}/shirabe.log"; mkdir -p "$(dirname "$log_path")"; python3 -c 'import os, subprocess, sys; log = open(sys.argv[1], "ab"); subprocess.Popen(["./target/debug/shirabe", "serve", "--bind", "{{bind}}", "--ui-dir", "ui/dist"], cwd=os.getcwd(), stdout=log, stderr=subprocess.STDOUT, start_new_session=True)' "$log_path"
     log_path="${SHIRABE_DIR:-$HOME/.shirabe}/shirabe.log"; for _ in {1..50}; do curl -fs "http://{{bind}}/api/health" >/dev/null && { echo "shirabe is running at http://{{bind}}"; exit 0; }; sleep 0.2; done; tail -40 "$log_path"; exit 1
