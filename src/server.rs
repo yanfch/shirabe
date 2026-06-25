@@ -220,6 +220,7 @@ struct MenubarResponse {
     source_usage: Vec<SourceUsageSummary>,
     recent_runs: Vec<RecentRun>,
     latest_run: Option<RecentRun>,
+    last_updated_at_ns: Option<i64>,
     sync: SyncStatus,
 }
 
@@ -1106,6 +1107,10 @@ fn load_menubar(
         None
     };
 
+    let last_updated_at_ns = sync
+        .finished_at_ns
+        .or_else(|| latest_import_scan_ns(&conn).ok().flatten());
+
     Ok(MenubarResponse {
         status: "ok",
         range: range.to_string(),
@@ -1118,6 +1123,7 @@ fn load_menubar(
         source_usage: load_source_usage_scoped(&conn, &filters)?,
         recent_runs,
         latest_run,
+        last_updated_at_ns,
         sync,
     })
 }
@@ -3344,6 +3350,10 @@ fn load_session_model_summaries(conn: &Connection, session_id: &str) -> Result<V
 fn count(conn: &Connection, table: &str) -> Result<i64> {
     let sql = format!("SELECT COUNT(*) FROM {table}");
     Ok(conn.query_row(&sql, [], |row| row.get(0))?)
+}
+
+fn latest_import_scan_ns(conn: &Connection) -> Result<Option<i64>> {
+    Ok(conn.query_row("SELECT MAX(last_scan_ns) FROM import_sources", [], |row| row.get(0))?)
 }
 
 fn count_where(conn: &Connection, table: &str, predicate: &str) -> Result<i64> {

@@ -37,6 +37,7 @@ export type MenubarUsage = {
   source_usage: SourceUsageSummary[];
   recent_runs: Run[];
   latest_run: Run | null;
+  last_updated_at_ns: number | null;
   sync: SyncStatus;
 };
 

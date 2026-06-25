@@ -6,18 +6,11 @@ Shirabe imports local agent logs into SQLite, normalizes them into common
 operation records, computes usage rollups, and exposes both a full web dashboard
 and a compact macOS menu bar view.
 
-## Current Support
+## Screenshots
 
-| Source | Status | Notes |
-| --- | --- | --- |
-| Codex | Supported | Sessions, runs, turns, token usage, cache, tools, skills, and trace detail from local Codex data. |
-| pi | Supported | Sessions, runs, token usage, cache, tools, failures, skills, and trace detail from local pi data. |
-| Claude Code | Supported | Local usage/session import and cost estimation from Claude logs. |
-| Kanade | Supported | Workflow/task import, spans, token usage, model/tool summaries, and trace detail where Kanade data provides it. |
-| Tsutae | Not integrated | Planned, not connected yet. |
-
-Cost is estimated from cached model unit prices. Cache hit, tool failure, and
-trace quality depend on what each source records locally.
+| Usage Dashboard | macOS Menu Bar |
+| --- | --- |
+| <a href="script/usage.png"><img src="script/usage.png" alt="Usage dashboard" width="520"></a> | <a href="script/menubar.png"><img src="script/menubar.png" alt="macOS menu bar usage panel" width="260"></a> |
 
 ## Surfaces
 
@@ -30,15 +23,18 @@ Shirabe has two UI surfaces over the same local API and database:
 They are independent views. You can use the browser dashboard without the menu
 bar app, or run only the menu bar app while the local Shirabe server is running.
 
-## Screenshots
+## Current Support
 
-### Usage Dashboard
+| Source | Status | Notes |
+| --- | --- | --- |
+| Codex | Supported | Sessions, runs, turns, token usage, cache, tools, skills, and trace detail from local Codex data. |
+| pi | Supported | Sessions, runs, token usage, cache, tools, failures, skills, and trace detail from local pi data. |
+| Claude Code | Supported | Local usage/session import and cost estimation from Claude logs. |
+| Kanade | Supported | Workflow/task import, spans, token usage, model/tool summaries, and trace detail where Kanade data provides it. |
+| Tsutae | Not integrated | Planned, not connected yet. |
 
-<a href="script/usage.png"><img src="script/usage.png" alt="Usage dashboard" width="760"></a>
-
-### macOS Menu Bar
-
-<a href="script/menubar.png"><img src="script/menubar.png" alt="macOS menu bar usage panel" width="420"></a>
+Cost is estimated from cached model unit prices. Cache hit, tool failure, and
+trace quality depend on what each source records locally.
 
 ## Quick Start
 

@@ -59,8 +59,8 @@
   $: latestRun = data?.latest_run ?? null;
   $: syncCaption = syncRunning
     ? `Syncing ${shortSyncPhase(data?.sync.phase)}`
-    : data?.sync.finished_at_ns
-      ? `Synced ${formatClockTime(data.sync.finished_at_ns)}`
+    : data?.last_updated_at_ns
+      ? `Synced ${formatClockTime(data.last_updated_at_ns)}`
       : null;
   $: emptyCaption = latestRun
     ? `Last active ${fmtTime(latestRun.started_at_ns)} · ${latestRun.source}`
