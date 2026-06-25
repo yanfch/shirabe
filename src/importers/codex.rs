@@ -601,10 +601,9 @@ fn tool_status(payload: &Map<String, Value>) -> OperationStatus {
         rest.split_whitespace()
             .next()
             .and_then(|value| value.parse::<i64>().ok())
-    }) {
-        if exit_code != 0 {
-            return OperationStatus::Failed;
-        }
+    }) && exit_code != 0
+    {
+        return OperationStatus::Failed;
     }
 
     OperationStatus::Success
