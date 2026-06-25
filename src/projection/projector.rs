@@ -1150,7 +1150,7 @@ mod tests {
             projector.project(event)?;
         }
 
-        db.refresh_observed_llm_latency_for_runs(["test:run-1"].into_iter())?;
+        db.refresh_observed_llm_latency_for_runs(["test:run-1"])?;
 
         let first: (Option<i64>, Option<f64>, Option<String>, Option<String>) =
             db.connection().query_row(

@@ -2044,7 +2044,7 @@ fn provider_latency_patterns(samples: &[LatencySample]) -> Vec<ProviderLatencyPa
                     Some((hour, percentile_i64_sorted_copy(delays, 0.5)?))
                 })
                 .collect::<Vec<_>>();
-            hour_stats.sort_by(|left, right| left.1.cmp(&right.1));
+            hour_stats.sort_by_key(|item| item.1);
             let best = hour_stats.first().copied();
             let slow = hour_stats.last().copied();
 
