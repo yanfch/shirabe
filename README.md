@@ -34,11 +34,11 @@ bar app, or run only the menu bar app while the local Shirabe server is running.
 
 ### Usage Dashboard
 
-![Usage dashboard](script/usage.png)
+<a href="script/usage.png"><img src="script/usage.png" alt="Usage dashboard" width="760"></a>
 
 ### macOS Menu Bar
 
-![macOS menu bar usage panel](script/menubar.png)
+<a href="script/menubar.png"><img src="script/menubar.png" alt="macOS menu bar usage panel" width="420"></a>
 
 ## Quick Start
 
@@ -149,3 +149,7 @@ SHIRABE_DIR=/path/to/data cargo run -- init
 ```
 
 The project is local-only today. It does not upload agent logs or usage data.
+
+## License
+
+MIT. See [LICENSE](LICENSE).

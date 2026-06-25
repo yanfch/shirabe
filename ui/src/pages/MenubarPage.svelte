@@ -57,6 +57,11 @@
     (summary?.tool_calls ?? 0) > 0;
   $: isRangeEmpty = Boolean(data) && !hasUsage;
   $: latestRun = data?.latest_run ?? null;
+  $: syncCaption = syncRunning
+    ? `Syncing ${shortSyncPhase(data?.sync.phase)}`
+    : data?.sync.finished_at_ns
+      ? `Synced ${formatClockTime(data.sync.finished_at_ns)}`
+      : null;
   $: emptyCaption = latestRun
     ? `Last active ${fmtTime(latestRun.started_at_ns)} · ${latestRun.source}`
     : "No local runs in this range.";
@@ -67,6 +72,20 @@
 
   function rangeCaption(value: RangeOption) {
     return value === "today" ? "today" : value === "7d" ? "last 7 days" : "last 30 days";
+  }
+
+  function formatClockTime(ns: number) {
+    return new Date(Math.floor(ns / 1_000_000)).toLocaleTimeString([], {
+      hour: "2-digit",
+      minute: "2-digit",
+    });
+  }
+
+  function shortSyncPhase(phase: string | null | undefined) {
+    if (!phase || phase === "idle") return "syncing";
+    if (phase.startsWith("import ")) return phase.replace("import ", "");
+    if (phase === "refresh rollups") return "rollup";
+    return phase;
   }
 
   async function load(nextRange = range) {
@@ -440,9 +459,14 @@
       </section>
 
       <footer class="menubar-footer">
-        <div>
-          <span class="dot"></span>
-          <span>LOCAL</span>
+        <div class="local-status">
+          <div class="local-line">
+            <span class="dot"></span>
+            <span>LOCAL</span>
+          </div>
+          {#if syncCaption}
+            <span class="footer-sync">{syncCaption}</span>
+          {/if}
         </div>
         <button type="button" on:click={openDashboard}>
           <span>OPEN DASHBOARD</span>
@@ -1079,24 +1103,30 @@
 
   .menubar-footer {
     justify-content: space-between;
-    gap: 8px;
+    gap: 6px;
     margin-top: 5px;
     padding: 4px 9px 0;
     font-size: 10px;
   }
 
-  .menubar-footer > div {
+  .local-status {
     flex: 0 0 auto;
-    min-width: 0;
+    min-width: 110px;
+    color: var(--text);
+  }
+
+  .local-line {
     display: inline-flex;
     align-items: center;
-    gap: 7px;
-    height: 24px;
-    padding: 0 9px;
-    border: 1px solid rgba(231, 224, 210, 0.075);
-    border-radius: 4px;
-    background: rgba(8, 10, 9, 0.34);
-    color: var(--text);
+    gap: 8px;
+  }
+
+  .footer-sync {
+    display: block;
+    margin-top: 2px;
+    color: var(--dim);
+    font-size: 9px;
+    line-height: 1;
   }
 
   .menubar-footer button {

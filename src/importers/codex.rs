@@ -1,12 +1,13 @@
 use std::{
     collections::{HashMap, HashSet},
     env, fs,
-    io::{BufRead, BufReader},
+    io::{BufRead, BufReader, Seek, SeekFrom},
     path::{Path, PathBuf},
     time::Instant,
 };
 
 use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use walkdir::WalkDir;
 
@@ -119,7 +120,7 @@ fn scan_sessions(
         }
         let prepared = db.prepare_import_file(source_id, root, metadata.len(), modified_ns)?;
         let imported = if prepared.should_import {
-            import_session_file(db, &prepared.file_id, root)?
+            import_session_file(db, &prepared, root, metadata.len())?
         } else {
             ImportedFile::skipped()
         };
@@ -169,7 +170,7 @@ fn scan_sessions(
             }
 
             files_imported += 1;
-            let imported = import_session_file(db, &prepared.file_id, entry.path())?;
+            let imported = import_session_file(db, &prepared, entry.path(), metadata.len())?;
             events += imported.events;
             warnings += imported.warnings;
         }
@@ -185,14 +186,26 @@ fn scan_sessions(
     })
 }
 
-fn import_session_file(db: &Database, file_id: &str, path: &Path) -> Result<ImportedFile> {
-    let file = fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
+fn import_session_file(
+    db: &Database,
+    prepared: &crate::db::PreparedImportFile,
+    path: &Path,
+    size_bytes: u64,
+) -> Result<ImportedFile> {
+    let checkpoint = CodexImportCheckpoint::from_prepared(prepared, size_bytes);
+    let mut file = fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
+    if checkpoint.start_offset > 0 {
+        file.seek(SeekFrom::Start(checkpoint.start_offset))
+            .with_context(|| format!("seek {}", path.display()))?;
+    }
     let mut reader = BufReader::new(file);
     let projector = Projector::new(db);
-    let mut state = SessionState::from_path(path);
+    let mut state = checkpoint
+        .state
+        .unwrap_or_else(|| SessionState::from_path(path));
     let mut line = String::new();
-    let mut line_number = 0usize;
-    let mut offset = 0u64;
+    let mut line_number = checkpoint.line_number;
+    let mut offset = checkpoint.start_offset;
     let mut events = 0usize;
     let mut warnings = 0usize;
     let mut first_event_ns: Option<i64> = None;
@@ -239,16 +252,39 @@ fn import_session_file(db: &Database, file_id: &str, path: &Path) -> Result<Impo
     projector.refresh_session_summaries(touched_session_ids.iter().map(String::as_str))?;
 
     let status = if warnings > 0 { "partial" } else { "imported" };
+    let cumulative_first_event_ns = match (checkpoint.first_event_ns, first_event_ns) {
+        (Some(previous), Some(current)) => Some(previous.min(current)),
+        (Some(previous), None) => Some(previous),
+        (None, Some(current)) => Some(current),
+        (None, None) => None,
+    };
+    let cumulative_last_event_ns = match (checkpoint.last_event_ns, last_event_ns) {
+        (Some(previous), Some(current)) => Some(previous.max(current)),
+        (Some(previous), None) => Some(previous),
+        (None, Some(current)) => Some(current),
+        (None, None) => None,
+    };
+
     db.finish_import_file(
-        file_id,
+        &prepared.file_id,
         status,
-        events,
-        warnings,
+        checkpoint.event_count.saturating_add(events),
+        checkpoint.warning_count.saturating_add(warnings),
         Some(offset),
-        first_event_ns,
-        last_event_ns,
+        cumulative_first_event_ns,
+        cumulative_last_event_ns,
         None,
     )?;
+    let checkpoint = CodexImportCheckpoint {
+        start_offset: offset,
+        line_number,
+        event_count: checkpoint.event_count.saturating_add(events),
+        warning_count: checkpoint.warning_count.saturating_add(warnings),
+        first_event_ns: cumulative_first_event_ns,
+        last_event_ns: cumulative_last_event_ns,
+        state: Some(state),
+    };
+    db.update_import_file_metadata(&prepared.file_id, &serde_json::to_string(&checkpoint)?)?;
 
     Ok(ImportedFile { events, warnings })
 }
@@ -379,6 +415,50 @@ fn parse_session_line(
     }
 }
 
+#[derive(Deserialize, Serialize)]
+struct CodexImportCheckpoint {
+    start_offset: u64,
+    line_number: usize,
+    event_count: usize,
+    warning_count: usize,
+    first_event_ns: Option<i64>,
+    last_event_ns: Option<i64>,
+    state: Option<SessionState>,
+}
+
+impl CodexImportCheckpoint {
+    fn from_prepared(prepared: &crate::db::PreparedImportFile, size_bytes: u64) -> Self {
+        let stored = prepared
+            .metadata_json
+            .as_deref()
+            .and_then(|value| serde_json::from_str::<Self>(value).ok());
+        let stored = match stored {
+            Some(stored)
+                if prepared.can_resume
+                    && prepared.last_offset == Some(stored.start_offset)
+                    && prepared
+                        .previous_size_bytes
+                        .is_none_or(|previous_size| previous_size == stored.start_offset)
+                    && stored.start_offset <= size_bytes =>
+            {
+                Some(stored)
+            }
+            _ => None,
+        };
+
+        stored.unwrap_or(Self {
+            start_offset: 0,
+            line_number: 0,
+            event_count: 0,
+            warning_count: 0,
+            first_event_ns: None,
+            last_event_ns: None,
+            state: None,
+        })
+    }
+}
+
+#[derive(Deserialize, Serialize)]
 struct SessionState {
     session_external_id: String,
     cwd: Option<String>,
@@ -751,7 +831,11 @@ impl ImportedFile {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::PathBuf};
+    use std::{
+        fs,
+        io::Write,
+        path::{Path, PathBuf},
+    };
 
     use anyhow::Result;
 
@@ -798,9 +882,119 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn imports_only_appended_codex_session_lines() -> Result<()> {
+        let root = temp_dir("codex-incremental-import");
+        fs::create_dir_all(&root)?;
+        let session_path = root.join("rollout-test.jsonl");
+        fs::write(
+            &session_path,
+            r#"{"timestamp":"2026-01-01T00:00:00.000Z","type":"session_meta","payload":{"id":"session-1","cwd":"/tmp/project","model":"gpt-test","model_provider":"openai"}}"#
+                .to_string()
+                + "\n"
+                + r#"{"timestamp":"2026-01-01T00:00:01.000Z","type":"response_item","payload":{"type":"user_message","message":"redacted","images":[]}}"#
+                + "\n"
+                + r#"{"timestamp":"2026-01-01T00:00:02.000Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":100,"cached_input_tokens":40,"output_tokens":20,"reasoning_output_tokens":5,"total_tokens":120},"model_context_window":1000}}}"#
+                + "\n",
+        )?;
+
+        let db_path = root.join("catalog.sqlite");
+        let db = Database::open(&db_path)?;
+        db.migrate()?;
+
+        let first = import(&db, Some(session_path.clone()))?;
+        let first_offset = get_import_file_i64(&db, "last_offset")?;
+        assert_eq!(first.files_imported, 1);
+        assert_eq!(first.events_projected, 2);
+        assert_eq!(count(&db, "llm_calls")?, 1);
+        assert_eq!(count(&db, "tool_calls")?, 0);
+
+        append_lines(
+            &session_path,
+            &[
+                r#"{"timestamp":"2026-01-01T00:00:03.000Z","type":"response_item","payload":{"type":"function_call","name":"shell_command","arguments":"{\"command\":\"true\"}","call_id":"call-1"}}"#,
+                r#"{"timestamp":"2026-01-01T00:00:04.000Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call-1","output":"Exit code: 0\nWall time: 0.1 seconds\nOutput:\n"}}"#,
+            ],
+        )?;
+
+        let second = import(&db, Some(session_path.clone()))?;
+        let second_offset = get_import_file_i64(&db, "last_offset")?;
+        assert_eq!(second.files_imported, 1);
+        assert_eq!(second.events_projected, 2);
+        assert!(second_offset > first_offset);
+        assert_eq!(get_import_file_i64(&db, "event_count")?, 4);
+        assert_eq!(count(&db, "sessions")?, 1);
+        assert_eq!(count(&db, "runs")?, 1);
+        assert_eq!(count(&db, "llm_calls")?, 1);
+        assert_eq!(count(&db, "tool_calls")?, 1);
+
+        let third = import(&db, Some(session_path))?;
+        assert_eq!(third.files_imported, 0);
+        assert_eq!(third.events_projected, 0);
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn truncated_codex_session_ignores_stale_checkpoint() -> Result<()> {
+        let root = temp_dir("codex-truncated-import");
+        fs::create_dir_all(&root)?;
+        let session_path = root.join("rollout-test.jsonl");
+        fs::write(
+            &session_path,
+            r#"{"timestamp":"2026-01-01T00:00:00.000Z","type":"session_meta","payload":{"id":"session-1","cwd":"/tmp/project","model":"gpt-test","model_provider":"openai"}}"#
+                .to_string()
+                + "\n"
+                + r#"{"timestamp":"2026-01-01T00:00:01.000Z","type":"response_item","payload":{"type":"user_message","message":"redacted","images":[]}}"#
+                + "\n"
+                + r#"{"timestamp":"2026-01-01T00:00:02.000Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":100,"cached_input_tokens":40,"output_tokens":20,"reasoning_output_tokens":5,"total_tokens":120},"model_context_window":1000}}}"#
+                + "\n",
+        )?;
+
+        let db_path = root.join("catalog.sqlite");
+        let db = Database::open(&db_path)?;
+        db.migrate()?;
+        let first = import(&db, Some(session_path.clone()))?;
+        assert_eq!(first.events_projected, 2);
+
+        fs::write(
+            &session_path,
+            r#"{"timestamp":"2026-01-02T00:00:00.000Z","type":"session_meta","payload":{"id":"session-1","cwd":"/tmp/project","model":"gpt-test","model_provider":"openai"}}"#
+                .to_string()
+                + "\n"
+                + r#"{"timestamp":"2026-01-02T00:00:01.000Z","type":"response_item","payload":{"type":"user_message","message":"redacted","images":[]}}"#
+                + "\n",
+        )?;
+
+        let second = import(&db, Some(session_path.clone()))?;
+        assert_eq!(second.files_imported, 1);
+        assert_eq!(second.events_projected, 1);
+        assert_eq!(
+            get_import_file_i64(&db, "last_offset")?,
+            fs::metadata(session_path)?.len() as i64
+        );
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
     fn count(db: &Database, table: &str) -> Result<i64> {
         let sql = format!("SELECT COUNT(*) FROM {table}");
         Ok(db.connection().query_row(&sql, [], |row| row.get(0))?)
+    }
+
+    fn get_import_file_i64(db: &Database, column: &str) -> Result<i64> {
+        let sql = format!("SELECT {column} FROM import_files LIMIT 1");
+        Ok(db.connection().query_row(&sql, [], |row| row.get(0))?)
+    }
+
+    fn append_lines(path: &Path, lines: &[&str]) -> Result<()> {
+        let mut file = fs::OpenOptions::new().append(true).open(path)?;
+        for line in lines {
+            writeln!(file, "{line}")?;
+        }
+        Ok(())
     }
 
     fn temp_dir(name: &str) -> PathBuf {

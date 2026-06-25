@@ -18,6 +18,12 @@ pub struct Database {
 pub struct PreparedImportFile {
     pub file_id: String,
     pub should_import: bool,
+    pub can_resume: bool,
+    pub previous_size_bytes: Option<u64>,
+    pub last_offset: Option<u64>,
+    pub event_count: usize,
+    pub warning_count: usize,
+    pub metadata_json: Option<String>,
 }
 
 pub struct BatchTransaction<'a> {
@@ -238,7 +244,8 @@ impl Database {
         let existing = self
             .conn
             .query_row(
-                "SELECT fingerprint, parser_version, status
+                "SELECT fingerprint, parser_version, status, size_bytes, last_offset,
+                    event_count, warning_count, metadata_json
                  FROM import_files
                  WHERE file_id = ?1",
                 params![file_id],
@@ -247,20 +254,59 @@ impl Database {
                         row.get::<_, String>(0)?,
                         row.get::<_, Option<String>>(1)?,
                         row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, Option<i64>>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, i64>(6)?,
+                        row.get::<_, Option<String>>(7)?,
                     ))
                 },
             )
             .optional()?;
 
-        if let Some((existing_fingerprint, existing_parser_version, status)) = existing {
-            let parser_matches = existing_parser_version.as_deref() == Some(parser_version);
-            let complete = matches!(status.as_str(), "imported" | "partial");
-            if existing_fingerprint == fingerprint && parser_matches && complete {
-                return Ok(PreparedImportFile {
-                    file_id,
-                    should_import: false,
+        let previous_size_bytes = existing
+            .as_ref()
+            .map(|(_, _, _, size_bytes, _, _, _, _)| (*size_bytes).max(0) as u64);
+        let previous_last_offset =
+            existing
+                .as_ref()
+                .and_then(|(_, _, _, _, last_offset, _, _, _)| {
+                    last_offset.map(|offset| offset.max(0) as u64)
                 });
-            }
+        let previous_event_count = existing
+            .as_ref()
+            .map(|(_, _, _, _, _, event_count, _, _)| (*event_count).max(0) as usize)
+            .unwrap_or_default();
+        let previous_warning_count = existing
+            .as_ref()
+            .map(|(_, _, _, _, _, _, warning_count, _)| (*warning_count).max(0) as usize)
+            .unwrap_or_default();
+        let previous_metadata_json = existing
+            .as_ref()
+            .and_then(|(_, _, _, _, _, _, _, metadata_json)| metadata_json.clone());
+
+        let can_resume =
+            existing
+                .as_ref()
+                .is_some_and(|(_, existing_parser_version, status, _, _, _, _, _)| {
+                    existing_parser_version.as_deref() == Some(parser_version)
+                        && matches!(status.as_str(), "imported" | "partial")
+                });
+
+        if let Some((existing_fingerprint, _, _, _, _, _, _, _)) = existing
+            && existing_fingerprint == fingerprint
+            && can_resume
+        {
+            return Ok(PreparedImportFile {
+                file_id,
+                should_import: false,
+                can_resume,
+                previous_size_bytes,
+                last_offset: previous_last_offset,
+                event_count: previous_event_count,
+                warning_count: previous_warning_count,
+                metadata_json: previous_metadata_json,
+            });
         }
 
         self.conn.execute(
@@ -294,6 +340,12 @@ impl Database {
         Ok(PreparedImportFile {
             file_id,
             should_import: true,
+            can_resume,
+            previous_size_bytes,
+            last_offset: previous_last_offset,
+            event_count: previous_event_count,
+            warning_count: previous_warning_count,
+            metadata_json: previous_metadata_json,
         })
     }
 
@@ -333,6 +385,26 @@ impl Database {
         )?;
 
         Ok(())
+    }
+
+    pub fn update_import_file_metadata(&self, file_id: &str, metadata_json: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE import_files SET metadata_json = ?2 WHERE file_id = ?1",
+            params![file_id, metadata_json],
+        )?;
+        Ok(())
+    }
+
+    pub fn latest_import_source_scan_ns(&self, source: &str) -> Result<Option<i64>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT MAX(last_scan_ns) FROM import_sources WHERE source = ?1",
+                params![source],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten())
     }
 }
 

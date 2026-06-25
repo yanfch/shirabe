@@ -2,7 +2,7 @@ use std::{
     net::SocketAddr,
     path::PathBuf,
     sync::{Arc, Mutex},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result};
@@ -15,10 +15,14 @@ use axum::{
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
-use tokio::net::TcpListener;
+use tokio::{net::TcpListener, time};
 use tower_http::{services::ServeDir, trace::TraceLayer};
 
 use crate::{db::Database, importers, rollup};
+
+const AUTO_SYNC_INTERVAL: Duration = Duration::from_secs(5 * 60);
+const SYNC_WATERMARK_OVERLAP_NS: i64 = 10 * 60 * 1_000_000_000;
+const FALLBACK_RECENT_SYNC_WINDOW_NS: i64 = 36 * 60 * 60 * 1_000_000_000;
 
 #[derive(Debug)]
 struct AppState {
@@ -36,6 +40,7 @@ pub async fn serve(db_path: PathBuf, bind: String, ui_dir: PathBuf) -> Result<()
         ui_dir,
         sync: Mutex::new(SyncStatus::default()),
     });
+    spawn_auto_sync(state.clone());
 
     let app = Router::new()
         .route("/api/health", get(health))
@@ -96,10 +101,20 @@ async fn sync_status(State(state): State<Arc<AppState>>) -> Response {
 }
 
 async fn start_sync(State(state): State<Arc<AppState>>) -> Response {
+    match try_start_sync_job(state.clone()) {
+        Some(response) => (StatusCode::ACCEPTED, Json(response)).into_response(),
+        None => {
+            let sync = current_sync_status(&state);
+            (StatusCode::ACCEPTED, Json(sync)).into_response()
+        }
+    }
+}
+
+fn try_start_sync_job(state: Arc<AppState>) -> Option<SyncStatus> {
     let response = {
         let mut sync = state.sync.lock().expect("sync status lock poisoned");
         if sync.state == "running" {
-            return (StatusCode::ACCEPTED, Json(sync.clone())).into_response();
+            return None;
         }
 
         *sync = SyncStatus::running();
@@ -109,7 +124,16 @@ async fn start_sync(State(state): State<Arc<AppState>>) -> Response {
     let job_state = state.clone();
     tokio::task::spawn_blocking(move || run_sync_job(job_state));
 
-    (StatusCode::ACCEPTED, Json(response)).into_response()
+    Some(response)
+}
+
+fn spawn_auto_sync(state: Arc<AppState>) {
+    tokio::spawn(async move {
+        loop {
+            time::sleep(AUTO_SYNC_INTERVAL).await;
+            let _ = try_start_sync_job(state.clone());
+        }
+    });
 }
 
 async fn sessions(State(state): State<Arc<AppState>>) -> Response {
@@ -1163,15 +1187,22 @@ fn run_sync_job_inner(state: &Arc<AppState>) -> Result<()> {
         .with_context(|| format!("open sqlite {}", state.db_path.display()))?;
     db.migrate()?;
 
+    let mut imported_files = 0usize;
     for source in ["codex", "pi", "claude", "kanade"] {
         set_sync_phase(state, &format!("import {source}"));
         let report = import_sync_source(&db, source);
+        imported_files = imported_files.saturating_add(report.files_imported);
         state
             .sync
             .lock()
             .expect("sync status lock poisoned")
             .sources
             .push(report);
+    }
+
+    if imported_files == 0 {
+        set_sync_phase(state, "complete");
+        return Ok(());
     }
 
     set_sync_phase(state, "refresh rollups");
@@ -1195,7 +1226,7 @@ fn set_sync_phase(state: &AppState, phase: &str) {
 
 fn import_sync_source(db: &Database, source: &str) -> SyncSourceReport {
     let started = Instant::now();
-    let modified_since_ns = sync_modified_since_ns();
+    let modified_since_ns = sync_modified_since_ns(db, source);
     let result = match source {
         "codex" => importers::codex::import_recent(db, None, modified_since_ns),
         "pi" => importers::pi::import_recent(db, None, modified_since_ns),
@@ -1230,9 +1261,12 @@ fn import_sync_source(db: &Database, source: &str) -> SyncSourceReport {
     }
 }
 
-fn sync_modified_since_ns() -> i64 {
-    const RECENT_SYNC_WINDOW_NS: i64 = 36 * 60 * 60 * 1_000_000_000;
-    crate::db::now_ns().saturating_sub(RECENT_SYNC_WINDOW_NS)
+fn sync_modified_since_ns(db: &Database, source: &str) -> i64 {
+    db.latest_import_source_scan_ns(source)
+        .ok()
+        .flatten()
+        .map(|last_scan_ns| last_scan_ns.saturating_sub(SYNC_WATERMARK_OVERLAP_NS))
+        .unwrap_or_else(|| crate::db::now_ns().saturating_sub(FALLBACK_RECENT_SYNC_WINDOW_NS))
 }
 
 fn elapsed_ms(started: Instant) -> i64 {
