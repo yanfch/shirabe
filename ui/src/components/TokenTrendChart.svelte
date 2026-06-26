@@ -150,7 +150,7 @@
     const localY = event.clientY - rect.top;
     hover = {
       index,
-      x: Math.min(Math.max(localX, 92), Math.max(92, rect.width - 92)),
+      x: Math.min(Math.max(localX, 100), Math.max(100, rect.width - 100)),
       y: Math.min(Math.max(localY, 46), rect.height - 8),
     };
   }
@@ -228,7 +228,13 @@
       <div class="token-chart-y bottom">0</div>
       <div class="token-chart-stage">
         <div class="token-grid-lines" aria-hidden="true"></div>
-        <div class="token-bars" style={`--bar-count: ${displayBuckets.length};`} role="img" aria-label="Token consumption trend">
+        <div
+          class="token-bars"
+          style={`--bar-count: ${displayBuckets.length};`}
+          role="img"
+          aria-label="Token consumption trend"
+          on:mouseleave={() => (hover = null)}
+        >
           {#each displayBuckets as bucket, index (bucket.bucket_key)}
             {@const total = totalFor(bucket.summary)}
             <button
@@ -241,7 +247,6 @@
               class:quiet={total === 0}
               on:mousemove={(event) => showTooltip(event, index)}
               on:mouseenter={(event) => showTooltip(event, index)}
-              on:mouseleave={() => (hover = null)}
             >
               <span class="token-bar-fill"></span>
             </button>

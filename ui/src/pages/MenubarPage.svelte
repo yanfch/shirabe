@@ -1105,8 +1105,8 @@
 
   .trend-bar.active,
   .trend-bar:focus-visible {
-    border-color: rgba(242, 238, 226, 0.72);
-    box-shadow: 0 0 0 1px rgba(242, 238, 226, 0.16), 0 0 16px rgba(141, 181, 106, 0.18);
+    border-color: rgba(141, 181, 106, 0.92);
+    box-shadow: 0 0 0 1px rgba(141, 181, 106, 0.2), 0 0 16px rgba(141, 181, 106, 0.22);
     outline: none;
   }
 

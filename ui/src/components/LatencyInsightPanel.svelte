@@ -186,17 +186,22 @@
   }
 
   function showTooltip(event: MouseEvent | FocusEvent, bucket: LatencyBucketSummary) {
-    const stage = event.currentTarget instanceof HTMLElement
-      ? event.currentTarget.closest(".latency-chart-stage")
-      : null;
-    const rect = stage?.getBoundingClientRect();
-    if (!rect) return;
-    const clientX = "clientX" in event ? event.clientX : rect.left + rect.width / 2;
-    const clientY = "clientY" in event ? event.clientY : rect.top + rect.height / 2;
+    const column = event.currentTarget instanceof HTMLElement ? event.currentTarget : null;
+    const stage = column?.closest(".latency-chart-stage");
+    const stageRect = stage?.getBoundingClientRect();
+    const columnRect = column?.getBoundingClientRect();
+    if (!stageRect || !columnRect) return;
+
+    const localX = "clientX" in event
+      ? event.clientX - stageRect.left
+      : columnRect.left + columnRect.width / 2 - stageRect.left;
+    const localY = "clientY" in event
+      ? event.clientY - stageRect.top
+      : columnRect.top - stageRect.top;
     hover = {
       bucket,
-      x: Math.min(Math.max(clientX - rect.left, 96), Math.max(96, rect.width - 96)),
-      y: Math.min(Math.max(clientY - rect.top, 48), rect.height - 12),
+      x: Math.min(Math.max(localX, 96), Math.max(96, stageRect.width - 96)),
+      y: Math.min(Math.max(localY, 48), stageRect.height - 12),
     };
   }
 </script>
@@ -233,6 +238,7 @@
             <button
               type="button"
               class="latency-chart-column"
+              class:active={hoveredBucket === bucket}
               aria-label={`${bucketLabel(bucket)} p50 ${fmtLatency(bucket.p50_response_delay_ns)} p90 ${fmtLatency(bucket.p90_response_delay_ns)} ${bucket.good_calls} calls`}
               on:mouseenter={(event) => showTooltip(event, bucket)}
               on:mousemove={(event) => showTooltip(event, bucket)}
