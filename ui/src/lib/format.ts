@@ -20,10 +20,11 @@ export function fmtPercent(value: number | null | undefined) {
 
 export function fmtCost(value: number | null | undefined) {
   if (value == null) return "-";
+  if (value === 0) return "$0";
   return new Intl.NumberFormat("en-US", {
     currency: "USD",
-    maximumFractionDigits: value >= 1 ? 2 : 4,
-    minimumFractionDigits: value >= 1 ? 2 : 4,
+    maximumFractionDigits: 2,
+    minimumFractionDigits: 0,
     style: "currency",
   }).format(value);
 }

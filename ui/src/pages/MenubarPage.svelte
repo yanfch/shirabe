@@ -70,6 +70,7 @@
   $: latencyBaseline = latencyPanel?.baseline ?? null;
   $: latencySlowestProvider = latencyCurrent?.slowest_provider ?? null;
   $: latencyProviderDrag = providerDrag(latencyPanel?.provider_patterns ?? []);
+  $: latestRunTime = latestRun ? formatCompactDateTime(latestRun.started_at_ns) : null;
 
   function normalizeRange(value: string | null): RangeOption {
     return value === "7d" || value === "30d" ? value : "today";
@@ -81,6 +82,15 @@
 
   function formatClockTime(ns: number) {
     return new Date(Math.floor(ns / 1_000_000)).toLocaleTimeString([], {
+      hour: "2-digit",
+      minute: "2-digit",
+    });
+  }
+
+  function formatCompactDateTime(ns: number) {
+    return new Date(Math.floor(ns / 1_000_000)).toLocaleString([], {
+      month: "short",
+      day: "numeric",
       hour: "2-digit",
       minute: "2-digit",
     });
@@ -347,7 +357,14 @@
         <div class="hero-kicker">{rangeCaption(trendRange)}</div>
         {#if isRangeEmpty}
           <div class="hero-value empty-value">No usage</div>
-          <div class="hero-caption">{emptyCaption}</div>
+          {#if latestRun && latestRunTime}
+            <div class="hero-caption empty-caption" title={emptyCaption}>
+              <span>Last active {latestRunTime}</span>
+              <span>{latestRun.source}</span>
+            </div>
+          {:else}
+            <div class="hero-caption">{emptyCaption}</div>
+          {/if}
         {:else}
           <div class="hero-value">{fmtCompact(totalTokens)}</div>
           <div class="hero-caption">
@@ -889,6 +906,19 @@
   .hero-caption {
     margin-top: 5px;
     font-size: 11px;
+  }
+
+  .empty-caption {
+    display: grid;
+    gap: 2px;
+    max-width: 100%;
+  }
+
+  .empty-caption span {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .mini-metrics {
