@@ -99,5 +99,8 @@ package-cli:
 package-macos:
     ./script/package_macos_dmg.sh
 
-package: package-cli package-macos
+package:
+    rm -rf dist/release
+    just package-cli
+    just package-macos
     cd dist/release && shasum -a 256 *.tar.gz *.dmg > SHA256SUMS
