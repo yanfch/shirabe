@@ -23,7 +23,7 @@
 
 # Local design notes and generated visual assets
 /assets/
-/docs/
+/private-docs/
 /prototypes/
 
 # macOS/editor noise
