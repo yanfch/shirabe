@@ -6,7 +6,7 @@ Shirabe imports local agent logs into SQLite, normalizes them into common
 operation records, computes usage rollups, and exposes both a full web dashboard
 and a compact macOS menu bar view.
 
-## Screenshots
+## Interface
 
 | Usage Dashboard | macOS Menu Bar |
 | --- | --- |
