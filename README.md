@@ -46,10 +46,10 @@ http://127.0.0.1:7778
 
 Supported local sources:
 
-- Codex: `~/.codex/sessions`
-- pi: `~/.pi/agent/sessions`
-- Claude Code: `~/.claude/projects`
-- Kanade: `~/.kanade/traces`
+- Codex: sessions, runs, turns, token usage, tools, skills, and trace detail from `~/.codex/sessions`.
+- pi: sessions, runs, token usage, tools, failures, and skills from `~/.pi/agent/sessions`.
+- Claude Code: local usage, sessions, tools, and cost estimates from `~/.claude/projects`.
+- Kanade: workflow/task traces, spans, token usage, models, and tools from `~/.kanade/traces`.
 
 Override source paths with `~/.shirabe/config.json`. See
 [configuration](docs/beta-configuration.md#configuration).
