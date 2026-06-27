@@ -120,8 +120,15 @@ Use the macOS menu bar package by opening the DMG and dragging
 when no server is already running on `127.0.0.1:7778`.
 
 Unsigned beta builds may show a macOS warning that the developer cannot be
-verified. Open the app with Control-click, then Open. For wider distribution,
-set `SIGN_IDENTITY` and notarize with Apple Developer ID:
+verified. Open the app with Control-click, then Open. CLI downloads may inherit
+the same quarantine flag; remove it after extracting if macOS blocks
+`bin/shirabe`:
+
+```bash
+xattr -dr com.apple.quarantine shirabe-v<version>-aarch64-apple-darwin
+```
+
+For wider distribution, set `SIGN_IDENTITY` and notarize with Apple Developer ID:
 
 ```bash
 SIGN_IDENTITY="Developer ID Application: Example (TEAMID)" \
@@ -195,7 +202,8 @@ shirabe import codex --path /path/to/codex/sessions
 ```
 
 For the server and menu bar app, configure source paths in
-`$SHIRABE_DIR/config.json`:
+`$SHIRABE_DIR/config.json`. With the default data directory, that file is
+`~/.shirabe/config.json`:
 
 ```json
 {
