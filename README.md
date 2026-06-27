@@ -93,6 +93,43 @@ just macos-run
 The menu bar app expects the local server at `http://127.0.0.1:7778`. If the
 popover shows offline, run `just restart`.
 
+## Beta Distribution
+
+GitHub beta releases ship two artifacts:
+
+- `shirabe-v<version>-<target>.tar.gz`: CLI/server plus the built web UI.
+- `ShirabeBar-v<version>-<target>.dmg`: macOS menu bar app with the server and UI bundled.
+
+Build both locally:
+
+```bash
+just package
+```
+
+Use the CLI package without the menu bar app:
+
+```bash
+tar -xzf shirabe-v<version>-aarch64-apple-darwin.tar.gz
+cd shirabe-v<version>-aarch64-apple-darwin
+./bin/shirabe init
+./bin/shirabe serve --ui-dir ./ui/dist
+```
+
+Use the macOS menu bar package by opening the DMG and dragging
+`ShirabeBar.app` into Applications. The app starts its bundled Shirabe server
+when no server is already running on `127.0.0.1:7778`.
+
+Unsigned beta builds may show a macOS warning that the developer cannot be
+verified. Open the app with Control-click, then Open. For wider distribution,
+set `SIGN_IDENTITY` and notarize with Apple Developer ID:
+
+```bash
+SIGN_IDENTITY="Developer ID Application: Example (TEAMID)" \
+NOTARIZE=1 \
+NOTARY_PROFILE=shirabe-notary \
+just package-macos
+```
+
 ## Development
 
 Useful commands:
@@ -142,6 +179,43 @@ override it with:
 
 ```bash
 SHIRABE_DIR=/path/to/data cargo run -- init
+```
+
+Importer source paths default to local agent data under your home directory:
+
+- Codex: `~/.codex/sessions`
+- pi: `~/.pi/agent/sessions`
+- Claude Code: `~/.claude/projects`
+- Kanade: `~/.kanade/traces`
+
+Override a one-off import with `--path`:
+
+```bash
+shirabe import codex --path /path/to/codex/sessions
+```
+
+For the server and menu bar app, configure source paths in
+`$SHIRABE_DIR/config.json`:
+
+```json
+{
+  "sources": {
+    "codex": "~/Library/Application Support/Codex/sessions",
+    "pi": "~/.pi/agent/sessions",
+    "claude": "~/.claude/projects",
+    "kanade": "~/.kanade/traces"
+  }
+}
+```
+
+Environment variables are also supported. Exact session/project paths take
+precedence over root directories:
+
+```bash
+SHIRABE_CODEX_SESSIONS_DIR=/path/to/sessions
+SHIRABE_PI_DIR=/path/to/.pi
+SHIRABE_CLAUDE_DIR=/path/to/.claude
+SHIRABE_KANADE_DIR=/path/to/.kanade
 ```
 
 The project is local-only today. It does not upload agent logs or usage data.

@@ -92,3 +92,12 @@ macos-run:
 
 macos-verify:
     ./script/build_and_run.sh --verify
+
+package-cli:
+    ./script/package_cli.sh
+
+package-macos:
+    ./script/package_macos_dmg.sh
+
+package: package-cli package-macos
+    cd dist/release && shasum -a 256 *.tar.gz *.dmg > SHA256SUMS

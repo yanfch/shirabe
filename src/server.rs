@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use tokio::{net::TcpListener, time};
 use tower_http::{services::ServeDir, trace::TraceLayer};
 
-use crate::{db::Database, importers, rollup};
+use crate::{config::SourcePaths, db::Database, importers, rollup};
 
 const AUTO_SYNC_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const SYNC_WATERMARK_OVERLAP_NS: i64 = 10 * 60 * 1_000_000_000;
@@ -29,16 +29,23 @@ const FALLBACK_RECENT_SYNC_WINDOW_NS: i64 = 36 * 60 * 60 * 1_000_000_000;
 struct AppState {
     db_path: PathBuf,
     ui_dir: PathBuf,
+    source_paths: SourcePaths,
     sync: Mutex<SyncStatus>,
 }
 
-pub async fn serve(db_path: PathBuf, bind: String, ui_dir: PathBuf) -> Result<()> {
+pub async fn serve(
+    db_path: PathBuf,
+    bind: String,
+    ui_dir: PathBuf,
+    source_paths: SourcePaths,
+) -> Result<()> {
     let addr: SocketAddr = bind
         .parse()
         .with_context(|| format!("parse bind address {bind}"))?;
     let state = Arc::new(AppState {
         db_path,
         ui_dir,
+        source_paths,
         sync: Mutex::new(SyncStatus::default()),
     });
     spawn_auto_sync(state.clone());
@@ -1302,7 +1309,7 @@ fn run_sync_job_inner(state: &Arc<AppState>) -> Result<()> {
     let mut imported_files = 0usize;
     for source in ["codex", "pi", "claude", "kanade"] {
         set_sync_phase(state, &format!("import {source}"));
-        let report = import_sync_source(&db, source);
+        let report = import_sync_source(&db, source, &state.source_paths);
         imported_files = imported_files.saturating_add(report.files_imported);
         state
             .sync
@@ -1336,14 +1343,24 @@ fn set_sync_phase(state: &AppState, phase: &str) {
     state.sync.lock().expect("sync status lock poisoned").phase = phase.to_string();
 }
 
-fn import_sync_source(db: &Database, source: &str) -> SyncSourceReport {
+fn import_sync_source(db: &Database, source: &str, source_paths: &SourcePaths) -> SyncSourceReport {
     let started = Instant::now();
     let modified_since_ns = sync_modified_since_ns(db, source);
     let result = match source {
-        "codex" => importers::codex::import_recent(db, None, modified_since_ns),
-        "pi" => importers::pi::import_recent(db, None, modified_since_ns),
-        "claude" => importers::claude::import_recent(db, None, modified_since_ns),
-        "kanade" => importers::kanade::import_recent(db, None, modified_since_ns),
+        "codex" => {
+            importers::codex::import_recent(db, Some(source_paths.codex.clone()), modified_since_ns)
+        }
+        "pi" => importers::pi::import_recent(db, Some(source_paths.pi.clone()), modified_since_ns),
+        "claude" => importers::claude::import_recent(
+            db,
+            Some(source_paths.claude.clone()),
+            modified_since_ns,
+        ),
+        "kanade" => importers::kanade::import_recent(
+            db,
+            Some(source_paths.kanade.clone()),
+            modified_since_ns,
+        ),
         _ => unreachable!("unsupported sync source"),
     };
 
@@ -1779,6 +1796,9 @@ struct LatencySample {
     delay_ns: i64,
 }
 
+const MIN_LATENCY_GOOD_CALLS: i64 = 20;
+const MIN_LATENCY_ACTIVE_GOOD_HOURS_FOR_PATTERN: i64 = 3;
+
 fn latency_panel_from_observations(
     conn: &Connection,
     filters: &UsageFilters,
@@ -1823,7 +1843,7 @@ fn load_today_latency_panel(
     let current_p50 = percentile_i64_sorted_copy(&current_delays, 0.5);
     let ratio_to_baseline = ratio_i64(current_p50, baseline_p50);
 
-    let status = if baseline.good_calls < 20 || baseline.active_good_hours < 3 {
+    let status = if baseline.good_calls < MIN_LATENCY_GOOD_CALLS {
         "learning"
     } else if current_samples.len() < 5 {
         "normal"
@@ -1857,7 +1877,8 @@ fn load_today_latency_panel(
 
 fn load_pattern_latency_panel(samples: Vec<LatencySample>) -> LatencyPanel {
     let baseline = latency_baseline(&samples);
-    let learning = baseline.good_calls < 20 || baseline.active_good_hours < 3;
+    let learning = baseline.good_calls < MIN_LATENCY_GOOD_CALLS
+        || baseline.active_good_hours < MIN_LATENCY_ACTIVE_GOOD_HOURS_FOR_PATTERN;
     let (best_windows, slow_windows) = if learning {
         (Vec::new(), Vec::new())
     } else {
@@ -4194,8 +4215,8 @@ mod tests {
     };
 
     use super::{
-        UsageFilters, UsageQuery, load_overview, load_run_detail, load_session_detail,
-        load_sessions, load_usage,
+        LatencySample, UsageFilters, UsageQuery, load_overview, load_pattern_latency_panel,
+        load_run_detail, load_session_detail, load_sessions, load_today_latency_panel, load_usage,
     };
 
     #[test]
@@ -4604,6 +4625,26 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn today_latency_panel_leaves_learning_after_enough_calls_without_hour_coverage() -> Result<()>
+    {
+        let db_path = temp_db_path("today-latency-learning");
+        let db = Database::open(&db_path)?;
+        db.migrate()?;
+        let samples = latency_samples_in_hour(20, 9);
+
+        let today_panel = load_today_latency_panel(db.connection(), samples.clone())?;
+        let pattern_panel = load_pattern_latency_panel(samples);
+
+        assert_eq!(today_panel.status, "normal");
+        assert_eq!(today_panel.baseline.good_calls, 20);
+        assert_eq!(today_panel.baseline.active_good_hours, 1);
+        assert_eq!(pattern_panel.status, "learning");
+
+        let _ = fs::remove_file(db_path);
+        Ok(())
+    }
+
     fn temp_db_path(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("shirabe-{name}-{}.sqlite", std::process::id()))
     }
@@ -4659,5 +4700,15 @@ mod tests {
             skill_events: Vec::new(),
             confidence: 1.0,
         }
+    }
+
+    fn latency_samples_in_hour(count: usize, hour: usize) -> Vec<LatencySample> {
+        (0..count)
+            .map(|index| LatencySample {
+                provider: "openai".to_string(),
+                hour,
+                delay_ns: (index as i64 + 1) * 1_000_000_000,
+            })
+            .collect()
     }
 }

@@ -68,6 +68,8 @@
   $: latencyStatus = latencyPanel ? latencyStatusLabel(latencyPanel.status, trendRange) : "-";
   $: latencyCurrent = latencyPanel?.current ?? null;
   $: latencyBaseline = latencyPanel?.baseline ?? null;
+  $: isLatencySlow = latencyPanel?.status === "slower" || latencyPanel?.status === "very_slow";
+  $: isLatencyStableToday = latencyPanel?.mode === "today" && latencyPanel?.status === "normal";
   $: latencySlowestProvider = latencyCurrent?.slowest_provider ?? null;
   $: latencyProviderDrag = providerDrag(latencyPanel?.provider_patterns ?? []);
   $: latestRunTime = latestRun ? formatCompactDateTime(latestRun.started_at_ns) : null;
@@ -514,7 +516,7 @@
         <span class="corner bl"></span><span class="corner br"></span>
         <div class="section-heading">
           <span>AI Latency</span>
-          <em class:attention={latencyPanel?.status === "slower" || latencyPanel?.status === "very_slow"}>{latencyStatus}</em>
+          <em class:attention={isLatencySlow} class:ok={isLatencyStableToday}>{latencyStatus}</em>
         </div>
 
         {#if !latencyPanel}
@@ -532,8 +534,8 @@
         {:else if latencyPanel.mode === "today"}
           <div class="latency-grid">
             <div>
-              <strong>{fmtLatency(latencyCurrent?.p50_response_delay_ns ?? latencyBaseline?.p50_response_delay_ns)}</strong>
-              <span>{(latencyCurrent?.good_calls ?? 0) >= 5 ? "p50 response" : "today p50"}</span>
+              <strong class:ok={isLatencyStableToday}>{fmtLatency(latencyCurrent?.p50_response_delay_ns ?? latencyBaseline?.p50_response_delay_ns)}</strong>
+              <span>{(latencyCurrent?.good_calls ?? 0) >= 5 ? "current p50" : "today p50"}</span>
             </div>
             <div>
               <strong class:attention={(latencyCurrent?.ratio_to_baseline ?? 0) >= 1.3}>
@@ -550,7 +552,7 @@
               <strong>No calls this hour</strong>
             {/if}
           </div>
-          <div class="latency-list">
+          <div class="latency-list" class:slow={isLatencySlow} class:stable={isLatencyStableToday && latencyPanel.slow_hours.length === 0}>
             <div class="latency-list-label">Slow hours</div>
             {#each latencyPanel.slow_hours.slice(0, 3) as hour}
               <div class:current={hour.is_current}>
@@ -559,7 +561,11 @@
                 <em style={`--latency-fill: ${Math.min(1, (hour.ratio_to_baseline ?? 1) / 3).toFixed(2)}`}></em>
               </div>
             {:else}
-              <div class="latency-muted">Stable today · no slow spikes</div>
+              <div>
+                <span>Today</span>
+                <strong>{fmtLatency(latencyCurrent?.p50_response_delay_ns ?? latencyBaseline?.p50_response_delay_ns)}</strong>
+                <em style="--latency-fill: 0.72"></em>
+              </div>
             {/each}
           </div>
         {:else}
@@ -1223,6 +1229,11 @@
     color: var(--amber);
   }
 
+  .latency-grid .ok,
+  .section-heading em.ok {
+    color: var(--green);
+  }
+
   .latency-provider {
     display: grid;
     grid-template-columns: 96px minmax(0, 1fr);
@@ -1263,11 +1274,6 @@
     grid-template-columns: 72px minmax(0, 1fr);
   }
 
-  .latency-list .current span,
-  .latency-list .current strong {
-    color: var(--amber);
-  }
-
   .latency-list em {
     display: block;
     height: 6px;
@@ -1276,6 +1282,10 @@
     opacity: calc(0.35 + var(--latency-fill, 0.5) * 0.65);
     transform-origin: left center;
     transform: scaleX(var(--latency-fill, 0.5));
+  }
+
+  .latency-list.stable em {
+    background: linear-gradient(90deg, rgba(141, 181, 106, 0.86), rgba(141, 181, 106, 0.26));
   }
 
   .latency-pattern {

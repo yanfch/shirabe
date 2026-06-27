@@ -47,15 +47,27 @@ async fn main() -> Result<()> {
                 spawn_parent_exit_watchdog(parent_pid);
             }
             let ui_dir = ui_dir.unwrap_or(paths.ui_dist);
-            server::serve(paths.catalog_db, bind, ui_dir).await?;
+            server::serve(paths.catalog_db, bind, ui_dir, paths.source_paths).await?;
         }
         Commands::Import { source, path } => {
             database.migrate()?;
             let report = match source {
-                ImportSource::Codex => importers::codex::import(&database, path)?,
-                ImportSource::Claude => importers::claude::import(&database, path)?,
-                ImportSource::Kanade => importers::kanade::import(&database, path)?,
-                ImportSource::Pi => importers::pi::import(&database, path)?,
+                ImportSource::Codex => importers::codex::import(
+                    &database,
+                    path.or_else(|| Some(paths.source_paths.codex.clone())),
+                )?,
+                ImportSource::Claude => importers::claude::import(
+                    &database,
+                    path.or_else(|| Some(paths.source_paths.claude.clone())),
+                )?,
+                ImportSource::Kanade => importers::kanade::import(
+                    &database,
+                    path.or_else(|| Some(paths.source_paths.kanade.clone())),
+                )?,
+                ImportSource::Pi => importers::pi::import(
+                    &database,
+                    path.or_else(|| Some(paths.source_paths.pi.clone())),
+                )?,
             };
             let rollup_report = rollup::refresh_all(&database)?;
             tracing::info!(
