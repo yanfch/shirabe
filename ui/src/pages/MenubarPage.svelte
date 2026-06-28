@@ -675,7 +675,7 @@
       repeating-linear-gradient(0deg, transparent 0, transparent 23px, rgba(231, 224, 210, 0.034) 24px),
       repeating-linear-gradient(90deg, transparent 0, transparent 23px, rgba(231, 224, 210, 0.03) 24px),
       radial-gradient(circle at 12% 0%, rgba(231, 224, 210, 0.03), transparent 30%),
-      linear-gradient(rgba(15, 18, 18, 0.95), rgba(15, 18, 18, 0.95));
+      linear-gradient(rgba(15, 18, 18, 0.9), rgba(15, 18, 18, 0.9));
     box-shadow:
       0 18px 34px rgba(0, 0, 0, 0.26),
       inset 0 1px 0 rgba(242, 238, 226, 0.035),
@@ -754,7 +754,7 @@
     border-radius: 4px;
     background:
       linear-gradient(180deg, rgba(231, 224, 210, 0.025), transparent),
-      rgba(13, 15, 14, 0.74);
+      rgba(13, 15, 14, 0.64);
     color: var(--muted);
     cursor: pointer;
     transition: border-color 120ms ease, background 120ms ease, color 120ms ease;
@@ -797,7 +797,7 @@
     overflow: hidden;
     background:
       repeating-linear-gradient(90deg, transparent 0, transparent 23px, rgba(231, 224, 210, 0.014) 24px),
-      rgba(8, 10, 9, 0.36);
+      rgba(8, 10, 9, 0.32);
   }
 
   .range-tabs button {
@@ -844,7 +844,7 @@
       repeating-linear-gradient(0deg, transparent 0, transparent 23px, rgba(231, 224, 210, 0.026) 24px),
       repeating-linear-gradient(90deg, transparent 0, transparent 23px, rgba(231, 224, 210, 0.022) 24px),
       radial-gradient(circle at 18% 0%, rgba(141, 181, 106, 0.035), transparent 34%),
-      rgba(11, 13, 12, 0.6);
+      rgba(11, 13, 12, 0.53);
     box-shadow: inset 0 1px 0 rgba(242, 238, 226, 0.02);
   }
 
@@ -861,7 +861,7 @@
       repeating-linear-gradient(0deg, transparent 0, transparent 23px, rgba(231, 224, 210, 0.024) 24px),
       repeating-linear-gradient(90deg, transparent 0, transparent 23px, rgba(231, 224, 210, 0.02) 24px),
       linear-gradient(90deg, rgba(141, 181, 106, 0.065), transparent 58%),
-      rgba(11, 13, 12, 0.6);
+      rgba(11, 13, 12, 0.53);
   }
 
   .hero-block::after {
