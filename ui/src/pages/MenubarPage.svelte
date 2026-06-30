@@ -1081,11 +1081,11 @@
     border-radius: 3px 3px 0 0;
     background: linear-gradient(
       180deg,
-      rgb(141 181 106 / var(--fill-top, 0.72)),
-      rgb(141 181 106 / var(--fill-bottom, 0.24))
+      rgb(143 185 105 / var(--fill-top, 0.72)),
+      rgb(143 185 105 / var(--fill-bottom, 0.24))
     );
-    border: 1px solid rgb(141 181 106 / var(--border-alpha, 0.58));
-    box-shadow: 0 0 12px rgb(141 181 106 / var(--glow-alpha, 0.1));
+    border: 1px solid rgb(143 185 105 / var(--border-alpha, 0.58));
+    box-shadow: 0 0 12px rgb(143 185 105 / var(--glow-alpha, 0.1));
     cursor: default;
     padding: 0;
   }
@@ -1111,8 +1111,10 @@
 
   .trend-bar.active,
   .trend-bar:focus-visible {
-    border-color: rgba(141, 181, 106, 0.92);
-    box-shadow: 0 0 0 1px rgba(141, 181, 106, 0.2), 0 0 16px rgba(141, 181, 106, 0.22);
+    border-color: var(--text);
+    box-shadow:
+      0 0 0 1px rgba(231, 224, 210, 0.42),
+      0 0 16px rgba(143, 185, 105, 0.22);
     outline: none;
   }
 

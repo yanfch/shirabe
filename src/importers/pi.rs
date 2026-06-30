@@ -526,8 +526,11 @@ impl SessionState {
     }
 
     fn apply_model_change(&mut self, entry: &Map<String, Value>) {
-        self.model = string_field(entry, "modelId").or_else(|| self.model.clone());
-        self.provider = string_field(entry, "provider").or_else(|| self.provider.clone());
+        let provider = string_field(entry, "provider").or_else(|| self.provider.clone());
+        let model = string_field(entry, "modelId").or_else(|| self.model.clone());
+        let (provider, model) = normalize_provider_and_model(provider, model);
+        self.provider = provider;
+        self.model = model;
     }
 
     fn apply_thinking_level(&mut self, entry: &Map<String, Value>) {
@@ -584,12 +587,18 @@ impl SessionState {
     }
 
     fn message_model(&self, message: &Map<String, Value>) -> Option<String> {
-        string_field(message, "model").or_else(|| self.model.clone())
+        let provider = string_field(message, "provider").or_else(|| self.provider.clone());
+        let model = string_field(message, "model").or_else(|| self.model.clone());
+        let (_, model) = normalize_provider_and_model(provider, model);
+        model
     }
 
     fn usage_from_message(&mut self, message: &Map<String, Value>) -> Usage {
-        self.provider = string_field(message, "provider").or_else(|| self.provider.clone());
-        self.model = string_field(message, "model").or_else(|| self.model.clone());
+        let provider = string_field(message, "provider").or_else(|| self.provider.clone());
+        let model = string_field(message, "model").or_else(|| self.model.clone());
+        let (provider, model) = normalize_provider_and_model(provider, model);
+        self.provider = provider;
+        self.model = model;
         self.api = string_field(message, "api").or_else(|| self.api.clone());
 
         let usage = message.get("usage").and_then(Value::as_object);
@@ -810,6 +819,52 @@ fn entry_timestamp_ns(entry: &Map<String, Value>) -> Option<i64> {
         })
 }
 
+fn normalize_provider_and_model(
+    provider: Option<String>,
+    model: Option<String>,
+) -> (Option<String>, Option<String>) {
+    let provider = provider.and_then(|value| non_empty(&value));
+    let model = model.and_then(|value| non_empty(&value));
+
+    let Some(model) = model else {
+        return (provider, None);
+    };
+
+    if let Some(provider_value) = provider.as_deref() {
+        for separator in ['/', ':'] {
+            if let Some(rest) = model.strip_prefix(provider_value)
+                && let Some(rest) = rest.strip_prefix(separator)
+            {
+                return (provider, non_empty(rest));
+            }
+        }
+        if let Some((_, derived_model)) = split_model_slug(&model) {
+            return (provider, Some(derived_model));
+        }
+        return (provider, Some(model));
+    }
+
+    if let Some((_, derived_model)) = split_model_slug(&model) {
+        return (None, Some(derived_model));
+    }
+
+    (provider, Some(model))
+}
+
+fn split_model_slug(model: &str) -> Option<(String, String)> {
+    for separator in ['/', ':'] {
+        if let Some((derived_provider, derived_model)) = model.split_once(separator) {
+            let derived_provider = non_empty(derived_provider);
+            let derived_model = non_empty(derived_model);
+            if let (Some(derived_provider), Some(derived_model)) = (derived_provider, derived_model)
+            {
+                return Some((derived_provider, derived_model));
+            }
+        }
+    }
+    None
+}
+
 fn string_field(payload: &Map<String, Value>, key: &str) -> Option<String> {
     payload.get(key).and_then(|value| match value {
         Value::String(value) => Some(value.clone()),
@@ -845,6 +900,11 @@ fn bool_field(payload: &Map<String, Value>, key: &str) -> Option<bool> {
         Value::String(value) => value.parse().ok(),
         _ => None,
     })
+}
+
+fn non_empty(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
 fn value_len(value: &Value) -> usize {
@@ -1011,6 +1071,74 @@ mod tests {
         assert_eq!(input_tokens, 100);
         assert_eq!(cache_read_tokens, 40);
         assert!((total_cost_usd - 0.033).abs() < f64::EPSILON);
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn splits_provider_prefix_from_pi_model_names() -> Result<()> {
+        let root = temp_dir("pi-import-provider-model");
+        fs::create_dir_all(&root)?;
+        let session_path = root.join("pi-session.jsonl");
+        fs::write(
+            &session_path,
+            r#"{"type":"session","id":"session-1","timestamp":"2026-01-01T00:00:00.000Z","cwd":"/tmp/project","version":1}"#
+                .to_string()
+                + "\n"
+                + r#"{"type":"model_change","id":"model-1","parentId":"session-1","timestamp":"2026-01-01T00:00:00.100Z","provider":"cline-pass","modelId":"cline-pass/deepseek-v4-flash"}"#
+                + "\n"
+                + r#"{"type":"message","id":"assistant-1","parentId":"model-1","timestamp":"2026-01-01T00:00:02.000Z","message":{"role":"assistant","content":[],"provider":"cline-pass","model":"cline-pass/deepseek-v4-flash","usage":{"input":60,"output":20,"cacheRead":40,"totalTokens":120},"timestamp":1767225602000}}"#
+                + "\n",
+        )?;
+
+        let db_path = root.join("catalog.sqlite");
+        let db = Database::open(&db_path)?;
+        db.migrate()?;
+
+        import(&db, Some(session_path))?;
+
+        let (provider, model): (Option<String>, Option<String>) = db.connection().query_row(
+            "SELECT provider, model FROM llm_calls LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(provider.as_deref(), Some("cline-pass"));
+        assert_eq!(model.as_deref(), Some("deepseek-v4-flash"));
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn derives_provider_from_model_slug_when_pi_provider_is_generic() -> Result<()> {
+        let root = temp_dir("pi-import-generic-provider-model");
+        fs::create_dir_all(&root)?;
+        let session_path = root.join("pi-session.jsonl");
+        fs::write(
+            &session_path,
+            r#"{"type":"session","id":"session-1","timestamp":"2026-01-01T00:00:00.000Z","cwd":"/tmp/project","version":1}"#
+                .to_string()
+                + "\n"
+                + r#"{"type":"model_change","id":"model-1","parentId":"session-1","timestamp":"2026-01-01T00:00:00.100Z","provider":"cline","modelId":"cline-pass/deepseek-v4-flash"}"#
+                + "\n"
+                + r#"{"type":"message","id":"assistant-1","parentId":"model-1","timestamp":"2026-01-01T00:00:02.000Z","message":{"role":"assistant","content":[],"provider":"cline","model":"cline-pass/deepseek-v4-flash","usage":{"input":60,"output":20,"cacheRead":40,"totalTokens":120},"timestamp":1767225602000}}"#
+                + "\n",
+        )?;
+
+        let db_path = root.join("catalog.sqlite");
+        let db = Database::open(&db_path)?;
+        db.migrate()?;
+
+        import(&db, Some(session_path))?;
+
+        let (provider, model): (Option<String>, Option<String>) = db.connection().query_row(
+            "SELECT provider, model FROM llm_calls LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(provider.as_deref(), Some("cline"));
+        assert_eq!(model.as_deref(), Some("deepseek-v4-flash"));
 
         let _ = fs::remove_dir_all(root);
         Ok(())
