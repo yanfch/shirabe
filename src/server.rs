@@ -982,7 +982,7 @@ impl UsageFilters {
             to,
             grain,
             source: normalize_filter_value(query.source),
-            model: normalize_filter_value(query.model),
+            model: normalize_model_filter_value(query.model),
         }
     }
 
@@ -4057,6 +4057,20 @@ fn normalize_filter_value(value: Option<String>) -> Option<String> {
     })
 }
 
+fn normalize_model_filter_value(value: Option<String>) -> Option<String> {
+    let value = normalize_filter_value(value)?;
+    if value == "unknown" {
+        return Some(value);
+    }
+    if let Some((_, suffix)) = value.rsplit_once('/') {
+        return normalize_filter_value(Some(suffix.to_string()));
+    }
+    if let Some((_, suffix)) = value.rsplit_once(':') {
+        return normalize_filter_value(Some(suffix.to_string()));
+    }
+    Some(value)
+}
+
 fn normalize_date_value(value: Option<String>) -> Option<String> {
     value.and_then(|value| {
         let value = value.trim();
@@ -4411,6 +4425,17 @@ mod tests {
             model: None,
         });
         assert_eq!(long_custom.usage_grain(), "month");
+
+        let normalized_model = UsageFilters::from_query(UsageQuery {
+            preset: Some("7d".to_string()),
+            range: None,
+            from: None,
+            to: None,
+            grain: Some("auto".to_string()),
+            source: None,
+            model: Some("cline-pass/deepseek-v4-pro".to_string()),
+        });
+        assert_eq!(normalized_model.model.as_deref(), Some("deepseek-v4-pro"));
 
         let _ = fs::remove_file(db_path);
         Ok(())

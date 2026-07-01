@@ -10,6 +10,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
 
 pub const SCHEMA_VERSION: i64 = 5;
+const IMPORT_PARSER_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "+import-v2");
 
 pub struct Database {
     path: PathBuf,
@@ -454,7 +455,7 @@ impl Database {
         let path_hash = stable_hash(&path);
         let file_id = format!("{source_id}:file:{path_hash}");
         let fingerprint = stable_hash(&format!("{path_hash}:{size_bytes}:{modified_ns}"));
-        let parser_version = env!("CARGO_PKG_VERSION");
+        let parser_version = IMPORT_PARSER_VERSION;
 
         let existing = self
             .conn

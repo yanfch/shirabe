@@ -121,6 +121,19 @@
     return `/?${params.toString()}`;
   }
 
+  function syncUsageFiltersFromResponse(nextUsage: Usage) {
+    const canonical = nextUsage.filters;
+    usageFilters = canonical;
+    const nextPath = usagePath(canonical);
+    if (location.pathname + location.search !== nextPath) {
+      history.replaceState(
+        { shirabe: true, depth: navigationDepth },
+        "",
+        nextPath,
+      );
+    }
+  }
+
   function sessionsPath() {
     return "/?page=sessions";
   }
@@ -149,6 +162,7 @@
         sessionDetail = await fetchSessionDetail(selectedSessionId);
       } else if (activePage === "usage") {
         usage = await fetchUsage(usageFilters);
+        if (usage) syncUsageFiltersFromResponse(usage);
       } else if (activePage === "sessions") {
         sessionList = await fetchSessions();
       }
@@ -181,6 +195,7 @@
         sessionDetail = await fetchSessionDetail(selectedSessionId);
       } else if (activePage === "usage") {
         usage = await fetchUsage(usageFilters);
+        if (usage) syncUsageFiltersFromResponse(usage);
       } else if (activePage === "sessions") {
         sessionList = await fetchSessions();
       } else if (!overview) {
@@ -293,6 +308,7 @@
     error = null;
     try {
       usage = await fetchUsage(usageFilters);
+      if (usage) syncUsageFiltersFromResponse(usage);
       if (!overview) {
         overview = await fetchOverview();
       }
