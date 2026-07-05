@@ -1,7 +1,10 @@
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NormalizedEvent {
+    pub profile_id: String,
+    pub device_id: String,
     pub source: String,
     pub source_kind: String,
     pub source_event_id: Option<String>,
@@ -20,7 +23,7 @@ pub struct NormalizedEvent {
     pub confidence: f64,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TraceContext {
     pub trace_id: Option<String>,
     pub span_id: Option<String>,
@@ -28,21 +31,21 @@ pub struct TraceContext {
     pub root_span_id: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EntityHint {
     pub external_id: String,
     pub kind: String,
     pub title: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TurnHint {
     pub external_id: String,
     pub index: Option<i64>,
     pub role: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Operation {
     pub operation_type: OperationType,
     pub name: String,
@@ -55,7 +58,7 @@ pub struct Operation {
     pub metadata: Option<Value>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OperationType {
     LlmCall,
     ToolCall,
@@ -86,7 +89,7 @@ impl OperationType {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum OperationStatus {
     Running,
     Success,
@@ -107,7 +110,7 @@ impl OperationStatus {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Usage {
     pub provider: Option<String>,
     pub model: Option<String>,
@@ -124,7 +127,7 @@ pub struct Usage {
     pub context_window_percent: Option<f64>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SkillEventHint {
     pub skill_name: String,
     pub event_type: SkillEventType,
@@ -132,7 +135,7 @@ pub struct SkillEventHint {
     pub metadata: Option<Value>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SkillEventType {
     Loaded,
     Invoked,

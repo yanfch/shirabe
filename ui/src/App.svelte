@@ -84,6 +84,8 @@
       from: preset === "custom" ? normalizeDateParam(params.get("from")) ?? customRange.from : null,
       to: preset === "custom" ? normalizeDateParam(params.get("to")) ?? customRange.to : null,
       grain: normalizeGrain(params.get("grain")),
+      profile_id: params.get("profile_id"),
+      device_id: params.get("device_id"),
       source: params.get("source"),
       model: params.get("model"),
     };
@@ -116,6 +118,8 @@
       if (filters.from) params.set("from", filters.from);
       if (filters.to) params.set("to", filters.to);
     }
+    if (filters.profile_id) params.set("profile_id", filters.profile_id);
+    if (filters.device_id) params.set("device_id", filters.device_id);
     if (filters.source) params.set("source", filters.source);
     if (filters.model) params.set("model", filters.model);
     return `/?${params.toString()}`;
@@ -406,6 +410,7 @@
 
   $: usageSourceOptions = usage?.source_options ?? [];
   $: usageModelOptions = usage?.model_options ?? [];
+  $: usageProfileOptions = usage?.profile_options ?? [];
 </script>
 
 {#if isMenubarView}
@@ -414,9 +419,10 @@
 <AppShell {overview} {syncStatus} {selectedRunId} {selectedSessionId} {activePage} onOverview={showOverview} onUsage={showUsage} onSessions={showSessions} onSync={triggerSync}>
   <svelte:fragment slot="topbar-extra">
     {#if activePage === "usage" && !selectedRunId}
-      <UsageFiltersBar
-        filters={usageFilters}
-        sourceOptions={usageSourceOptions}
+        <UsageFiltersBar
+          filters={usageFilters}
+          profileOptions={usageProfileOptions}
+          sourceOptions={usageSourceOptions}
         modelOptions={usageModelOptions}
         onFilterChange={updateUsageFilters}
       />

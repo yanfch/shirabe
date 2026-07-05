@@ -116,12 +116,14 @@ fn insert_source_rollups(
     let now = now_ns();
     let sql = format!(
         "INSERT INTO usage_source_rollups (
-            bucket, bucket_key, source, sessions, runs, turns, llm_calls,
+            bucket, bucket_key, profile_id, device_id, source, sessions, runs, turns, llm_calls,
             tool_calls, failed_tool_calls, input_tokens, output_tokens,
             cache_read_tokens, cache_write_tokens, total_cost_usd, updated_at_ns
         )
         WITH run_rollups AS (
             SELECT
+                r.profile_id,
+                r.device_id,
                 r.source,
                 {run_bucket_expr} AS bucket_key,
                 COUNT(*) AS runs,
@@ -135,26 +137,30 @@ fn insert_source_rollups(
                 COALESCE(SUM(r.cache_write_tokens), 0) AS cache_write_tokens,
                 COALESCE(SUM(r.total_cost_usd), 0) AS total_cost_usd
             FROM runs r
-            GROUP BY r.source, bucket_key
+            GROUP BY r.profile_id, r.device_id, r.source, bucket_key
             HAVING bucket_key IS NOT NULL
         ),
         turn_rollups AS (
             SELECT
+                t.profile_id,
+                t.device_id,
                 t.source,
                 {turn_bucket_expr} AS bucket_key,
                 COUNT(*) AS turns
             FROM turns t
-            GROUP BY t.source, bucket_key
+            GROUP BY t.profile_id, t.device_id, t.source, bucket_key
             HAVING bucket_key IS NOT NULL
         ),
         source_keys AS (
-            SELECT source, bucket_key FROM run_rollups
+            SELECT profile_id, device_id, source, bucket_key FROM run_rollups
             UNION
-            SELECT source, bucket_key FROM turn_rollups
+            SELECT profile_id, device_id, source, bucket_key FROM turn_rollups
         )
         SELECT
             ?1,
             sk.bucket_key,
+            sk.profile_id,
+            sk.device_id,
             sk.source,
             COALESCE(rr.sessions, 0),
             COALESCE(rr.runs, 0),
@@ -170,9 +176,9 @@ fn insert_source_rollups(
             ?2
         FROM source_keys sk
         LEFT JOIN run_rollups rr
-            ON rr.source = sk.source AND rr.bucket_key = sk.bucket_key
+            ON rr.profile_id = sk.profile_id AND rr.source = sk.source AND rr.bucket_key = sk.bucket_key
         LEFT JOIN turn_rollups tr
-            ON tr.source = sk.source AND tr.bucket_key = sk.bucket_key"
+            ON tr.profile_id = sk.profile_id AND tr.source = sk.source AND tr.bucket_key = sk.bucket_key"
     );
     conn.execute(&sql, (bucket, now))?;
     Ok(())
@@ -182,13 +188,15 @@ fn insert_model_rollups(conn: &Connection, bucket: &str, bucket_expr: &str) -> R
     let now = now_ns();
     let sql = format!(
         "INSERT INTO usage_model_rollups (
-            bucket, bucket_key, source, model, sessions, runs, turns, llm_calls,
+            bucket, bucket_key, profile_id, device_id, source, model, sessions, runs, turns, llm_calls,
             input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
             total_cost_usd, updated_at_ns
         )
         SELECT
             ?1,
             {bucket_expr} AS bucket_key,
+            l.profile_id,
+            l.device_id,
             l.source,
             COALESCE(NULLIF(l.model, ''), 'unknown') AS model,
             COUNT(DISTINCT l.session_id),
@@ -203,7 +211,7 @@ fn insert_model_rollups(conn: &Connection, bucket: &str, bucket_expr: &str) -> R
             ?2
         FROM llm_calls l
         LEFT JOIN model_prices mp ON mp.model_name = l.model
-        GROUP BY bucket_key, l.source, COALESCE(NULLIF(l.model, ''), 'unknown')
+        GROUP BY bucket_key, l.profile_id, l.device_id, l.source, COALESCE(NULLIF(l.model, ''), 'unknown')
         HAVING bucket_key IS NOT NULL"
     );
     conn.execute(&sql, (bucket, now))?;
@@ -214,12 +222,14 @@ fn insert_tool_rollups(conn: &Connection, bucket: &str, bucket_expr: &str) -> Re
     let now = now_ns();
     let sql = format!(
         "INSERT INTO usage_tool_rollups (
-            bucket, bucket_key, source, tool_name, calls, success_calls,
+            bucket, bucket_key, profile_id, device_id, source, tool_name, calls, success_calls,
             failed_calls, updated_at_ns
         )
         SELECT
             ?1,
             {bucket_expr} AS bucket_key,
+            tc.profile_id,
+            tc.device_id,
             tc.source,
             tc.tool_name,
             COUNT(*),
@@ -227,7 +237,7 @@ fn insert_tool_rollups(conn: &Connection, bucket: &str, bucket_expr: &str) -> Re
             COALESCE(SUM(CASE WHEN tc.status = 'failed' THEN 1 ELSE 0 END), 0),
             ?2
         FROM tool_calls tc
-        GROUP BY bucket_key, tc.source, tc.tool_name
+        GROUP BY bucket_key, tc.profile_id, tc.device_id, tc.source, tc.tool_name
         HAVING bucket_key IS NOT NULL"
     );
     conn.execute(&sql, (bucket, now))?;
@@ -238,12 +248,14 @@ fn insert_tool_model_rollups(conn: &Connection, bucket: &str, bucket_expr: &str)
     let now = now_ns();
     let sql = format!(
         "INSERT INTO usage_tool_model_rollups (
-            bucket, bucket_key, source, model, tool_name, calls, success_calls,
+            bucket, bucket_key, profile_id, device_id, source, model, tool_name, calls, success_calls,
             failed_calls, updated_at_ns
         )
         WITH run_models AS (
             SELECT DISTINCT
                 run_id,
+                profile_id,
+                device_id,
                 source,
                 COALESCE(NULLIF(model, ''), 'unknown') AS model
             FROM llm_calls
@@ -251,6 +263,8 @@ fn insert_tool_model_rollups(conn: &Connection, bucket: &str, bucket_expr: &str)
         SELECT
             ?1,
             {bucket_expr} AS bucket_key,
+            tc.profile_id,
+            tc.device_id,
             tc.source,
             rm.model,
             tc.tool_name,
@@ -259,8 +273,8 @@ fn insert_tool_model_rollups(conn: &Connection, bucket: &str, bucket_expr: &str)
             COALESCE(SUM(CASE WHEN tc.status = 'failed' THEN 1 ELSE 0 END), 0),
             ?2
         FROM tool_calls tc
-        JOIN run_models rm ON rm.run_id = tc.run_id AND rm.source = tc.source
-        GROUP BY bucket_key, tc.source, rm.model, tc.tool_name
+        JOIN run_models rm ON rm.run_id = tc.run_id AND rm.profile_id = tc.profile_id AND rm.source = tc.source
+        GROUP BY bucket_key, tc.profile_id, tc.device_id, tc.source, rm.model, tc.tool_name
         HAVING bucket_key IS NOT NULL"
     );
     conn.execute(&sql, (bucket, now))?;

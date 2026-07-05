@@ -1,8 +1,9 @@
 <script lang="ts">
   import FilterDropdown from "./FilterDropdown.svelte";
-  import type { UsageFilters, UsageGrain } from "../lib/types";
+  import type { ProfileOption, UsageFilters, UsageGrain } from "../lib/types";
 
   export let filters: UsageFilters;
+  export let profileOptions: ProfileOption[] = [];
   export let sourceOptions: string[] = [];
   export let modelOptions: string[] = [];
   export let onFilterChange: (filters: UsageFilters) => void;
@@ -28,6 +29,13 @@
   $: modelFilterOptions = [
     { value: null, label: "All models" },
     ...modelOptions.map((model) => ({ value: model, label: model })),
+  ];
+  $: profileFilterOptions = [
+    { value: null, label: "All accounts" },
+    ...profileOptions.map((profile) => ({
+      value: profile.profile_id,
+      label: profile.profile_label,
+    })),
   ];
   $: timeLabel = `${presetLabel(filters.preset)} · ${grainLabel(filters.grain)}`;
 
@@ -73,6 +81,10 @@
 
   function setSource(source: string | null) {
     onFilterChange({ ...filters, source });
+  }
+
+  function setProfile(profile_id: string | null) {
+    onFilterChange({ ...filters, profile_id });
   }
 
   function setModel(model: string | null) {
@@ -174,6 +186,7 @@
     {/if}
   </div>
 
+  <FilterDropdown label="Account" value={filters.profile_id} options={profileFilterOptions} onSelect={setProfile} />
   <FilterDropdown label="Source" value={filters.source} options={sourceFilterOptions} onSelect={setSource} />
   <FilterDropdown label="Model" value={filters.model} options={modelFilterOptions} onSelect={setModel} />
 </div>

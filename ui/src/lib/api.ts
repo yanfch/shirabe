@@ -20,14 +20,17 @@ export function fetchUsage(filters: UsageFilters) {
     if (filters.from) params.set("from", filters.from);
     if (filters.to) params.set("to", filters.to);
   }
+  if (filters.profile_id) params.set("profile_id", filters.profile_id);
+  if (filters.device_id) params.set("device_id", filters.device_id);
   if (filters.source) params.set("source", filters.source);
   if (filters.model) params.set("model", filters.model);
   return fetchJson<Usage>(`/api/usage?${params.toString()}`);
 }
 
-export function fetchMenubarUsage(range: string) {
+export function fetchMenubarUsage(range: string, profileId?: string | null) {
   const params = new URLSearchParams();
   params.set("range", range);
+  if (profileId) params.set("profile_id", profileId);
   return fetchJson<MenubarUsage>(`/api/menubar?${params.toString()}`);
 }
 

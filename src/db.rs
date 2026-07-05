@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     fs,
+    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -9,7 +10,9 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
 
-pub const SCHEMA_VERSION: i64 = 5;
+use crate::config::Identity;
+
+pub const SCHEMA_VERSION: i64 = 6;
 const IMPORT_PARSER_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "+import-v2");
 
 pub struct Database {
@@ -47,6 +50,7 @@ impl Database {
         conn.pragma_update(None, "temp_store", "MEMORY")?;
         conn.pragma_update(None, "cache_size", -200_000i64)?;
         conn.pragma_update(None, "mmap_size", 268_435_456i64)?;
+        set_shared_sqlite_modes(path);
 
         Ok(Self {
             path: path.to_path_buf(),
@@ -76,6 +80,7 @@ impl Database {
         self.conn
             .execute_batch(SCHEMA_SQL)
             .context("apply schema")?;
+        self.recreate_rollups_if_legacy()?;
         self.ensure_column(
             "usage_source_rollups",
             "total_cost_usd",
@@ -95,6 +100,21 @@ impl Database {
         self.ensure_column("llm_calls", "observed_trigger_step_id", "TEXT")?;
         self.ensure_column("llm_calls", "observed_trigger_step_type", "TEXT")?;
         self.ensure_column("llm_calls", "observed_latency_quality", "TEXT")?;
+        for table in [
+            "import_sources",
+            "import_files",
+            "sessions",
+            "runs",
+            "turns",
+            "run_steps",
+            "llm_calls",
+            "tool_calls",
+            "run_signals",
+            "skill_events",
+        ] {
+            self.ensure_column(table, "profile_id", "TEXT NOT NULL DEFAULT 'local'")?;
+            self.ensure_column(table, "device_id", "TEXT NOT NULL DEFAULT 'local_device'")?;
+        }
         self.backfill_time_buckets()?;
         self.backfill_observed_llm_latency()?;
 
@@ -103,6 +123,49 @@ impl Database {
              VALUES ('schema_version', ?1, ?2)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at_ns = excluded.updated_at_ns",
             params![SCHEMA_VERSION.to_string(), now_ns()],
+        )?;
+
+        Ok(())
+    }
+
+    pub fn register_identity(&self, identity: &Identity) -> Result<()> {
+        let now = now_ns();
+        self.conn.execute(
+            "INSERT INTO devices (
+                device_id, device_label, hostname, created_at_ns, last_seen_ns
+             )
+             VALUES (?1, ?2, ?3, ?4, ?4)
+             ON CONFLICT(device_id) DO UPDATE SET
+                device_label = excluded.device_label,
+                hostname = excluded.hostname,
+                last_seen_ns = excluded.last_seen_ns",
+            params![
+                identity.device_id,
+                identity.device_label,
+                env_hostname(),
+                now
+            ],
+        )?;
+        self.conn.execute(
+            "INSERT INTO profiles (
+                profile_id, device_id, profile_label, macos_uid, macos_username,
+                created_at_ns, last_seen_ns
+             )
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)
+             ON CONFLICT(profile_id) DO UPDATE SET
+                device_id = excluded.device_id,
+                profile_label = excluded.profile_label,
+                macos_uid = excluded.macos_uid,
+                macos_username = excluded.macos_username,
+                last_seen_ns = excluded.last_seen_ns",
+            params![
+                identity.profile_id,
+                identity.device_id,
+                identity.profile_label,
+                identity.macos_uid,
+                identity.macos_username,
+                now
+            ],
         )?;
 
         Ok(())
@@ -334,6 +397,35 @@ impl Database {
         Ok(())
     }
 
+    fn table_has_column(&self, table: &str, column: &str) -> Result<bool> {
+        let count: i64 = self.conn.query_row(
+            &format!(
+                "SELECT COUNT(*) FROM pragma_table_info({}) WHERE name = ?1",
+                sql_string(table)
+            ),
+            params![column],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    fn recreate_rollups_if_legacy(&self) -> Result<()> {
+        if self.table_has_column("usage_source_rollups", "profile_id")? {
+            return Ok(());
+        }
+
+        self.conn.execute_batch(
+            "DROP TABLE IF EXISTS usage_source_rollups;
+             DROP TABLE IF EXISTS usage_model_rollups;
+             DROP TABLE IF EXISTS usage_tool_rollups;
+             DROP TABLE IF EXISTS usage_tool_model_rollups;",
+        )?;
+        self.conn
+            .execute_batch(SCHEMA_SQL)
+            .context("recreate profile-aware usage rollups")?;
+        Ok(())
+    }
+
     fn backfill_time_buckets(&self) -> Result<()> {
         self.conn
             .execute_batch(
@@ -367,18 +459,37 @@ impl Database {
         source_kind: &str,
         root_path: &Path,
     ) -> Result<String> {
+        self.record_import_source_for_profile(
+            source,
+            source_kind,
+            root_path,
+            "local",
+            "local_device",
+        )
+    }
+
+    pub fn record_import_source_for_profile(
+        &self,
+        source: &str,
+        source_kind: &str,
+        root_path: &Path,
+        profile_id: &str,
+        device_id: &str,
+    ) -> Result<String> {
         let root_path = root_path.to_string_lossy().to_string();
         let root_path_hash = stable_hash(&root_path);
-        let source_id = format!("{source}:{root_path_hash}");
+        let source_id = source_id_for_profile(profile_id, source, &root_path_hash);
         let now = now_ns();
 
         self.conn.execute(
             "INSERT INTO import_sources (
-                source_id, source, source_kind, root_path, root_path_hash,
+                source_id, profile_id, device_id, source, source_kind, root_path, root_path_hash,
                 enabled, last_scan_ns, parser_version
              )
-             VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, ?7)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1, ?8, ?9)
              ON CONFLICT(source_id) DO UPDATE SET
+                profile_id = excluded.profile_id,
+                device_id = excluded.device_id,
                 source_kind = excluded.source_kind,
                 root_path = excluded.root_path,
                 root_path_hash = excluded.root_path_hash,
@@ -386,6 +497,8 @@ impl Database {
                 parser_version = excluded.parser_version",
             params![
                 source_id,
+                profile_id,
+                device_id,
                 source,
                 source_kind,
                 root_path,
@@ -414,11 +527,18 @@ impl Database {
 
         self.conn.execute(
             "INSERT INTO import_files (
-                file_id, source_id, path, path_hash, size_bytes, modified_ns,
+                file_id, profile_id, device_id, source_id, path, path_hash, size_bytes, modified_ns,
                 fingerprint, parser_version, status, last_import_ns
              )
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+             VALUES (
+                ?1,
+                COALESCE((SELECT profile_id FROM import_sources WHERE source_id = ?2), 'local'),
+                COALESCE((SELECT device_id FROM import_sources WHERE source_id = ?2), 'local_device'),
+                ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10
+             )
              ON CONFLICT(file_id) DO UPDATE SET
+                profile_id = excluded.profile_id,
+                device_id = excluded.device_id,
                 path = excluded.path,
                 path_hash = excluded.path_hash,
                 size_bytes = excluded.size_bytes,
@@ -527,11 +647,18 @@ impl Database {
 
         self.conn.execute(
             "INSERT INTO import_files (
-                file_id, source_id, path, path_hash, size_bytes, modified_ns,
+                file_id, profile_id, device_id, source_id, path, path_hash, size_bytes, modified_ns,
                 fingerprint, parser_version, status, last_import_ns
              )
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'pending', ?9)
+             VALUES (
+                ?1,
+                COALESCE((SELECT profile_id FROM import_sources WHERE source_id = ?2), 'local'),
+                COALESCE((SELECT device_id FROM import_sources WHERE source_id = ?2), 'local_device'),
+                ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'pending', ?9
+             )
              ON CONFLICT(file_id) DO UPDATE SET
+                profile_id = excluded.profile_id,
+                device_id = excluded.device_id,
                 path = excluded.path,
                 path_hash = excluded.path_hash,
                 size_bytes = excluded.size_bytes,
@@ -612,15 +739,42 @@ impl Database {
     }
 
     pub fn latest_import_source_scan_ns(&self, source: &str) -> Result<Option<i64>> {
+        self.latest_import_source_scan_ns_for_profile(source, "local")
+    }
+
+    pub fn latest_import_source_scan_ns_for_profile(
+        &self,
+        source: &str,
+        profile_id: &str,
+    ) -> Result<Option<i64>> {
         Ok(self
             .conn
             .query_row(
-                "SELECT MAX(last_scan_ns) FROM import_sources WHERE source = ?1",
-                params![source],
+                "SELECT MAX(last_scan_ns) FROM import_sources WHERE source = ?1 AND profile_id = ?2",
+                params![source, profile_id],
                 |row| row.get(0),
             )
             .optional()?
             .flatten())
+    }
+}
+
+fn set_shared_sqlite_modes(path: &Path) {
+    if !path.starts_with(Path::new("/Users/Shared/Shirabe")) {
+        return;
+    }
+
+    for candidate in [
+        path.to_path_buf(),
+        PathBuf::from(format!("{}-wal", path.display())),
+        PathBuf::from(format!("{}-shm", path.display())),
+    ] {
+        let Ok(metadata) = fs::metadata(&candidate) else {
+            continue;
+        };
+        let mut permissions = metadata.permissions();
+        permissions.set_mode(0o666);
+        let _ = fs::set_permissions(&candidate, permissions);
     }
 }
 
@@ -648,6 +802,20 @@ pub fn stable_hash(input: &str) -> String {
     hex::encode(hasher.finalize())
 }
 
+fn env_hostname() -> Option<String> {
+    std::env::var("HOSTNAME")
+        .ok()
+        .filter(|value| !value.is_empty())
+}
+
+fn source_id_for_profile(profile_id: &str, source: &str, root_path_hash: &str) -> String {
+    if profile_id == "local" {
+        format!("{source}:{root_path_hash}")
+    } else {
+        format!("{profile_id}:{source}:{root_path_hash}")
+    }
+}
+
 fn sql_string(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
@@ -668,8 +836,30 @@ CREATE TABLE IF NOT EXISTS meta (
     updated_at_ns INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS devices (
+    device_id TEXT PRIMARY KEY,
+    device_label TEXT NOT NULL,
+    hostname TEXT,
+    created_at_ns INTEGER NOT NULL,
+    last_seen_ns INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS profiles (
+    profile_id TEXT PRIMARY KEY,
+    device_id TEXT NOT NULL,
+    profile_label TEXT NOT NULL,
+    macos_uid TEXT,
+    macos_username TEXT NOT NULL,
+    created_at_ns INTEGER NOT NULL,
+    last_seen_ns INTEGER NOT NULL,
+    FOREIGN KEY (device_id) REFERENCES devices(device_id)
+);
+CREATE INDEX IF NOT EXISTS idx_profiles_device ON profiles(device_id);
+
 CREATE TABLE IF NOT EXISTS import_sources (
     source_id TEXT PRIMARY KEY,
+    profile_id TEXT NOT NULL DEFAULT 'local',
+    device_id TEXT NOT NULL DEFAULT 'local_device',
     source TEXT NOT NULL,
     source_kind TEXT NOT NULL,
     root_path TEXT NOT NULL,
@@ -681,9 +871,12 @@ CREATE TABLE IF NOT EXISTS import_sources (
     parser_version TEXT,
     metadata_json TEXT
 );
+CREATE INDEX IF NOT EXISTS idx_import_sources_profile ON import_sources(profile_id, source);
 
 CREATE TABLE IF NOT EXISTS import_files (
     file_id TEXT PRIMARY KEY,
+    profile_id TEXT NOT NULL DEFAULT 'local',
+    device_id TEXT NOT NULL DEFAULT 'local_device',
     source_id TEXT NOT NULL,
     path TEXT NOT NULL,
     path_hash TEXT NOT NULL,
@@ -703,6 +896,7 @@ CREATE TABLE IF NOT EXISTS import_files (
     FOREIGN KEY (source_id) REFERENCES import_sources(source_id)
 );
 CREATE INDEX IF NOT EXISTS idx_import_files_source ON import_files(source_id);
+CREATE INDEX IF NOT EXISTS idx_import_files_profile_source ON import_files(profile_id, source_id);
 CREATE INDEX IF NOT EXISTS idx_import_files_status ON import_files(status);
 
 CREATE TABLE IF NOT EXISTS pricing_sources (
@@ -730,6 +924,8 @@ CREATE INDEX IF NOT EXISTS idx_model_prices_provider ON model_prices(provider);
 
 CREATE TABLE IF NOT EXISTS sessions (
     session_id TEXT PRIMARY KEY,
+    profile_id TEXT NOT NULL DEFAULT 'local',
+    device_id TEXT NOT NULL DEFAULT 'local_device',
     source TEXT NOT NULL,
     kind TEXT NOT NULL,
     title TEXT,
@@ -745,11 +941,14 @@ CREATE TABLE IF NOT EXISTS sessions (
     primary_signal TEXT,
     metadata_json TEXT
 );
+CREATE INDEX IF NOT EXISTS idx_sessions_profile_seen ON sessions(profile_id, last_seen_ns);
 CREATE INDEX IF NOT EXISTS idx_sessions_source_seen ON sessions(source, last_seen_ns);
 CREATE INDEX IF NOT EXISTS idx_sessions_last_seen ON sessions(last_seen_ns);
 
 CREATE TABLE IF NOT EXISTS runs (
     run_id TEXT PRIMARY KEY,
+    profile_id TEXT NOT NULL DEFAULT 'local',
+    device_id TEXT NOT NULL DEFAULT 'local_device',
     source TEXT NOT NULL,
     kind TEXT NOT NULL,
     title TEXT,
@@ -786,6 +985,7 @@ CREATE TABLE IF NOT EXISTS runs (
     metadata_json TEXT,
     FOREIGN KEY (session_id) REFERENCES sessions(session_id)
 );
+CREATE INDEX IF NOT EXISTS idx_runs_profile_started ON runs(profile_id, started_at_ns);
 CREATE INDEX IF NOT EXISTS idx_runs_started ON runs(started_at_ns);
 CREATE INDEX IF NOT EXISTS idx_runs_source_started ON runs(source, started_at_ns);
 CREATE INDEX IF NOT EXISTS idx_runs_source_day ON runs(source, started_day);
@@ -795,6 +995,8 @@ CREATE INDEX IF NOT EXISTS idx_runs_session_started ON runs(session_id, started_
 
 CREATE TABLE IF NOT EXISTS turns (
     turn_id TEXT PRIMARY KEY,
+    profile_id TEXT NOT NULL DEFAULT 'local',
+    device_id TEXT NOT NULL DEFAULT 'local_device',
     run_id TEXT NOT NULL,
     session_id TEXT,
     source TEXT NOT NULL,
@@ -820,6 +1022,7 @@ CREATE TABLE IF NOT EXISTS turns (
     FOREIGN KEY (run_id) REFERENCES runs(run_id),
     FOREIGN KEY (session_id) REFERENCES sessions(session_id)
 );
+CREATE INDEX IF NOT EXISTS idx_turns_profile_started ON turns(profile_id, started_at_ns);
 CREATE INDEX IF NOT EXISTS idx_turns_run ON turns(run_id);
 CREATE INDEX IF NOT EXISTS idx_turns_session ON turns(session_id);
 CREATE INDEX IF NOT EXISTS idx_turns_session_started ON turns(session_id, started_at_ns);
@@ -830,6 +1033,8 @@ CREATE INDEX IF NOT EXISTS idx_turns_source_month ON turns(source, started_month
 
 CREATE TABLE IF NOT EXISTS run_steps (
     step_id TEXT PRIMARY KEY,
+    profile_id TEXT NOT NULL DEFAULT 'local',
+    device_id TEXT NOT NULL DEFAULT 'local_device',
     run_id TEXT NOT NULL,
     session_id TEXT,
     turn_id TEXT,
@@ -861,9 +1066,12 @@ CREATE TABLE IF NOT EXISTS run_steps (
 );
 CREATE INDEX IF NOT EXISTS idx_run_steps_run_order ON run_steps(run_id, order_index, started_at_ns);
 CREATE INDEX IF NOT EXISTS idx_run_steps_run_status ON run_steps(run_id, status);
+CREATE INDEX IF NOT EXISTS idx_run_steps_profile_started ON run_steps(profile_id, started_at_ns);
 
 CREATE TABLE IF NOT EXISTS llm_calls (
     llm_call_id TEXT PRIMARY KEY,
+    profile_id TEXT NOT NULL DEFAULT 'local',
+    device_id TEXT NOT NULL DEFAULT 'local_device',
     run_id TEXT NOT NULL,
     session_id TEXT,
     turn_id TEXT,
@@ -908,6 +1116,7 @@ CREATE TABLE IF NOT EXISTS llm_calls (
     metadata_json TEXT,
     FOREIGN KEY (run_id) REFERENCES runs(run_id)
 );
+CREATE INDEX IF NOT EXISTS idx_llm_calls_profile_started ON llm_calls(profile_id, started_at_ns);
 CREATE INDEX IF NOT EXISTS idx_llm_calls_run ON llm_calls(run_id);
 CREATE INDEX IF NOT EXISTS idx_llm_calls_run_started ON llm_calls(run_id, started_at_ns);
 CREATE INDEX IF NOT EXISTS idx_llm_calls_source_run ON llm_calls(source, run_id);
@@ -924,6 +1133,8 @@ CREATE INDEX IF NOT EXISTS idx_llm_calls_model ON llm_calls(model, started_at_ns
 
 CREATE TABLE IF NOT EXISTS tool_calls (
     tool_call_id TEXT PRIMARY KEY,
+    profile_id TEXT NOT NULL DEFAULT 'local',
+    device_id TEXT NOT NULL DEFAULT 'local_device',
     run_id TEXT NOT NULL,
     session_id TEXT,
     turn_id TEXT,
@@ -946,6 +1157,7 @@ CREATE TABLE IF NOT EXISTS tool_calls (
     metadata_json TEXT,
     FOREIGN KEY (run_id) REFERENCES runs(run_id)
 );
+CREATE INDEX IF NOT EXISTS idx_tool_calls_profile_started ON tool_calls(profile_id, started_at_ns);
 CREATE INDEX IF NOT EXISTS idx_tool_calls_run ON tool_calls(run_id);
 CREATE INDEX IF NOT EXISTS idx_tool_calls_run_started ON tool_calls(run_id, started_at_ns);
 CREATE INDEX IF NOT EXISTS idx_tool_calls_source_run ON tool_calls(source, run_id);
@@ -961,6 +1173,8 @@ CREATE INDEX IF NOT EXISTS idx_tool_calls_name_status ON tool_calls(tool_name, s
 
 CREATE TABLE IF NOT EXISTS run_signals (
     signal_id TEXT PRIMARY KEY,
+    profile_id TEXT NOT NULL DEFAULT 'local',
+    device_id TEXT NOT NULL DEFAULT 'local_device',
     run_id TEXT NOT NULL,
     source TEXT NOT NULL,
     signal_type TEXT NOT NULL,
@@ -973,9 +1187,12 @@ CREATE TABLE IF NOT EXISTS run_signals (
 );
 CREATE INDEX IF NOT EXISTS idx_run_signals_run ON run_signals(run_id);
 CREATE INDEX IF NOT EXISTS idx_run_signals_type ON run_signals(signal_type, severity);
+CREATE INDEX IF NOT EXISTS idx_run_signals_profile ON run_signals(profile_id, created_at_ns);
 
 CREATE TABLE IF NOT EXISTS skill_events (
     skill_event_id TEXT PRIMARY KEY,
+    profile_id TEXT NOT NULL DEFAULT 'local',
+    device_id TEXT NOT NULL DEFAULT 'local_device',
     source TEXT NOT NULL,
     skill_name TEXT NOT NULL,
     event_type TEXT NOT NULL,
@@ -995,6 +1212,8 @@ CREATE TABLE IF NOT EXISTS skill_events (
 );
 CREATE INDEX IF NOT EXISTS idx_skill_events_source_time
 ON skill_events(source, occurred_at_ns);
+CREATE INDEX IF NOT EXISTS idx_skill_events_profile_time
+ON skill_events(profile_id, occurred_at_ns);
 CREATE INDEX IF NOT EXISTS idx_skill_events_source_day_name
 ON skill_events(source, occurred_day, skill_name);
 CREATE INDEX IF NOT EXISTS idx_skill_events_source_month_name
@@ -1021,6 +1240,8 @@ CREATE TABLE IF NOT EXISTS metric_rollups (
 CREATE TABLE IF NOT EXISTS usage_source_rollups (
     bucket TEXT NOT NULL,
     bucket_key TEXT NOT NULL,
+    profile_id TEXT NOT NULL DEFAULT 'local',
+    device_id TEXT NOT NULL DEFAULT 'local_device',
     source TEXT NOT NULL,
     sessions INTEGER NOT NULL DEFAULT 0,
     runs INTEGER NOT NULL DEFAULT 0,
@@ -1034,14 +1255,16 @@ CREATE TABLE IF NOT EXISTS usage_source_rollups (
     cache_write_tokens INTEGER NOT NULL DEFAULT 0,
     total_cost_usd REAL NOT NULL DEFAULT 0,
     updated_at_ns INTEGER NOT NULL,
-    PRIMARY KEY (bucket, bucket_key, source)
+    PRIMARY KEY (bucket, bucket_key, profile_id, source)
 );
 CREATE INDEX IF NOT EXISTS idx_usage_source_rollups_lookup
-ON usage_source_rollups(bucket, bucket_key, source);
+ON usage_source_rollups(bucket, bucket_key, profile_id, source);
 
 CREATE TABLE IF NOT EXISTS usage_model_rollups (
     bucket TEXT NOT NULL,
     bucket_key TEXT NOT NULL,
+    profile_id TEXT NOT NULL DEFAULT 'local',
+    device_id TEXT NOT NULL DEFAULT 'local_device',
     source TEXT NOT NULL,
     model TEXT NOT NULL,
     sessions INTEGER NOT NULL DEFAULT 0,
@@ -1054,28 +1277,32 @@ CREATE TABLE IF NOT EXISTS usage_model_rollups (
     cache_write_tokens INTEGER NOT NULL DEFAULT 0,
     total_cost_usd REAL NOT NULL DEFAULT 0,
     updated_at_ns INTEGER NOT NULL,
-    PRIMARY KEY (bucket, bucket_key, source, model)
+    PRIMARY KEY (bucket, bucket_key, profile_id, source, model)
 );
 CREATE INDEX IF NOT EXISTS idx_usage_model_rollups_lookup
-ON usage_model_rollups(bucket, bucket_key, source, model);
+ON usage_model_rollups(bucket, bucket_key, profile_id, source, model);
 
 CREATE TABLE IF NOT EXISTS usage_tool_rollups (
     bucket TEXT NOT NULL,
     bucket_key TEXT NOT NULL,
+    profile_id TEXT NOT NULL DEFAULT 'local',
+    device_id TEXT NOT NULL DEFAULT 'local_device',
     source TEXT NOT NULL,
     tool_name TEXT NOT NULL,
     calls INTEGER NOT NULL DEFAULT 0,
     success_calls INTEGER NOT NULL DEFAULT 0,
     failed_calls INTEGER NOT NULL DEFAULT 0,
     updated_at_ns INTEGER NOT NULL,
-    PRIMARY KEY (bucket, bucket_key, source, tool_name)
+    PRIMARY KEY (bucket, bucket_key, profile_id, source, tool_name)
 );
 CREATE INDEX IF NOT EXISTS idx_usage_tool_rollups_lookup
-ON usage_tool_rollups(bucket, bucket_key, source, tool_name);
+ON usage_tool_rollups(bucket, bucket_key, profile_id, source, tool_name);
 
 CREATE TABLE IF NOT EXISTS usage_tool_model_rollups (
     bucket TEXT NOT NULL,
     bucket_key TEXT NOT NULL,
+    profile_id TEXT NOT NULL DEFAULT 'local',
+    device_id TEXT NOT NULL DEFAULT 'local_device',
     source TEXT NOT NULL,
     model TEXT NOT NULL,
     tool_name TEXT NOT NULL,
@@ -1083,8 +1310,8 @@ CREATE TABLE IF NOT EXISTS usage_tool_model_rollups (
     success_calls INTEGER NOT NULL DEFAULT 0,
     failed_calls INTEGER NOT NULL DEFAULT 0,
     updated_at_ns INTEGER NOT NULL,
-    PRIMARY KEY (bucket, bucket_key, source, model, tool_name)
+    PRIMARY KEY (bucket, bucket_key, profile_id, source, model, tool_name)
 );
 CREATE INDEX IF NOT EXISTS idx_usage_tool_model_rollups_lookup
-ON usage_tool_model_rollups(bucket, bucket_key, source, model, tool_name);
+ON usage_tool_model_rollups(bucket, bucket_key, profile_id, source, model, tool_name);
 "#;

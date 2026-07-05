@@ -1,17 +1,22 @@
 use std::{
     env, fs,
     path::{Path, PathBuf},
+    process::Command,
 };
 
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+
+use crate::db::{now_ns, stable_hash};
 
 #[derive(Debug, Clone)]
 pub struct Paths {
     pub data_dir: PathBuf,
+    pub config_dir: PathBuf,
     pub catalog_db: PathBuf,
     pub ui_dist: PathBuf,
     pub source_paths: SourcePaths,
+    pub identity: Identity,
 }
 
 #[derive(Debug, Clone)]
@@ -22,11 +27,23 @@ pub struct SourcePaths {
     pub kanade: PathBuf,
 }
 
+#[derive(Debug, Clone)]
+pub struct Identity {
+    pub device_id: String,
+    pub device_label: String,
+    pub profile_id: String,
+    pub profile_label: String,
+    pub macos_uid: Option<String>,
+    pub macos_username: String,
+}
+
 impl Paths {
     pub fn resolve(data_dir: Option<PathBuf>) -> Result<Self> {
         let data_dir = data_dir.unwrap_or_else(default_data_dir);
         let data_dir = expand_tilde(data_dir)?;
-        let source_paths = SourcePaths::resolve(&data_dir)?;
+        let config_dir = config_dir_for_data_dir(&data_dir)?;
+        let source_paths = SourcePaths::resolve(&config_dir)?;
+        let identity = Identity::resolve(&config_dir)?;
         let catalog_db = data_dir.join("catalog.sqlite");
         let ui_dist = env::current_dir()
             .context("resolve current directory")?
@@ -35,9 +52,95 @@ impl Paths {
 
         Ok(Self {
             data_dir,
+            config_dir,
             catalog_db,
             ui_dist,
             source_paths,
+            identity,
+        })
+    }
+}
+
+impl Identity {
+    fn resolve(data_dir: &Path) -> Result<Self> {
+        let mut config = ConfigFile::load(data_dir)?;
+        let mut changed = false;
+        let mut identity = config.identity.unwrap_or_default();
+
+        let macos_username = env::var("USER")
+            .or_else(|_| env::var("LOGNAME"))
+            .unwrap_or_else(|_| "local".to_string());
+        let macos_uid = env::var("SHIRABE_MACOS_UID").ok().or_else(current_uid);
+        let device_label = env::var("SHIRABE_DEVICE_LABEL")
+            .ok()
+            .or_else(current_computer_name)
+            .or_else(|| env::var("HOSTNAME").ok())
+            .unwrap_or_else(|| "This Mac".to_string());
+        let profile_label = env::var("SHIRABE_PROFILE_LABEL")
+            .ok()
+            .unwrap_or_else(|| macos_username.clone());
+
+        let device_id =
+            if let Some(value) = env::var("SHIRABE_DEVICE_ID").ok().filter(|v| !v.is_empty()) {
+                value
+            } else if let Some(value) = identity.device_id.take().filter(|v| !v.is_empty()) {
+                value
+            } else if let Some(seed) = current_machine_identifier_seed() {
+                changed = true;
+                generated_id("device", &seed)
+            } else {
+                changed = true;
+                generated_id("device", &format!("{}:{}", data_dir.display(), now_ns()))
+            };
+
+        let profile_id = if let Some(value) = env::var("SHIRABE_PROFILE_ID")
+            .ok()
+            .filter(|v| !v.is_empty())
+        {
+            value
+        } else if let Some(value) = identity.profile_id.take().filter(|v| !v.is_empty()) {
+            value
+        } else {
+            changed = true;
+            generated_id(
+                "profile",
+                &format!(
+                    "{}:{}:{}",
+                    device_id,
+                    macos_uid.as_deref().unwrap_or(&macos_username),
+                    now_ns()
+                ),
+            )
+        };
+
+        let device_label = identity
+            .device_label
+            .take()
+            .filter(|v| !v.is_empty())
+            .unwrap_or(device_label);
+        let profile_label = identity
+            .profile_label
+            .take()
+            .filter(|v| !v.is_empty())
+            .unwrap_or(profile_label);
+
+        if changed {
+            config.identity = Some(IdentityConfig {
+                device_id: Some(device_id.clone()),
+                device_label: Some(device_label.clone()),
+                profile_id: Some(profile_id.clone()),
+                profile_label: Some(profile_label.clone()),
+            });
+            config.save(data_dir)?;
+        }
+
+        Ok(Self {
+            device_id,
+            device_label,
+            profile_id,
+            profile_label,
+            macos_uid,
+            macos_username,
         })
     }
 }
@@ -88,18 +191,28 @@ impl SourcePaths {
     }
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 struct ConfigFile {
     #[serde(default)]
     sources: Option<SourcePathConfig>,
+    #[serde(default)]
+    identity: Option<IdentityConfig>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 struct SourcePathConfig {
     codex: Option<PathBuf>,
     pi: Option<PathBuf>,
     claude: Option<PathBuf>,
     kanade: Option<PathBuf>,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize)]
+struct IdentityConfig {
+    device_id: Option<String>,
+    device_label: Option<String>,
+    profile_id: Option<String>,
+    profile_label: Option<String>,
 }
 
 impl ConfigFile {
@@ -112,6 +225,13 @@ impl ConfigFile {
         let raw = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
         serde_json::from_str(&raw).with_context(|| format!("parse {}", path.display()))
     }
+
+    fn save(&self, data_dir: &Path) -> Result<()> {
+        fs::create_dir_all(data_dir).with_context(|| format!("create {}", data_dir.display()))?;
+        let path = data_dir.join("config.json");
+        let raw = serde_json::to_string_pretty(self)?;
+        fs::write(&path, format!("{raw}\n")).with_context(|| format!("write {}", path.display()))
+    }
 }
 
 fn default_data_dir() -> PathBuf {
@@ -121,6 +241,24 @@ fn default_data_dir() -> PathBuf {
             let home = env::var_os("HOME").unwrap_or_else(|| ".".into());
             PathBuf::from(home).join(".shirabe")
         })
+}
+
+fn config_dir_for_data_dir(data_dir: &Path) -> Result<PathBuf> {
+    if let Some(config_dir) = env::var_os("SHIRABE_CONFIG_DIR") {
+        return expand_tilde(PathBuf::from(config_dir));
+    }
+
+    if is_shared_workspace_dir(data_dir) {
+        let home = env::var_os("HOME").context("HOME is not set")?;
+        return Ok(PathBuf::from(home).join(".shirabe"));
+    }
+
+    Ok(data_dir.to_path_buf())
+}
+
+pub fn is_shared_workspace_dir(data_dir: &Path) -> bool {
+    data_dir.join("workspace.json").exists()
+        || data_dir.starts_with(Path::new("/Users/Shared/Shirabe"))
 }
 
 fn expand_tilde(path: PathBuf) -> Result<PathBuf> {
@@ -172,4 +310,78 @@ fn join_segments(mut path: PathBuf, segments: &[&str]) -> PathBuf {
         path.push(segment);
     }
     path
+}
+
+fn generated_id(prefix: &str, seed: &str) -> String {
+    format!("{prefix}_{}", &stable_hash(seed)[..16])
+}
+
+fn current_uid() -> Option<String> {
+    Command::new("id")
+        .arg("-u")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn current_computer_name() -> Option<String> {
+    Command::new("scutil")
+        .args(["--get", "ComputerName"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn current_machine_identifier_seed() -> Option<String> {
+    current_platform_uuid()
+        .map(|uuid| format!("macos-platform-uuid:{uuid}"))
+        .or_else(|| {
+            Command::new("scutil")
+                .args(["--get", "LocalHostName"])
+                .output()
+                .ok()
+                .filter(|output| output.status.success())
+                .and_then(|output| String::from_utf8(output.stdout).ok())
+                .map(|value| format!("macos-local-hostname:{}", value.trim()))
+                .filter(|value| !value.ends_with(':'))
+        })
+}
+
+fn current_platform_uuid() -> Option<String> {
+    Command::new("ioreg")
+        .args(["-rd1", "-c", "IOPlatformExpertDevice"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .and_then(|output| parse_platform_uuid(&output))
+}
+
+fn parse_platform_uuid(output: &str) -> Option<String> {
+    output.lines().find_map(|line| {
+        let (_, value) = line.split_once("\"IOPlatformUUID\"")?;
+        let (_, value) = value.split_once('=')?;
+        let value = value.trim().trim_matches('"');
+        (!value.is_empty()).then(|| value.to_string())
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_platform_uuid;
+
+    #[test]
+    fn parses_ioreg_platform_uuid() {
+        let output = r#"    "IOPlatformUUID" = "ABCDEF12-3456-7890-ABCD-EF1234567890""#;
+        assert_eq!(
+            parse_platform_uuid(output),
+            Some("ABCDEF12-3456-7890-ABCD-EF1234567890".to_string())
+        );
+    }
 }

@@ -1,7 +1,12 @@
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
 use std::{
     collections::HashMap,
+    fs::{self, File, OpenOptions},
+    io::Write,
     net::SocketAddr,
-    path::PathBuf,
+    os::unix::fs::PermissionsExt,
+    path::{Path as FsPath, PathBuf},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -19,7 +24,12 @@ use serde::{Deserialize, Serialize};
 use tokio::{net::TcpListener, time};
 use tower_http::{services::ServeDir, trace::TraceLayer};
 
-use crate::{config::SourcePaths, db::Database, importers, rollup};
+use crate::{
+    config::{Identity, SourcePaths},
+    db::Database,
+    importers::{self, ImportIdentity},
+    rollup, workspace,
+};
 
 const AUTO_SYNC_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const SYNC_WATERMARK_OVERLAP_NS: i64 = 10 * 60 * 1_000_000_000;
@@ -30,6 +40,7 @@ struct AppState {
     db_path: PathBuf,
     ui_dir: PathBuf,
     source_paths: SourcePaths,
+    identity: Identity,
     sync: Mutex<SyncStatus>,
 }
 
@@ -38,7 +49,9 @@ pub async fn serve(
     bind: String,
     ui_dir: PathBuf,
     source_paths: SourcePaths,
+    identity: Identity,
 ) -> Result<()> {
+    let _server_lock = acquire_server_lock_if_shared(&db_path)?;
     let addr: SocketAddr = bind
         .parse()
         .with_context(|| format!("parse bind address {bind}"))?;
@@ -46,6 +59,7 @@ pub async fn serve(
         db_path,
         ui_dir,
         source_paths,
+        identity,
         sync: Mutex::new(SyncStatus::default()),
     });
     spawn_auto_sync(state.clone());
@@ -68,6 +82,110 @@ pub async fn serve(
     tracing::info!("serving http://{}", listener.local_addr()?);
     axum::serve(listener, app).await?;
 
+    Ok(())
+}
+
+struct ServerLock {
+    _path: PathBuf,
+    _file: File,
+}
+
+impl Drop for ServerLock {
+    fn drop(&mut self) {
+        let _ = unlock_server_file(&self._file);
+    }
+}
+
+fn acquire_server_lock_if_shared(db_path: &FsPath) -> Result<Option<ServerLock>> {
+    let Some(workspace_dir) = db_path.parent().filter(|path| is_shared_workspace(path)) else {
+        return Ok(None);
+    };
+
+    fs::create_dir_all(workspace_dir)
+        .with_context(|| format!("create {}", workspace_dir.display()))?;
+    let lock_path = workspace_dir.join("server.lock");
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .or_else(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create_new(true)
+                    .open(&lock_path)
+            } else {
+                Err(error)
+            }
+        })
+        .with_context(|| format!("open {}", lock_path.display()))?;
+    try_lock_server_file(&file, &lock_path)?;
+    file.set_len(0)
+        .with_context(|| format!("truncate {}", lock_path.display()))?;
+    writeln!(file, "{}", std::process::id())?;
+    set_shared_file_mode(&lock_path)?;
+    Ok(Some(ServerLock {
+        _path: lock_path,
+        _file: file,
+    }))
+}
+
+fn set_shared_file_mode(path: &FsPath) -> Result<()> {
+    let mut permissions = fs::metadata(path)
+        .with_context(|| format!("stat {}", path.display()))?
+        .permissions();
+    permissions.set_mode(0o666);
+    match fs::set_permissions(path, permissions) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("set permissions on {}", path.display())),
+    }
+}
+
+#[cfg(unix)]
+fn try_lock_server_file(file: &File, lock_path: &FsPath) -> Result<()> {
+    unsafe extern "C" {
+        fn flock(fd: i32, operation: i32) -> i32;
+    }
+    const LOCK_EX: i32 = 2;
+    const LOCK_NB: i32 = 4;
+
+    if unsafe { flock(file.as_raw_fd(), LOCK_EX | LOCK_NB) } == 0 {
+        return Ok(());
+    }
+
+    let error = std::io::Error::last_os_error();
+    if error.kind() == std::io::ErrorKind::WouldBlock {
+        anyhow::bail!(
+            "shared Shirabe server is already running; lock file {} is locked",
+            lock_path.display()
+        );
+    }
+    Err(error).with_context(|| format!("lock {}", lock_path.display()))
+}
+
+#[cfg(not(unix))]
+fn try_lock_server_file(_file: &File, _lock_path: &FsPath) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn unlock_server_file(file: &File) -> Result<()> {
+    unsafe extern "C" {
+        fn flock(fd: i32, operation: i32) -> i32;
+    }
+    const LOCK_UN: i32 = 8;
+
+    if unsafe { flock(file.as_raw_fd(), LOCK_UN) } == 0 {
+        return Ok(());
+    }
+
+    Err(std::io::Error::last_os_error()).context("unlock shared server lock")
+}
+
+#[cfg(not(unix))]
+fn unlock_server_file(_file: &File) -> Result<()> {
     Ok(())
 }
 
@@ -98,7 +216,12 @@ async fn menubar(
     State(state): State<Arc<AppState>>,
     Query(query): Query<MenubarQuery>,
 ) -> Response {
-    match load_menubar(&state.db_path, query, current_sync_status(&state)) {
+    match load_menubar(
+        &state.db_path,
+        query,
+        current_sync_status(&state),
+        &state.identity,
+    ) {
         Ok(response) => Json(response).into_response(),
         Err(error) => api_error(error),
     }
@@ -206,6 +329,7 @@ struct UsageResponse {
     status: &'static str,
     filters: UsageFilters,
     usage_grain: String,
+    profile_options: Vec<ProfileOption>,
     source_options: Vec<String>,
     model_options: Vec<String>,
     summary: UsageSummary,
@@ -226,6 +350,8 @@ struct UsageResponse {
 struct MenubarResponse {
     status: &'static str,
     range: String,
+    profile_options: Vec<ProfileOption>,
+    current_profile_id: String,
     summary: UsageSummary,
     latency: LatencySummary,
     latency_panel: LatencyPanel,
@@ -333,6 +459,8 @@ struct UsageQuery {
     from: Option<String>,
     to: Option<String>,
     grain: Option<String>,
+    profile_id: Option<String>,
+    device_id: Option<String>,
     source: Option<String>,
     model: Option<String>,
 }
@@ -340,6 +468,7 @@ struct UsageQuery {
 #[derive(Debug, Deserialize)]
 struct MenubarQuery {
     range: Option<String>,
+    profile_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -349,6 +478,8 @@ struct UsageFilters {
     from: Option<String>,
     to: Option<String>,
     grain: String,
+    profile_id: Option<String>,
+    device_id: Option<String>,
     source: Option<String>,
     model: Option<String>,
 }
@@ -796,6 +927,16 @@ struct ErrorResponse {
     message: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct ProfileOption {
+    profile_id: String,
+    profile_label: String,
+    device_id: String,
+    device_label: Option<String>,
+    macos_username: Option<String>,
+    is_current: bool,
+}
+
 const LLM_COST_SQL: &str = "CASE
     WHEN l.total_cost_usd > 0 THEN l.total_cost_usd
     ELSE
@@ -822,6 +963,8 @@ impl UsageFilters {
             from: None,
             to: None,
             grain: "auto".to_string(),
+            profile_id: None,
+            device_id: None,
             source: None,
             model: None,
         }
@@ -922,6 +1065,12 @@ impl UsageFilters {
 
     fn rollup_source_where_for(&self, alias: &str, bucket: &str) -> String {
         let mut conditions = vec![self.rollup_key_where_for(alias, bucket)];
+        if let Some(profile) = self.profile_condition(alias) {
+            conditions.push(profile);
+        }
+        if let Some(device) = self.device_condition(alias) {
+            conditions.push(device);
+        }
         if let Some(source) = &self.source {
             conditions.push(format!("{alias}.source = {}", sql_literal(source)));
         }
@@ -981,6 +1130,8 @@ impl UsageFilters {
             from,
             to,
             grain,
+            profile_id: normalize_filter_value(query.profile_id),
+            device_id: normalize_filter_value(query.device_id),
             source: normalize_filter_value(query.source),
             model: normalize_model_filter_value(query.model),
         }
@@ -990,6 +1141,12 @@ impl UsageFilters {
         let mut conditions = vec![self.date_predicate(&format!("{alias}.last_seen_ns"))];
         if let Some(source) = self.source_condition(alias) {
             conditions.push(source);
+        }
+        if let Some(profile) = self.profile_condition(alias) {
+            conditions.push(profile);
+        }
+        if let Some(device) = self.device_condition(alias) {
+            conditions.push(device);
         }
         if let Some(model) = self.model_exists_for_session(alias) {
             conditions.push(model);
@@ -1002,6 +1159,12 @@ impl UsageFilters {
         if let Some(source) = self.source_condition(alias) {
             conditions.push(source);
         }
+        if let Some(profile) = self.profile_condition(alias) {
+            conditions.push(profile);
+        }
+        if let Some(device) = self.device_condition(alias) {
+            conditions.push(device);
+        }
         if let Some(model) = self.model_exists_for_run(alias) {
             conditions.push(model);
         }
@@ -1012,6 +1175,12 @@ impl UsageFilters {
         let mut conditions = vec![self.date_predicate(&format!("{alias}.started_at_ns"))];
         if let Some(source) = self.source_condition(alias) {
             conditions.push(source);
+        }
+        if let Some(profile) = self.profile_condition(alias) {
+            conditions.push(profile);
+        }
+        if let Some(device) = self.device_condition(alias) {
+            conditions.push(device);
         }
         if let Some(model) = self.model_exists_for_turn(alias) {
             conditions.push(model);
@@ -1024,6 +1193,12 @@ impl UsageFilters {
         if let Some(source) = self.source_condition(alias) {
             conditions.push(source);
         }
+        if let Some(profile) = self.profile_condition(alias) {
+            conditions.push(profile);
+        }
+        if let Some(device) = self.device_condition(alias) {
+            conditions.push(device);
+        }
         if let Some(model) = self.model_condition(alias) {
             conditions.push(model);
         }
@@ -1035,6 +1210,12 @@ impl UsageFilters {
         if let Some(source) = self.source_condition(alias) {
             conditions.push(source);
         }
+        if let Some(profile) = self.profile_condition(alias) {
+            conditions.push(profile);
+        }
+        if let Some(device) = self.device_condition(alias) {
+            conditions.push(device);
+        }
         if let Some(model) = self.model_exists_for_tool(alias) {
             conditions.push(model);
         }
@@ -1045,6 +1226,12 @@ impl UsageFilters {
         let mut conditions = vec![self.date_predicate(&format!("{alias}.occurred_at_ns"))];
         if let Some(source) = self.source_condition(alias) {
             conditions.push(source);
+        }
+        if let Some(profile) = self.profile_condition(alias) {
+            conditions.push(profile);
+        }
+        if let Some(device) = self.device_condition(alias) {
+            conditions.push(device);
         }
         if let Some(model) = self.model_exists_for_skill(alias) {
             conditions.push(model);
@@ -1068,6 +1255,18 @@ impl UsageFilters {
         self.source
             .as_deref()
             .map(|source| format!("{alias}.source = {}", sql_literal(source)))
+    }
+
+    fn profile_condition(&self, alias: &str) -> Option<String> {
+        self.profile_id
+            .as_deref()
+            .map(|profile_id| format!("{alias}.profile_id = {}", sql_literal(profile_id)))
+    }
+
+    fn device_condition(&self, alias: &str) -> Option<String> {
+        self.device_id
+            .as_deref()
+            .map(|device_id| format!("{alias}.device_id = {}", sql_literal(device_id)))
     }
 
     fn model_condition(&self, alias: &str) -> Option<String> {
@@ -1178,6 +1377,7 @@ fn load_usage(db_path: &PathBuf, filters: UsageFilters) -> Result<UsageResponse>
         status: "ok",
         filters: filters.clone(),
         usage_grain: filters.usage_grain().to_string(),
+        profile_options: load_profile_options(&conn, filters.profile_id.as_deref())?,
         source_options: load_source_options(&conn)?,
         model_options: load_model_options(&conn)?,
         summary,
@@ -1199,11 +1399,17 @@ fn load_menubar(
     db_path: &PathBuf,
     query: MenubarQuery,
     sync: SyncStatus,
+    identity: &Identity,
 ) -> Result<MenubarResponse> {
     let conn =
         Connection::open(db_path).with_context(|| format!("open sqlite {}", db_path.display()))?;
     let range = normalize_menubar_range(query.range.as_deref());
-    let filters = menubar_filters(range);
+    let selected_profile_id = if query.profile_id.as_deref() == Some("all") {
+        None
+    } else {
+        normalize_filter_value(query.profile_id).or_else(|| Some(identity.profile_id.clone()))
+    };
+    let filters = menubar_filters(range, selected_profile_id);
     let summary = UsageSummary::from_totals(&load_usage_totals(&conn, &filters)?);
     let latency_observations = load_latency_observations(&conn, &filters)?;
     let latency = latency_summary_from_observations(&latency_observations);
@@ -1225,6 +1431,11 @@ fn load_menubar(
     Ok(MenubarResponse {
         status: "ok",
         range: range.to_string(),
+        profile_options: load_profile_options(&conn, filters.profile_id.as_deref())?,
+        current_profile_id: filters
+            .profile_id
+            .clone()
+            .unwrap_or_else(|| "all".to_string()),
         summary,
         latency,
         latency_panel,
@@ -1249,13 +1460,15 @@ fn normalize_menubar_range(value: Option<&str>) -> &'static str {
     }
 }
 
-fn menubar_filters(range: &str) -> UsageFilters {
+fn menubar_filters(range: &str, profile_id: Option<String>) -> UsageFilters {
     UsageFilters {
         preset: range.to_string(),
         range: range.to_string(),
         from: None,
         to: None,
         grain: "day".to_string(),
+        profile_id,
+        device_id: None,
         source: None,
         model: None,
     }
@@ -1307,9 +1520,17 @@ fn run_sync_job_inner(state: &Arc<AppState>) -> Result<()> {
     db.migrate()?;
 
     let mut imported_files = 0usize;
+    if let Some(workspace_dir) = shared_workspace_dir(&state.db_path) {
+        set_sync_phase(state, "drain inbox");
+        let drain = workspace::drain_inbox(&db, workspace_dir)?;
+        if drain.events_projected > 0 {
+            imported_files = imported_files.saturating_add(drain.files_drained);
+        }
+    }
+
     for source in ["codex", "pi", "claude", "kanade"] {
         set_sync_phase(state, &format!("import {source}"));
-        let report = import_sync_source(&db, source, &state.source_paths);
+        let report = import_sync_source(&db, source, &state.source_paths, &state.identity);
         imported_files = imported_files.saturating_add(report.files_imported);
         state
             .sync
@@ -1339,27 +1560,52 @@ fn run_sync_job_inner(state: &Arc<AppState>) -> Result<()> {
     Ok(())
 }
 
+fn shared_workspace_dir(db_path: &FsPath) -> Option<&FsPath> {
+    db_path.parent().filter(|path| is_shared_workspace(path))
+}
+
+fn is_shared_workspace(path: &FsPath) -> bool {
+    path.join("workspace.json").exists() || path.starts_with(FsPath::new("/Users/Shared/Shirabe"))
+}
+
 fn set_sync_phase(state: &AppState, phase: &str) {
     state.sync.lock().expect("sync status lock poisoned").phase = phase.to_string();
 }
 
-fn import_sync_source(db: &Database, source: &str, source_paths: &SourcePaths) -> SyncSourceReport {
+fn import_sync_source(
+    db: &Database,
+    source: &str,
+    source_paths: &SourcePaths,
+    identity: &Identity,
+) -> SyncSourceReport {
     let started = Instant::now();
-    let modified_since_ns = sync_modified_since_ns(db, source);
+    let modified_since_ns = sync_modified_since_ns(db, source, &identity.profile_id);
+    let import_identity =
+        ImportIdentity::new(identity.profile_id.clone(), identity.device_id.clone());
     let result = match source {
-        "codex" => {
-            importers::codex::import_recent(db, Some(source_paths.codex.clone()), modified_since_ns)
-        }
-        "pi" => importers::pi::import_recent(db, Some(source_paths.pi.clone()), modified_since_ns),
-        "claude" => importers::claude::import_recent(
+        "codex" => importers::codex::import_recent_with_identity(
+            db,
+            Some(source_paths.codex.clone()),
+            modified_since_ns,
+            &import_identity,
+        ),
+        "pi" => importers::pi::import_recent_with_identity(
+            db,
+            Some(source_paths.pi.clone()),
+            modified_since_ns,
+            &import_identity,
+        ),
+        "claude" => importers::claude::import_recent_with_identity(
             db,
             Some(source_paths.claude.clone()),
             modified_since_ns,
+            &import_identity,
         ),
-        "kanade" => importers::kanade::import_recent(
+        "kanade" => importers::kanade::import_recent_with_identity(
             db,
             Some(source_paths.kanade.clone()),
             modified_since_ns,
+            &import_identity,
         ),
         _ => unreachable!("unsupported sync source"),
     };
@@ -1390,8 +1636,8 @@ fn import_sync_source(db: &Database, source: &str, source_paths: &SourcePaths) -
     }
 }
 
-fn sync_modified_since_ns(db: &Database, source: &str) -> i64 {
-    db.latest_import_source_scan_ns(source)
+fn sync_modified_since_ns(db: &Database, source: &str, profile_id: &str) -> i64 {
+    db.latest_import_source_scan_ns_for_profile(source, profile_id)
         .ok()
         .flatten()
         .map(|last_scan_ns| last_scan_ns.saturating_sub(SYNC_WATERMARK_OVERLAP_NS))
@@ -2182,6 +2428,46 @@ fn load_import_summaries(conn: &Connection) -> Result<Vec<ImportSourceSummary>> 
     collect_rows(rows)
 }
 
+fn load_profile_options(
+    conn: &Connection,
+    selected_profile_id: Option<&str>,
+) -> Result<Vec<ProfileOption>> {
+    let mut statement = conn.prepare(
+        "WITH profile_ids AS (
+            SELECT profile_id FROM profiles
+            UNION
+            SELECT profile_id FROM runs
+            UNION
+            SELECT profile_id FROM sessions
+            UNION
+            SELECT profile_id FROM import_sources
+         )
+         SELECT
+            ids.profile_id,
+            COALESCE(p.profile_label, ids.profile_id) AS profile_label,
+            COALESCE(p.device_id, 'local_device') AS device_id,
+            d.device_label,
+            p.macos_username
+         FROM profile_ids ids
+         LEFT JOIN profiles p ON p.profile_id = ids.profile_id
+         LEFT JOIN devices d ON d.device_id = p.device_id
+         WHERE ids.profile_id IS NOT NULL AND ids.profile_id != ''
+         ORDER BY profile_label, ids.profile_id",
+    )?;
+    let rows = statement.query_map([], |row| {
+        let profile_id: String = row.get(0)?;
+        Ok(ProfileOption {
+            is_current: selected_profile_id == Some(profile_id.as_str()),
+            profile_id,
+            profile_label: row.get(1)?,
+            device_id: row.get(2)?,
+            device_label: row.get(3)?,
+            macos_username: row.get(4)?,
+        })
+    })?;
+    collect_rows(rows)
+}
+
 fn load_source_options(conn: &Connection) -> Result<Vec<String>> {
     let mut statement = conn.prepare(
         "WITH sources AS (
@@ -2341,42 +2627,8 @@ fn load_today_hourly_usage_buckets(
     conn: &Connection,
     filters: &UsageFilters,
 ) -> Result<Vec<UsageBucketSummary>> {
-    let source_llm_condition = filters
-        .source
-        .as_ref()
-        .map(|source| format!("AND l.source = {}", sql_literal(source)))
-        .unwrap_or_default();
-    let source_tool_condition = filters
-        .source
-        .as_ref()
-        .map(|source| format!("AND tc.source = {}", sql_literal(source)))
-        .unwrap_or_default();
-    let model_llm_condition = filters
-        .model
-        .as_ref()
-        .map(|model| {
-            format!(
-                "AND COALESCE(NULLIF(l.model, ''), 'unknown') = {}",
-                sql_literal(model)
-            )
-        })
-        .unwrap_or_default();
-    let model_tool_condition = filters
-        .model
-        .as_ref()
-        .map(|model| {
-            format!(
-                "AND EXISTS (
-                    SELECT 1
-                    FROM llm_calls lm
-                    WHERE lm.run_id = tc.run_id
-                      AND lm.source = tc.source
-                      AND COALESCE(NULLIF(lm.model, ''), 'unknown') = {}
-                )",
-                sql_literal(model)
-            )
-        })
-        .unwrap_or_default();
+    let llm_where = filters.llm_where("l");
+    let tool_where = filters.tool_where("tc");
     let sql = format!(
         "WITH RECURSIVE hours(hour) AS (
             SELECT 0
@@ -2404,10 +2656,7 @@ fn load_today_hourly_usage_buckets(
                 COALESCE(SUM({LLM_COST_SQL}), 0) AS total_cost_usd
             FROM llm_calls l
             LEFT JOIN model_prices mp ON mp.model_name = l.model
-            WHERE l.started_at_ns >= {today_start_ns}
-              AND l.started_at_ns < {tomorrow_start_ns}
-              {source_llm_condition}
-              {model_llm_condition}
+            WHERE {llm_where}
             GROUP BY hour
          ),
          tool_buckets AS (
@@ -2416,10 +2665,7 @@ fn load_today_hourly_usage_buckets(
                 COUNT(*) AS tool_calls,
                 COALESCE(SUM(CASE WHEN tc.status = 'failed' THEN 1 ELSE 0 END), 0) AS failed_tool_calls
             FROM tool_calls tc
-            WHERE tc.started_at_ns >= {today_start_ns}
-              AND tc.started_at_ns < {tomorrow_start_ns}
-              {source_tool_condition}
-              {model_tool_condition}
+            WHERE {tool_where}
             GROUP BY hour
          )
          SELECT
@@ -2439,14 +2685,8 @@ fn load_today_hourly_usage_buckets(
          LEFT JOIN llm_buckets lb ON lb.hour = hb.hour
          LEFT JOIN tool_buckets tb ON tb.hour = hb.hour
          ORDER BY hb.hour DESC",
-        today_start_ns =
-            date_expr_start_ns_sql("date('now', 'localtime', 'start of day')"),
-        tomorrow_start_ns =
-            date_expr_start_ns_sql("date('now', 'localtime', 'start of day', '+1 day')"),
-        source_llm_condition = source_llm_condition,
-        source_tool_condition = source_tool_condition,
-        model_llm_condition = model_llm_condition,
-        model_tool_condition = model_tool_condition,
+        llm_where = llm_where,
+        tool_where = tool_where,
     );
     let mut statement = conn.prepare(&sql)?;
 
@@ -4217,6 +4457,7 @@ mod tests {
     use anyhow::Result;
 
     use crate::{
+        config::Identity,
         db::Database,
         projection::{
             event::{
@@ -4229,8 +4470,9 @@ mod tests {
     };
 
     use super::{
-        LatencySample, UsageFilters, UsageQuery, load_overview, load_pattern_latency_panel,
-        load_run_detail, load_session_detail, load_sessions, load_today_latency_panel, load_usage,
+        LatencySample, MenubarQuery, SyncStatus, UsageFilters, UsageQuery, load_menubar,
+        load_overview, load_pattern_latency_panel, load_run_detail, load_session_detail,
+        load_sessions, load_today_latency_panel, load_usage,
     };
 
     #[test]
@@ -4245,6 +4487,8 @@ mod tests {
         )?;
 
         let event = NormalizedEvent {
+            profile_id: "local".to_string(),
+            device_id: "local_device".to_string(),
             source: "kanade".to_string(),
             source_kind: "otlp_jsonl_span".to_string(),
             source_event_id: Some("span-1".to_string()),
@@ -4323,6 +4567,8 @@ mod tests {
         db.migrate()?;
 
         let event = NormalizedEvent {
+            profile_id: "local".to_string(),
+            device_id: "local_device".to_string(),
             source: "codex".to_string(),
             source_kind: "session_jsonl_event".to_string(),
             source_event_id: Some("event-1".to_string()),
@@ -4404,6 +4650,8 @@ mod tests {
             from: Some("1970-01-01".to_string()),
             to: Some("1970-01-02".to_string()),
             grain: Some("day".to_string()),
+            profile_id: None,
+            device_id: None,
             source: None,
             model: None,
         });
@@ -4421,6 +4669,8 @@ mod tests {
             from: Some("1970-01-01".to_string()),
             to: Some("1970-05-02".to_string()),
             grain: Some("auto".to_string()),
+            profile_id: None,
+            device_id: None,
             source: None,
             model: None,
         });
@@ -4432,6 +4682,8 @@ mod tests {
             from: None,
             to: None,
             grain: Some("auto".to_string()),
+            profile_id: None,
+            device_id: None,
             source: None,
             model: Some("cline-pass/deepseek-v4-pro".to_string()),
         });
@@ -4460,6 +4712,8 @@ mod tests {
                 from: Some("1970-01-10".to_string()),
                 to: Some("1970-02-10".to_string()),
                 grain: Some("day".to_string()),
+                profile_id: None,
+                device_id: None,
                 source: None,
                 model: None,
             }),
@@ -4472,6 +4726,8 @@ mod tests {
                 from: Some("1970-01-10".to_string()),
                 to: Some("1970-02-10".to_string()),
                 grain: Some("month".to_string()),
+                profile_id: None,
+                device_id: None,
                 source: None,
                 model: None,
             }),
@@ -4486,6 +4742,94 @@ mod tests {
         assert_eq!(month_usage.buckets[0].bucket_key, "1970-01");
         assert_eq!(month_usage.buckets[0].input_tokens, 100);
         assert_eq!(month_usage.buckets[0].output_tokens, 10);
+
+        let _ = fs::remove_file(db_path);
+        Ok(())
+    }
+
+    #[test]
+    fn usage_filters_profile_scoped_imports_without_id_collisions() -> Result<()> {
+        let db_path = temp_db_path("usage-profile-filter");
+        let db = Database::open(&db_path)?;
+        db.migrate()?;
+
+        let mut profile_a = usage_test_event("shared", epoch_day_noon_ns(20), 100, 10);
+        profile_a.profile_id = "profile_a".to_string();
+        profile_a.device_id = "device_1".to_string();
+        let mut profile_b = usage_test_event("shared", epoch_day_noon_ns(20), 200, 20);
+        profile_b.profile_id = "profile_b".to_string();
+        profile_b.device_id = "device_1".to_string();
+
+        let projector = Projector::new(&db);
+        let result_a = projector.project(&profile_a)?;
+        let result_b = projector.project(&profile_b)?;
+        rollup::refresh_all(&db)?;
+
+        assert_ne!(result_a.run_id, result_b.run_id);
+
+        let all_usage = load_usage(&db_path, UsageFilters::all())?;
+        assert_eq!(all_usage.summary.sessions, 2);
+        assert_eq!(all_usage.summary.runs, 2);
+        assert_eq!(all_usage.summary.input_tokens, 300);
+
+        let profile_usage = load_usage(
+            &db_path,
+            UsageFilters {
+                profile_id: Some("profile_a".to_string()),
+                ..UsageFilters::all()
+            },
+        )?;
+        assert_eq!(profile_usage.summary.sessions, 1);
+        assert_eq!(profile_usage.summary.runs, 1);
+        assert_eq!(profile_usage.summary.input_tokens, 100);
+        assert!(
+            all_usage
+                .profile_options
+                .iter()
+                .any(|profile| profile.profile_id == "profile_a")
+        );
+
+        let _ = fs::remove_file(db_path);
+        Ok(())
+    }
+
+    #[test]
+    fn menubar_today_trend_respects_profile_filter() -> Result<()> {
+        let db_path = temp_db_path("menubar-profile-trend-filter");
+        let db = Database::open(&db_path)?;
+        db.migrate()?;
+
+        let timestamp_ns = crate::db::now_ns();
+        let mut profile_a = usage_test_event("today-a", timestamp_ns, 77, 11);
+        profile_a.profile_id = "profile_a".to_string();
+        profile_a.device_id = "device_1".to_string();
+        let mut profile_b = usage_test_event("today-b", timestamp_ns + 1, 33, 7);
+        profile_b.profile_id = "profile_b".to_string();
+        profile_b.device_id = "device_1".to_string();
+
+        let projector = Projector::new(&db);
+        projector.project(&profile_a)?;
+        projector.project(&profile_b)?;
+        rollup::refresh_all(&db)?;
+
+        let menubar = load_menubar(
+            &db_path,
+            MenubarQuery {
+                range: None,
+                profile_id: Some("profile_b".to_string()),
+            },
+            SyncStatus::default(),
+            &test_identity("profile_a"),
+        )?;
+
+        let trend_tokens = menubar
+            .trend
+            .iter()
+            .map(|bucket| bucket.input_tokens)
+            .sum::<i64>();
+        assert_eq!(menubar.current_profile_id, "profile_b");
+        assert_eq!(menubar.summary.input_tokens, 33);
+        assert_eq!(trend_tokens, 33);
 
         let _ = fs::remove_file(db_path);
         Ok(())
@@ -4585,6 +4929,8 @@ mod tests {
         db.migrate()?;
 
         let event = NormalizedEvent {
+            profile_id: "local".to_string(),
+            device_id: "local_device".to_string(),
             source: "pi".to_string(),
             source_kind: "session_jsonl_event".to_string(),
             source_event_id: Some("pi-tool-1".to_string()),
@@ -4685,6 +5031,8 @@ mod tests {
         output_tokens: i64,
     ) -> NormalizedEvent {
         NormalizedEvent {
+            profile_id: "local".to_string(),
+            device_id: "local_device".to_string(),
             source: "codex".to_string(),
             source_kind: "session_jsonl_event".to_string(),
             source_event_id: Some(format!("event-{id}")),
@@ -4724,6 +5072,17 @@ mod tests {
             },
             skill_events: Vec::new(),
             confidence: 1.0,
+        }
+    }
+
+    fn test_identity(profile_id: &str) -> Identity {
+        Identity {
+            device_id: "device_1".to_string(),
+            device_label: "Test Mac".to_string(),
+            profile_id: profile_id.to_string(),
+            profile_label: profile_id.to_string(),
+            macos_uid: None,
+            macos_username: profile_id.to_string(),
         }
     }
 
