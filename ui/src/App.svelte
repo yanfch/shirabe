@@ -8,8 +8,8 @@
   import SessionListPage from "./pages/SessionListPage.svelte";
   import UsagePage from "./pages/UsagePage.svelte";
   import UsageFiltersBar from "./components/UsageFiltersBar.svelte";
-  import { fetchOverview, fetchRunDetail, fetchSessionDetail, fetchSessions, fetchSyncStatus, fetchUsage, startSync } from "./lib/api";
-  import type { Overview, RunDetail, SessionDetail, SessionList, SyncStatus, Usage, UsageFilters } from "./lib/types";
+  import { fetchOverview, fetchRunDetail, fetchSessionDetail, fetchSessions, fetchSyncStatus, fetchUsage, fetchWorkspaceStatus, repairWorkspace, startSync } from "./lib/api";
+  import type { Overview, RunDetail, SessionDetail, SessionList, SyncStatus, Usage, UsageFilters, WorkspaceStatus } from "./lib/types";
 
   let overview: Overview | null = null;
   let usage: Usage | null = null;
@@ -17,6 +17,8 @@
   let sessionDetail: SessionDetail | null = null;
   let runDetail: RunDetail | null = null;
   let syncStatus: SyncStatus | null = null;
+  let workspaceStatus: WorkspaceStatus | null = null;
+  let workspaceBusy = false;
   let syncPoll: number | null = null;
   const initialParams = new URLSearchParams(location.search);
   const isMenubarView = initialParams.get("view") === "menubar";
@@ -84,6 +86,8 @@
       from: preset === "custom" ? normalizeDateParam(params.get("from")) ?? customRange.from : null,
       to: preset === "custom" ? normalizeDateParam(params.get("to")) ?? customRange.to : null,
       grain: normalizeGrain(params.get("grain")),
+      profile_id: params.get("profile_id"),
+      device_id: params.get("device_id"),
       source: params.get("source"),
       model: params.get("model"),
     };
@@ -116,9 +120,24 @@
       if (filters.from) params.set("from", filters.from);
       if (filters.to) params.set("to", filters.to);
     }
+    if (filters.profile_id) params.set("profile_id", filters.profile_id);
+    if (filters.device_id) params.set("device_id", filters.device_id);
     if (filters.source) params.set("source", filters.source);
     if (filters.model) params.set("model", filters.model);
     return `/?${params.toString()}`;
+  }
+
+  function syncUsageFiltersFromResponse(nextUsage: Usage) {
+    const canonical = nextUsage.filters;
+    usageFilters = canonical;
+    const nextPath = usagePath(canonical);
+    if (location.pathname + location.search !== nextPath) {
+      history.replaceState(
+        { shirabe: true, depth: navigationDepth },
+        "",
+        nextPath,
+      );
+    }
   }
 
   function sessionsPath() {
@@ -142,6 +161,7 @@
     try {
       overview = await fetchOverview();
       syncStatus = await fetchSyncStatus();
+      workspaceStatus = await fetchWorkspaceStatus();
       if (syncStatus.state === "running") beginSyncPolling();
       if (selectedRunId) {
         runDetail = await fetchRunDetail(selectedRunId);
@@ -149,6 +169,7 @@
         sessionDetail = await fetchSessionDetail(selectedSessionId);
       } else if (activePage === "usage") {
         usage = await fetchUsage(usageFilters);
+        if (usage) syncUsageFiltersFromResponse(usage);
       } else if (activePage === "sessions") {
         sessionList = await fetchSessions();
       }
@@ -181,6 +202,7 @@
         sessionDetail = await fetchSessionDetail(selectedSessionId);
       } else if (activePage === "usage") {
         usage = await fetchUsage(usageFilters);
+        if (usage) syncUsageFiltersFromResponse(usage);
       } else if (activePage === "sessions") {
         sessionList = await fetchSessions();
       } else if (!overview) {
@@ -293,6 +315,7 @@
     error = null;
     try {
       usage = await fetchUsage(usageFilters);
+      if (usage) syncUsageFiltersFromResponse(usage);
       if (!overview) {
         overview = await fetchOverview();
       }
@@ -334,6 +357,19 @@
     }
   }
 
+  async function repairWorkspaceFromSidebar() {
+    workspaceBusy = true;
+    error = null;
+    try {
+      workspaceStatus = await repairWorkspace();
+    } catch (err) {
+      error = err instanceof Error ? err.message : String(err);
+      workspaceStatus = await fetchWorkspaceStatus();
+    } finally {
+      workspaceBusy = false;
+    }
+  }
+
   function beginSyncPolling() {
     if (syncPoll !== null) {
       window.clearInterval(syncPoll);
@@ -364,6 +400,7 @@
     refreshing = currentHasData;
     try {
       overview = await fetchOverview();
+      workspaceStatus = await fetchWorkspaceStatus();
       if (runDetail && selectedRunId) {
         runDetail = await fetchRunDetail(selectedRunId);
       } else if (sessionDetail && selectedSessionId) {
@@ -390,17 +427,32 @@
 
   $: usageSourceOptions = usage?.source_options ?? [];
   $: usageModelOptions = usage?.model_options ?? [];
+  $: usageProfileOptions = usage?.profile_options ?? [];
 </script>
 
 {#if isMenubarView}
   <MenubarPage />
 {:else}
-<AppShell {overview} {syncStatus} {selectedRunId} {selectedSessionId} {activePage} onOverview={showOverview} onUsage={showUsage} onSessions={showSessions} onSync={triggerSync}>
+<AppShell
+  {overview}
+  {syncStatus}
+  {workspaceStatus}
+  {workspaceBusy}
+  {selectedRunId}
+  {selectedSessionId}
+  {activePage}
+  onOverview={showOverview}
+  onUsage={showUsage}
+  onSessions={showSessions}
+  onSync={triggerSync}
+  onRepairWorkspace={repairWorkspaceFromSidebar}
+>
   <svelte:fragment slot="topbar-extra">
     {#if activePage === "usage" && !selectedRunId}
-      <UsageFiltersBar
-        filters={usageFilters}
-        sourceOptions={usageSourceOptions}
+        <UsageFiltersBar
+          filters={usageFilters}
+          profileOptions={usageProfileOptions}
+          sourceOptions={usageSourceOptions}
         modelOptions={usageModelOptions}
         onFilterChange={updateUsageFilters}
       />

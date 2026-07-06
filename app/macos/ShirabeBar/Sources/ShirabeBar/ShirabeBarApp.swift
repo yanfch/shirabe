@@ -25,14 +25,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate {
     private let dashboardURL = URL(string: "http://127.0.0.1:7778/?page=usage")!
     private let healthURL = URL(string: "http://127.0.0.1:7778/api/health")!
     private let syncURL = URL(string: "http://127.0.0.1:7778/api/sync")!
+    private let sharedWorkspacePath = "/Users/Shared/Shirabe"
 
     private var statusItem: NSStatusItem?
     private var panel: NSPanel?
     private var webView: WKWebView?
     private var serverProcess: Process?
+    private var collectorProcess: Process?
     private var serverLogFile: FileHandle?
+    private var collectorLogFile: FileHandle?
     private var outsideClickMonitor: Any?
     private var hasLoadedWebView = false
+    private var hasRunInitialCollector = false
 
     static func main() {
         let app = NSApplication.shared
@@ -204,6 +208,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate {
     @MainActor
     private func ensureServerAndShowContentIfNeeded() async {
         await ensureServerAvailable()
+        runInitialCollectorIfNeeded()
         await checkServerAndShowContentIfNeeded()
     }
 
@@ -243,7 +248,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate {
             "--exit-when-parent-exits",
             String(ProcessInfo.processInfo.processIdentifier),
         ]
-        process.environment = ProcessInfo.processInfo.environment
+        process.environment = serverEnvironment()
 
         if let logFile = openServerLogFile() {
             process.standardOutput = logFile
@@ -267,6 +272,64 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate {
         }
     }
 
+    private func runInitialCollectorIfNeeded() {
+        guard !hasRunInitialCollector else { return }
+        hasRunInitialCollector = true
+        runBundledCollectorIfPossible { [weak self] in
+            self?.requestServerSync {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+                    self?.reloadWebView()
+                }
+            }
+        }
+    }
+
+    private func runBundledCollectorIfPossible(completion: (() -> Void)? = nil) {
+        if collectorProcess?.isRunning == true {
+            completion?()
+            return
+        }
+        guard sharedWorkspaceExists(),
+              let serverURL = bundledServerURL() else {
+            completion?()
+            return
+        }
+
+        let process = Process()
+        process.executableURL = serverURL
+        process.arguments = [
+            "collect",
+            "--workspace",
+            sharedWorkspacePath,
+        ]
+        process.environment = ProcessInfo.processInfo.environment
+
+        if let logFile = openLogFile(named: "shirabe-collector.log") {
+            process.standardOutput = logFile
+            process.standardError = logFile
+            collectorLogFile = logFile
+        }
+
+        process.terminationHandler = { [weak self, weak process] _ in
+            DispatchQueue.main.async {
+                guard let self, let process, self.collectorProcess === process else { return }
+                self.collectorProcess = nil
+                self.collectorLogFile?.closeFile()
+                self.collectorLogFile = nil
+                completion?()
+            }
+        }
+
+        do {
+            try process.run()
+            collectorProcess = process
+        } catch {
+            collectorLogFile?.closeFile()
+            collectorLogFile = nil
+            completion?()
+        }
+    }
+
     private func bundledServerURL() -> URL? {
         guard let executableDirectory = Bundle.main.executableURL?.deletingLastPathComponent() else {
             return nil
@@ -279,9 +342,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate {
         return url
     }
 
+    private func sharedWorkspaceExists() -> Bool {
+        FileManager.default.fileExists(atPath: "\(sharedWorkspacePath)/workspace.json")
+    }
+
+    private func serverEnvironment() -> [String: String] {
+        var environment = ProcessInfo.processInfo.environment
+        if sharedWorkspaceExists() {
+            environment["SHIRABE_DIR"] = sharedWorkspacePath
+        }
+        return environment
+    }
+
     private func openServerLogFile() -> FileHandle? {
+        openLogFile(named: "shirabe-server.log")
+    }
+
+    private func openLogFile(named name: String) -> FileHandle? {
         let logDirectory = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".shirabe", isDirectory: true)
-        let logURL = logDirectory.appendingPathComponent("shirabe-server.log")
+        let logURL = logDirectory.appendingPathComponent(name)
 
         do {
             try FileManager.default.createDirectory(at: logDirectory, withIntermediateDirectories: true)
@@ -303,6 +382,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate {
         serverProcess = nil
         serverLogFile?.closeFile()
         serverLogFile = nil
+        if collectorProcess?.isRunning == true {
+            collectorProcess?.terminate()
+        }
+        collectorProcess = nil
+        collectorLogFile?.closeFile()
+        collectorLogFile = nil
     }
 
     @MainActor
@@ -319,11 +404,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate {
         request.timeoutInterval = 1.2
 
         do {
-            let (_, response) = try await URLSession.shared.data(for: request)
-            return (response as? HTTPURLResponse).map { 200..<300 ~= $0.statusCode } ?? false
+            let (data, response) = try await URLSession.shared.data(for: request)
+            let ok = (response as? HTTPURLResponse).map { 200..<300 ~= $0.statusCode } ?? false
+            guard ok else { return false }
+            if sharedWorkspaceExists() {
+                return healthDatabasePath(from: data)?.hasPrefix(sharedWorkspacePath) == true
+            }
+            return true
         } catch {
             return false
         }
+    }
+
+    private func healthDatabasePath(from data: Data) -> String? {
+        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return nil
+        }
+        return object["database"] as? String
     }
 
     @MainActor
@@ -374,14 +471,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, WKNavigationDelegate {
     }
 
     @objc private func syncNow() {
+        runBundledCollectorIfPossible { [weak self] in
+            self?.requestServerSync {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+                    self?.reloadWebView()
+                }
+            }
+        }
+    }
+
+    private func requestServerSync(completion: (() -> Void)? = nil) {
         var request = URLRequest(url: syncURL)
         request.httpMethod = "POST"
         request.timeoutInterval = 2
 
-        URLSession.shared.dataTask(with: request) { [weak self] _, _, _ in
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
-                self?.reloadWebView()
-            }
+        URLSession.shared.dataTask(with: request) { _, _, _ in
+            completion?()
         }.resume()
     }
 
@@ -476,7 +581,7 @@ private struct OfflineView: View {
                 Text("Local server is offline")
                     .font(.system(size: 18, weight: .semibold, design: .monospaced))
                     .foregroundStyle(Color(red: 0.9, green: 0.88, blue: 0.82))
-                Text("Start Shirabe with `just restart`, then retry.")
+                Text("Retry, or check ~/.shirabe/shirabe-server.log.")
                     .font(.system(size: 13, design: .monospaced))
                     .foregroundStyle(Color(red: 0.58, green: 0.62, blue: 0.56))
             }

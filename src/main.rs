@@ -7,13 +7,14 @@ pub mod projection;
 mod rollup;
 mod server;
 mod skills;
+mod workspace;
 
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use clap::Parser;
-use cli::{Cli, Commands, ImportSource, PricingCommand, RollupCommand};
-use config::Paths;
+use cli::{Cli, Commands, ImportSource, PricingCommand, RollupCommand, WorkspaceCommand};
+use config::{Paths, is_shared_workspace_dir};
 use db::Database;
 
 #[tokio::main]
@@ -22,12 +23,13 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
     let paths = Paths::resolve(cli.data_dir)?;
-    let database = Database::open(&paths.catalog_db)?;
 
     match cli.command {
         Commands::Init => {
-            database.migrate()?;
+            ensure_not_shared_workspace_direct_write(&paths, "init")?;
+            let (_database, _adopted_legacy_profile) = open_registered_database(&paths)?;
             println!("initialized {}", paths.data_dir.display());
+            println!("config {}", paths.config_dir.display());
             println!("catalog {}", paths.catalog_db.display());
         }
         Commands::Serve {
@@ -35,8 +37,13 @@ async fn main() -> Result<()> {
             ui_dir,
             exit_when_parent_exits,
         } => {
-            database.migrate()?;
-            if let Some(report) = rollup::refresh_if_missing(&database)? {
+            let (database, adopted_legacy_profile) = open_registered_database(&paths)?;
+            let rollup_report = if adopted_legacy_profile {
+                Some(rollup::refresh_all(&database)?)
+            } else {
+                rollup::refresh_if_missing(&database)?
+            };
+            if let Some(report) = rollup_report {
                 tracing::info!(
                     source_rollups = report.source_rollups,
                     model_rollups = report.model_rollups,
@@ -47,26 +54,42 @@ async fn main() -> Result<()> {
                 spawn_parent_exit_watchdog(parent_pid);
             }
             let ui_dir = ui_dir.unwrap_or(paths.ui_dist);
-            server::serve(paths.catalog_db, bind, ui_dir, paths.source_paths).await?;
+            server::serve(
+                paths.catalog_db,
+                bind,
+                ui_dir,
+                paths.source_paths,
+                paths.identity,
+            )
+            .await?;
         }
         Commands::Import { source, path } => {
-            database.migrate()?;
+            ensure_not_shared_workspace_direct_write(&paths, "import")?;
+            let (database, _adopted_legacy_profile) = open_registered_database(&paths)?;
+            let import_identity = importers::ImportIdentity::new(
+                paths.identity.profile_id.clone(),
+                paths.identity.device_id.clone(),
+            );
             let report = match source {
-                ImportSource::Codex => importers::codex::import(
+                ImportSource::Codex => importers::codex::import_with_identity(
                     &database,
                     path.or_else(|| Some(paths.source_paths.codex.clone())),
+                    &import_identity,
                 )?,
-                ImportSource::Claude => importers::claude::import(
+                ImportSource::Claude => importers::claude::import_with_identity(
                     &database,
                     path.or_else(|| Some(paths.source_paths.claude.clone())),
+                    &import_identity,
                 )?,
-                ImportSource::Kanade => importers::kanade::import(
+                ImportSource::Kanade => importers::kanade::import_with_identity(
                     &database,
                     path.or_else(|| Some(paths.source_paths.kanade.clone())),
+                    &import_identity,
                 )?,
-                ImportSource::Pi => importers::pi::import(
+                ImportSource::Pi => importers::pi::import_with_identity(
                     &database,
                     path.or_else(|| Some(paths.source_paths.pi.clone())),
+                    &import_identity,
                 )?,
             };
             let rollup_report = rollup::refresh_all(&database)?;
@@ -78,8 +101,14 @@ async fn main() -> Result<()> {
             );
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
+        Commands::Collect { workspace } => {
+            let report =
+                workspace::collect_to_inbox(workspace, &paths.source_paths, &paths.identity)?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
         Commands::Pricing { command } => {
-            database.migrate()?;
+            ensure_not_shared_workspace_direct_write(&paths, "pricing refresh")?;
+            let (database, _adopted_legacy_profile) = open_registered_database(&paths)?;
             let report = match command {
                 PricingCommand::Refresh { url } => {
                     pricing::refresh_litellm_pricing(
@@ -92,14 +121,56 @@ async fn main() -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
         Commands::Rollup { command } => {
-            database.migrate()?;
+            ensure_not_shared_workspace_direct_write(&paths, "rollup refresh")?;
+            let (database, _adopted_legacy_profile) = open_registered_database(&paths)?;
             let report = match command {
                 RollupCommand::Refresh => rollup::refresh_all(&database)?,
             };
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
+        Commands::Workspace { command } => {
+            let workspace_path = match command {
+                WorkspaceCommand::Init { path } | WorkspaceCommand::Repair { path } => path,
+            };
+            let report = workspace::prepare(workspace_path)?;
+            let shared_paths = Paths::resolve(Some(report.workspace_dir.clone()))?;
+            let shared_db = Database::open(&shared_paths.catalog_db)?;
+            shared_db.migrate()?;
+            shared_db.register_identity(&shared_paths.identity)?;
+            let mut pricing_changed = workspace::seed_pricing_cache(&shared_db, &paths.catalog_db)?;
+            if !pricing_changed {
+                pricing_changed = workspace::seed_pricing_cache_from_default_local(&shared_db)?;
+            }
+            if pricing_changed {
+                rollup::refresh_all(&shared_db)?;
+            }
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
     }
 
+    Ok(())
+}
+
+fn open_registered_database(paths: &Paths) -> Result<(Database, bool)> {
+    let database = Database::open(&paths.catalog_db)?;
+    database.migrate()?;
+    database.register_identity(&paths.identity)?;
+    let adopted_legacy_profile = if is_shared_workspace_dir(&paths.data_dir) {
+        false
+    } else {
+        database.adopt_legacy_local_profile(&paths.identity)?
+    };
+    Ok((database, adopted_legacy_profile))
+}
+
+fn ensure_not_shared_workspace_direct_write(paths: &Paths, action: &str) -> Result<()> {
+    if is_shared_workspace_dir(&paths.data_dir) {
+        bail!(
+            "shared workspace {} is server-owned; run `shirabe serve` for DB writes and use `shirabe collect --workspace {}` from other accounts instead of direct `{action}`",
+            paths.data_dir.display(),
+            paths.data_dir.display()
+        );
+    }
     Ok(())
 }
 

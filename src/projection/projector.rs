@@ -69,12 +69,12 @@ impl<'a> Projector<'a> {
         let session_id = event
             .session
             .as_ref()
-            .map(|session| ids::session_id(&event.source, &session.external_id));
-        let run_id = ids::run_id(&event.source, &event.run.external_id);
+            .map(|session| ids::session_id(&event.profile_id, &event.source, &session.external_id));
+        let run_id = ids::run_id(&event.profile_id, &event.source, &event.run.external_id);
         let turn_id = event
             .turn
             .as_ref()
-            .map(|turn| ids::turn_id(&event.source, &turn.external_id));
+            .map(|turn| ids::turn_id(&event.profile_id, &event.source, &turn.external_id));
 
         let should_upsert_session = if let Some(session_id) = session_id.as_ref() {
             match cache.as_mut() {
@@ -112,6 +112,7 @@ impl<'a> Projector<'a> {
 
         let llm_call_id = if event.operation.operation_type == OperationType::LlmCall {
             let id = ids::event_scoped_id(
+                &event.profile_id,
                 &event.source,
                 "llm",
                 event.source_event_id.as_deref(),
@@ -135,6 +136,7 @@ impl<'a> Projector<'a> {
 
         let tool_call_id = if event.operation.operation_type == OperationType::ToolCall {
             let id = ids::event_scoped_id(
+                &event.profile_id,
                 &event.source,
                 "tool",
                 event.source_event_id.as_deref(),
@@ -157,6 +159,7 @@ impl<'a> Projector<'a> {
         };
 
         let step_id = ids::event_scoped_id(
+            &event.profile_id,
             &event.source,
             "step",
             event.source_event_id.as_deref(),
@@ -222,17 +225,19 @@ impl<'a> Projector<'a> {
             execute_cached(
                 self.conn,
                 "INSERT INTO skill_events (
-                    skill_event_id, source, skill_name, event_type, confidence,
+                    skill_event_id, profile_id, device_id, source, skill_name, event_type, confidence,
                     session_id, run_id, turn_id, source_event_id, source_ref,
                     occurred_at_ns, occurred_day, occurred_month, metadata_json
                  )
                  VALUES (
-                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
-                    date(?11 / 1000000000, 'unixepoch', 'localtime'),
-                    strftime('%Y-%m', ?11 / 1000000000, 'unixepoch', 'localtime'),
-                    ?12
+                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+                    date(?13 / 1000000000, 'unixepoch', 'localtime'),
+                    strftime('%Y-%m', ?13 / 1000000000, 'unixepoch', 'localtime'),
+                    ?14
                  )
                  ON CONFLICT(skill_event_id) DO UPDATE SET
+                    profile_id = excluded.profile_id,
+                    device_id = excluded.device_id,
                     confidence = excluded.confidence,
                     session_id = COALESCE(excluded.session_id, skill_events.session_id),
                     run_id = excluded.run_id,
@@ -244,6 +249,8 @@ impl<'a> Projector<'a> {
                     metadata_json = COALESCE(excluded.metadata_json, skill_events.metadata_json)",
                 params![
                     skill_event_id,
+                    event.profile_id,
+                    event.device_id,
                     event.source,
                     skill_event.skill_name,
                     skill_event.event_type.as_str(),
@@ -285,11 +292,13 @@ impl<'a> Projector<'a> {
         execute_cached(
             self.conn,
             "INSERT INTO sessions (
-                session_id, source, kind, title, external_id, project_id, cwd,
+                session_id, profile_id, device_id, source, kind, title, external_id, project_id, cwd,
                 first_seen_ns, last_seen_ns, metadata_json
              )
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
              ON CONFLICT(session_id) DO UPDATE SET
+                profile_id = excluded.profile_id,
+                device_id = excluded.device_id,
                 title = COALESCE(excluded.title, sessions.title),
                 project_id = COALESCE(excluded.project_id, sessions.project_id),
                 cwd = COALESCE(excluded.cwd, sessions.cwd),
@@ -298,6 +307,8 @@ impl<'a> Projector<'a> {
                 metadata_json = COALESCE(excluded.metadata_json, sessions.metadata_json)",
             params![
                 session_id,
+                event.profile_id,
+                event.device_id,
                 event.source,
                 session.kind,
                 session.title,
@@ -324,19 +335,21 @@ impl<'a> Projector<'a> {
         execute_cached(
             self.conn,
             "INSERT INTO runs (
-                run_id, source, kind, title, status, trace_id, root_span_id,
+                run_id, profile_id, device_id, source, kind, title, status, trace_id, root_span_id,
                 session_id, external_id, cwd, project_id, started_at_ns, ended_at_ns,
                 started_day, started_month, duration_ns, input_tokens, output_tokens,
                 cache_read_tokens, cache_write_tokens, total_cost_usd,
                 max_context_window_percent, metadata_json
              )
              VALUES (
-                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
-                date(?12 / 1000000000, 'unixepoch', 'localtime'),
-                strftime('%Y-%m', ?12 / 1000000000, 'unixepoch', 'localtime'),
-                ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
+                date(?14 / 1000000000, 'unixepoch', 'localtime'),
+                strftime('%Y-%m', ?14 / 1000000000, 'unixepoch', 'localtime'),
+                ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23
              )
              ON CONFLICT(run_id) DO UPDATE SET
+                profile_id = excluded.profile_id,
+                device_id = excluded.device_id,
                 title = COALESCE(excluded.title, runs.title),
                 status = excluded.status,
                 trace_id = COALESCE(excluded.trace_id, runs.trace_id),
@@ -358,6 +371,8 @@ impl<'a> Projector<'a> {
                 metadata_json = COALESCE(excluded.metadata_json, runs.metadata_json)",
             params![
                 run_id,
+                event.profile_id,
+                event.device_id,
                 event.source,
                 event.run.kind,
                 event.run.title,
@@ -400,17 +415,19 @@ impl<'a> Projector<'a> {
         execute_cached(
             self.conn,
             "INSERT INTO turns (
-                turn_id, run_id, session_id, source, turn_index, role, status,
+                turn_id, profile_id, device_id, run_id, session_id, source, turn_index, role, status,
                 started_at_ns, started_day, started_month, ended_at_ns, duration_ns, input_tokens,
                 output_tokens, trace_id, span_id, metadata_json
              )
              VALUES (
-                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8,
-                date(?8 / 1000000000, 'unixepoch', 'localtime'),
-                strftime('%Y-%m', ?8 / 1000000000, 'unixepoch', 'localtime'),
-                ?9, ?10, ?11, ?12, ?13, ?14, ?15
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
+                date(?10 / 1000000000, 'unixepoch', 'localtime'),
+                strftime('%Y-%m', ?10 / 1000000000, 'unixepoch', 'localtime'),
+                ?11, ?12, ?13, ?14, ?15, ?16, ?17
              )
              ON CONFLICT(turn_id) DO UPDATE SET
+                profile_id = excluded.profile_id,
+                device_id = excluded.device_id,
                 turn_index = COALESCE(excluded.turn_index, turns.turn_index),
                 role = COALESCE(excluded.role, turns.role),
                 status = COALESCE(excluded.status, turns.status),
@@ -423,6 +440,8 @@ impl<'a> Projector<'a> {
                 metadata_json = COALESCE(excluded.metadata_json, turns.metadata_json)",
             params![
                 turn_id,
+                event.profile_id,
+                event.device_id,
                 run_id,
                 session_id,
                 event.source,
@@ -463,14 +482,16 @@ impl<'a> Projector<'a> {
         execute_cached(
             self.conn,
             "INSERT INTO run_steps (
-                step_id, run_id, session_id, turn_id, source, source_event_id,
+                step_id, profile_id, device_id, run_id, session_id, turn_id, source, source_event_id,
                 source_ref, step_type, name, status, error_type, started_at_ns,
                 ended_at_ns, duration_ns, order_index, llm_call_id, tool_call_id,
                 trace_id, span_id, input_tokens, output_tokens,
                 estimated_wasted_tokens, cost_usd, metadata_json
              )
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, 0, ?22, ?23)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, 0, ?24, ?25)
              ON CONFLICT(step_id) DO UPDATE SET
+                profile_id = excluded.profile_id,
+                device_id = excluded.device_id,
                 session_id = COALESCE(excluded.session_id, run_steps.session_id),
                 turn_id = COALESCE(excluded.turn_id, run_steps.turn_id),
                 status = excluded.status,
@@ -485,6 +506,8 @@ impl<'a> Projector<'a> {
                 metadata_json = COALESCE(excluded.metadata_json, run_steps.metadata_json)",
             params![
                 step_id,
+                event.profile_id,
+                event.device_id,
                 run_id,
                 session_id,
                 turn_id,
@@ -531,7 +554,7 @@ impl<'a> Projector<'a> {
         execute_cached(
             self.conn,
             "INSERT INTO llm_calls (
-                llm_call_id, run_id, session_id, turn_id, source, provider,
+                llm_call_id, profile_id, device_id, run_id, session_id, turn_id, source, provider,
                 model, operation, status, error_type, input_tokens, output_tokens,
                 reasoning_tokens, uncached_input_tokens, cache_read_tokens,
                 cache_write_tokens, cache_ratio, model_context_window,
@@ -541,12 +564,14 @@ impl<'a> Projector<'a> {
              )
              VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
-                ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25,
-                date(?23 / 1000000000, 'unixepoch', 'localtime'),
-                strftime('%Y-%m', ?23 / 1000000000, 'unixepoch', 'localtime'),
-                ?26, ?27, ?28
+                ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27,
+                date(?25 / 1000000000, 'unixepoch', 'localtime'),
+                strftime('%Y-%m', ?25 / 1000000000, 'unixepoch', 'localtime'),
+                ?28, ?29, ?30
              )
              ON CONFLICT(llm_call_id) DO UPDATE SET
+                profile_id = excluded.profile_id,
+                device_id = excluded.device_id,
                 session_id = COALESCE(excluded.session_id, llm_calls.session_id),
                 turn_id = COALESCE(excluded.turn_id, llm_calls.turn_id),
                 provider = COALESCE(excluded.provider, llm_calls.provider),
@@ -575,6 +600,8 @@ impl<'a> Projector<'a> {
                 metadata_json = COALESCE(excluded.metadata_json, llm_calls.metadata_json)",
             params![
                 llm_call_id,
+                event.profile_id,
+                event.device_id,
                 run_id,
                 session_id,
                 turn_id,
@@ -627,17 +654,19 @@ impl<'a> Projector<'a> {
         execute_cached(
             self.conn,
             "INSERT INTO tool_calls (
-                tool_call_id, run_id, session_id, turn_id, source, tool_name,
+                tool_call_id, profile_id, device_id, run_id, session_id, turn_id, source, tool_name,
                 status, error_type, output_bytes, started_at_ns, ended_at_ns, duration_ns,
                 started_day, started_month, trace_id, span_id, metadata_json
              )
              VALUES (
-                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
-                date(?10 / 1000000000, 'unixepoch', 'localtime'),
-                strftime('%Y-%m', ?10 / 1000000000, 'unixepoch', 'localtime'),
-                ?13, ?14, ?15
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
+                date(?12 / 1000000000, 'unixepoch', 'localtime'),
+                strftime('%Y-%m', ?12 / 1000000000, 'unixepoch', 'localtime'),
+                ?15, ?16, ?17
              )
              ON CONFLICT(tool_call_id) DO UPDATE SET
+                profile_id = excluded.profile_id,
+                device_id = excluded.device_id,
                 session_id = COALESCE(excluded.session_id, tool_calls.session_id),
                 turn_id = COALESCE(excluded.turn_id, tool_calls.turn_id),
                 status = excluded.status,
@@ -652,6 +681,8 @@ impl<'a> Projector<'a> {
                 metadata_json = COALESCE(excluded.metadata_json, tool_calls.metadata_json)",
             params![
                 tool_call_id,
+                event.profile_id,
+                event.device_id,
                 run_id,
                 session_id,
                 turn_id,
@@ -775,6 +806,8 @@ impl<'a> Projector<'a> {
             if let Some(severity) = severity {
                 self.upsert_signal(
                     run_id,
+                    &event.profile_id,
+                    &event.device_id,
                     &event.source,
                     "context_bloat",
                     severity,
@@ -804,6 +837,8 @@ impl<'a> Projector<'a> {
             if let Some(severity) = severity {
                 self.upsert_signal(
                     run_id,
+                    &event.profile_id,
+                    &event.device_id,
                     &event.source,
                     "low_cache_reuse",
                     severity,
@@ -836,6 +871,8 @@ impl<'a> Projector<'a> {
             if let Some(severity) = severity {
                 self.upsert_signal(
                     run_id,
+                    &event.profile_id,
+                    &event.device_id,
                     &event.source,
                     "reasoning_spike",
                     severity,
@@ -866,6 +903,8 @@ impl<'a> Projector<'a> {
 
         self.upsert_signal(
             run_id,
+            &event.profile_id,
+            &event.device_id,
             &event.source,
             "tool_failure",
             "medium",
@@ -882,6 +921,8 @@ impl<'a> Projector<'a> {
     fn upsert_signal(
         &self,
         run_id: &str,
+        profile_id: &str,
+        device_id: &str,
         source: &str,
         signal_type: &str,
         severity: &str,
@@ -898,17 +939,21 @@ impl<'a> Projector<'a> {
         execute_cached(
             self.conn,
             "INSERT INTO run_signals (
-                signal_id, run_id, source, signal_type, severity, title,
+                signal_id, profile_id, device_id, run_id, source, signal_type, severity, title,
                 evidence_json, suggestion, created_at_ns
              )
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
              ON CONFLICT(signal_id) DO UPDATE SET
+                profile_id = excluded.profile_id,
+                device_id = excluded.device_id,
                 severity = excluded.severity,
                 title = excluded.title,
                 evidence_json = excluded.evidence_json,
                 suggestion = excluded.suggestion",
             params![
                 signal_id,
+                profile_id,
+                device_id,
                 run_id,
                 source,
                 signal_type,
@@ -1001,6 +1046,8 @@ mod tests {
         db.migrate()?;
 
         let event = NormalizedEvent {
+            profile_id: "local".to_string(),
+            device_id: "local_device".to_string(),
             source: "kanade".to_string(),
             source_kind: "otlp_jsonl_file".to_string(),
             source_event_id: Some("span-1".to_string()),
@@ -1252,6 +1299,8 @@ mod tests {
         status: OperationStatus,
     ) -> NormalizedEvent {
         NormalizedEvent {
+            profile_id: "local".to_string(),
+            device_id: "local_device".to_string(),
             source: "test".to_string(),
             source_kind: "test".to_string(),
             source_event_id: Some(source_event_id.to_string()),

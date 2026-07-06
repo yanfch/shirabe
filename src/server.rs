@@ -1,7 +1,12 @@
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
 use std::{
     collections::HashMap,
+    fs::{self, File, OpenOptions},
+    io::Write,
     net::SocketAddr,
-    path::PathBuf,
+    os::unix::fs::PermissionsExt,
+    path::{Path as FsPath, PathBuf},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -19,7 +24,12 @@ use serde::{Deserialize, Serialize};
 use tokio::{net::TcpListener, time};
 use tower_http::{services::ServeDir, trace::TraceLayer};
 
-use crate::{config::SourcePaths, db::Database, importers, rollup};
+use crate::{
+    config::{Identity, SourcePaths},
+    db::Database,
+    importers::{self, ImportIdentity},
+    rollup, workspace,
+};
 
 const AUTO_SYNC_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const SYNC_WATERMARK_OVERLAP_NS: i64 = 10 * 60 * 1_000_000_000;
@@ -30,6 +40,7 @@ struct AppState {
     db_path: PathBuf,
     ui_dir: PathBuf,
     source_paths: SourcePaths,
+    identity: Identity,
     sync: Mutex<SyncStatus>,
 }
 
@@ -38,7 +49,9 @@ pub async fn serve(
     bind: String,
     ui_dir: PathBuf,
     source_paths: SourcePaths,
+    identity: Identity,
 ) -> Result<()> {
+    let _server_lock = acquire_server_lock_if_shared(&db_path)?;
     let addr: SocketAddr = bind
         .parse()
         .with_context(|| format!("parse bind address {bind}"))?;
@@ -46,6 +59,7 @@ pub async fn serve(
         db_path,
         ui_dir,
         source_paths,
+        identity,
         sync: Mutex::new(SyncStatus::default()),
     });
     spawn_auto_sync(state.clone());
@@ -55,6 +69,8 @@ pub async fn serve(
         .route("/api/overview", get(overview))
         .route("/api/usage", get(usage))
         .route("/api/menubar", get(menubar))
+        .route("/api/workspace", get(workspace_status))
+        .route("/api/workspace/repair", post(repair_workspace))
         .route("/api/sync", post(start_sync))
         .route("/api/sync/status", get(sync_status))
         .route("/api/sessions", get(sessions))
@@ -68,6 +84,110 @@ pub async fn serve(
     tracing::info!("serving http://{}", listener.local_addr()?);
     axum::serve(listener, app).await?;
 
+    Ok(())
+}
+
+struct ServerLock {
+    _path: PathBuf,
+    _file: File,
+}
+
+impl Drop for ServerLock {
+    fn drop(&mut self) {
+        let _ = unlock_server_file(&self._file);
+    }
+}
+
+fn acquire_server_lock_if_shared(db_path: &FsPath) -> Result<Option<ServerLock>> {
+    let Some(workspace_dir) = db_path.parent().filter(|path| is_shared_workspace(path)) else {
+        return Ok(None);
+    };
+
+    fs::create_dir_all(workspace_dir)
+        .with_context(|| format!("create {}", workspace_dir.display()))?;
+    let lock_path = workspace_dir.join("server.lock");
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .or_else(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create_new(true)
+                    .open(&lock_path)
+            } else {
+                Err(error)
+            }
+        })
+        .with_context(|| format!("open {}", lock_path.display()))?;
+    try_lock_server_file(&file, &lock_path)?;
+    file.set_len(0)
+        .with_context(|| format!("truncate {}", lock_path.display()))?;
+    writeln!(file, "{}", std::process::id())?;
+    set_shared_file_mode(&lock_path)?;
+    Ok(Some(ServerLock {
+        _path: lock_path,
+        _file: file,
+    }))
+}
+
+fn set_shared_file_mode(path: &FsPath) -> Result<()> {
+    let mut permissions = fs::metadata(path)
+        .with_context(|| format!("stat {}", path.display()))?
+        .permissions();
+    permissions.set_mode(0o666);
+    match fs::set_permissions(path, permissions) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("set permissions on {}", path.display())),
+    }
+}
+
+#[cfg(unix)]
+fn try_lock_server_file(file: &File, lock_path: &FsPath) -> Result<()> {
+    unsafe extern "C" {
+        fn flock(fd: i32, operation: i32) -> i32;
+    }
+    const LOCK_EX: i32 = 2;
+    const LOCK_NB: i32 = 4;
+
+    if unsafe { flock(file.as_raw_fd(), LOCK_EX | LOCK_NB) } == 0 {
+        return Ok(());
+    }
+
+    let error = std::io::Error::last_os_error();
+    if error.kind() == std::io::ErrorKind::WouldBlock {
+        anyhow::bail!(
+            "shared Shirabe server is already running; lock file {} is locked",
+            lock_path.display()
+        );
+    }
+    Err(error).with_context(|| format!("lock {}", lock_path.display()))
+}
+
+#[cfg(not(unix))]
+fn try_lock_server_file(_file: &File, _lock_path: &FsPath) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn unlock_server_file(file: &File) -> Result<()> {
+    unsafe extern "C" {
+        fn flock(fd: i32, operation: i32) -> i32;
+    }
+    const LOCK_UN: i32 = 8;
+
+    if unsafe { flock(file.as_raw_fd(), LOCK_UN) } == 0 {
+        return Ok(());
+    }
+
+    Err(std::io::Error::last_os_error()).context("unlock shared server lock")
+}
+
+#[cfg(not(unix))]
+fn unlock_server_file(_file: &File) -> Result<()> {
     Ok(())
 }
 
@@ -98,7 +218,12 @@ async fn menubar(
     State(state): State<Arc<AppState>>,
     Query(query): Query<MenubarQuery>,
 ) -> Response {
-    match load_menubar(&state.db_path, query, current_sync_status(&state)) {
+    match load_menubar(
+        &state.db_path,
+        query,
+        current_sync_status(&state),
+        &state.identity,
+    ) {
         Ok(response) => Json(response).into_response(),
         Err(error) => api_error(error),
     }
@@ -106,6 +231,20 @@ async fn menubar(
 
 async fn sync_status(State(state): State<Arc<AppState>>) -> Response {
     Json(current_sync_status(&state)).into_response()
+}
+
+async fn workspace_status(State(state): State<Arc<AppState>>) -> Response {
+    match load_workspace_status(&state.db_path, &state.identity, false) {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => api_error(error),
+    }
+}
+
+async fn repair_workspace(State(state): State<Arc<AppState>>) -> Response {
+    match repair_workspace_inner(&state) {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => api_error(error),
+    }
 }
 
 async fn start_sync(State(state): State<Arc<AppState>>) -> Response {
@@ -189,6 +328,25 @@ struct HealthResponse {
 }
 
 #[derive(Debug, Serialize)]
+struct WorkspaceStatusResponse {
+    status: &'static str,
+    mode: &'static str,
+    workspace_dir: String,
+    catalog_db: String,
+    shared_workspace_dir: String,
+    shared_workspace_exists: bool,
+    current_profile_id: String,
+    current_profile_label: String,
+    current_device_id: String,
+    current_device_label: String,
+    profile_count: i64,
+    writable: bool,
+    repair_available: bool,
+    restart_required: bool,
+    issue: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
 struct OverviewResponse {
     status: &'static str,
     totals: OverviewTotals,
@@ -206,6 +364,7 @@ struct UsageResponse {
     status: &'static str,
     filters: UsageFilters,
     usage_grain: String,
+    profile_options: Vec<ProfileOption>,
     source_options: Vec<String>,
     model_options: Vec<String>,
     summary: UsageSummary,
@@ -226,6 +385,8 @@ struct UsageResponse {
 struct MenubarResponse {
     status: &'static str,
     range: String,
+    profile_options: Vec<ProfileOption>,
+    current_profile_id: String,
     summary: UsageSummary,
     latency: LatencySummary,
     latency_panel: LatencyPanel,
@@ -333,6 +494,8 @@ struct UsageQuery {
     from: Option<String>,
     to: Option<String>,
     grain: Option<String>,
+    profile_id: Option<String>,
+    device_id: Option<String>,
     source: Option<String>,
     model: Option<String>,
 }
@@ -340,6 +503,7 @@ struct UsageQuery {
 #[derive(Debug, Deserialize)]
 struct MenubarQuery {
     range: Option<String>,
+    profile_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -349,6 +513,8 @@ struct UsageFilters {
     from: Option<String>,
     to: Option<String>,
     grain: String,
+    profile_id: Option<String>,
+    device_id: Option<String>,
     source: Option<String>,
     model: Option<String>,
 }
@@ -796,10 +962,23 @@ struct ErrorResponse {
     message: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct ProfileOption {
+    profile_id: String,
+    profile_label: String,
+    device_id: String,
+    device_label: Option<String>,
+    macos_username: Option<String>,
+    is_current: bool,
+}
+
 const LLM_COST_SQL: &str = "CASE
     WHEN l.total_cost_usd > 0 THEN l.total_cost_usd
     ELSE
-        (l.input_tokens * COALESCE(mp.input_cost_per_token, 0)) +
+        ((CASE
+            WHEN l.uncached_input_tokens > 0 THEN l.uncached_input_tokens
+            ELSE MAX(l.input_tokens - l.cache_read_tokens - l.cache_write_tokens, 0)
+        END) * COALESCE(mp.input_cost_per_token, 0)) +
         (l.output_tokens * COALESCE(mp.output_cost_per_token, 0)) +
         (l.cache_read_tokens * COALESCE(mp.cache_read_input_token_cost, 0)) +
         (l.cache_write_tokens * COALESCE(mp.cache_creation_input_token_cost, 0))
@@ -808,7 +987,10 @@ const LLM_COST_SQL: &str = "CASE
 const MODEL_ROLLUP_COST_SQL: &str = "CASE
     WHEN m.total_cost_usd > 0 THEN m.total_cost_usd
     ELSE
-        (m.input_tokens * COALESCE(mp.input_cost_per_token, 0)) +
+        ((CASE
+            WHEN m.uncached_input_tokens > 0 THEN m.uncached_input_tokens
+            ELSE MAX(m.input_tokens - m.cache_read_tokens - m.cache_write_tokens, 0)
+        END) * COALESCE(mp.input_cost_per_token, 0)) +
         (m.output_tokens * COALESCE(mp.output_cost_per_token, 0)) +
         (m.cache_read_tokens * COALESCE(mp.cache_read_input_token_cost, 0)) +
         (m.cache_write_tokens * COALESCE(mp.cache_creation_input_token_cost, 0))
@@ -822,6 +1004,8 @@ impl UsageFilters {
             from: None,
             to: None,
             grain: "auto".to_string(),
+            profile_id: None,
+            device_id: None,
             source: None,
             model: None,
         }
@@ -922,6 +1106,12 @@ impl UsageFilters {
 
     fn rollup_source_where_for(&self, alias: &str, bucket: &str) -> String {
         let mut conditions = vec![self.rollup_key_where_for(alias, bucket)];
+        if let Some(profile) = self.profile_condition(alias) {
+            conditions.push(profile);
+        }
+        if let Some(device) = self.device_condition(alias) {
+            conditions.push(device);
+        }
         if let Some(source) = &self.source {
             conditions.push(format!("{alias}.source = {}", sql_literal(source)));
         }
@@ -981,8 +1171,10 @@ impl UsageFilters {
             from,
             to,
             grain,
+            profile_id: normalize_filter_value(query.profile_id),
+            device_id: normalize_filter_value(query.device_id),
             source: normalize_filter_value(query.source),
-            model: normalize_filter_value(query.model),
+            model: normalize_model_filter_value(query.model),
         }
     }
 
@@ -990,6 +1182,12 @@ impl UsageFilters {
         let mut conditions = vec![self.date_predicate(&format!("{alias}.last_seen_ns"))];
         if let Some(source) = self.source_condition(alias) {
             conditions.push(source);
+        }
+        if let Some(profile) = self.profile_condition(alias) {
+            conditions.push(profile);
+        }
+        if let Some(device) = self.device_condition(alias) {
+            conditions.push(device);
         }
         if let Some(model) = self.model_exists_for_session(alias) {
             conditions.push(model);
@@ -1002,6 +1200,12 @@ impl UsageFilters {
         if let Some(source) = self.source_condition(alias) {
             conditions.push(source);
         }
+        if let Some(profile) = self.profile_condition(alias) {
+            conditions.push(profile);
+        }
+        if let Some(device) = self.device_condition(alias) {
+            conditions.push(device);
+        }
         if let Some(model) = self.model_exists_for_run(alias) {
             conditions.push(model);
         }
@@ -1012,6 +1216,12 @@ impl UsageFilters {
         let mut conditions = vec![self.date_predicate(&format!("{alias}.started_at_ns"))];
         if let Some(source) = self.source_condition(alias) {
             conditions.push(source);
+        }
+        if let Some(profile) = self.profile_condition(alias) {
+            conditions.push(profile);
+        }
+        if let Some(device) = self.device_condition(alias) {
+            conditions.push(device);
         }
         if let Some(model) = self.model_exists_for_turn(alias) {
             conditions.push(model);
@@ -1024,6 +1234,12 @@ impl UsageFilters {
         if let Some(source) = self.source_condition(alias) {
             conditions.push(source);
         }
+        if let Some(profile) = self.profile_condition(alias) {
+            conditions.push(profile);
+        }
+        if let Some(device) = self.device_condition(alias) {
+            conditions.push(device);
+        }
         if let Some(model) = self.model_condition(alias) {
             conditions.push(model);
         }
@@ -1035,6 +1251,12 @@ impl UsageFilters {
         if let Some(source) = self.source_condition(alias) {
             conditions.push(source);
         }
+        if let Some(profile) = self.profile_condition(alias) {
+            conditions.push(profile);
+        }
+        if let Some(device) = self.device_condition(alias) {
+            conditions.push(device);
+        }
         if let Some(model) = self.model_exists_for_tool(alias) {
             conditions.push(model);
         }
@@ -1045,6 +1267,12 @@ impl UsageFilters {
         let mut conditions = vec![self.date_predicate(&format!("{alias}.occurred_at_ns"))];
         if let Some(source) = self.source_condition(alias) {
             conditions.push(source);
+        }
+        if let Some(profile) = self.profile_condition(alias) {
+            conditions.push(profile);
+        }
+        if let Some(device) = self.device_condition(alias) {
+            conditions.push(device);
         }
         if let Some(model) = self.model_exists_for_skill(alias) {
             conditions.push(model);
@@ -1068,6 +1296,18 @@ impl UsageFilters {
         self.source
             .as_deref()
             .map(|source| format!("{alias}.source = {}", sql_literal(source)))
+    }
+
+    fn profile_condition(&self, alias: &str) -> Option<String> {
+        self.profile_id
+            .as_deref()
+            .map(|profile_id| format!("{alias}.profile_id = {}", sql_literal(profile_id)))
+    }
+
+    fn device_condition(&self, alias: &str) -> Option<String> {
+        self.device_id
+            .as_deref()
+            .map(|device_id| format!("{alias}.device_id = {}", sql_literal(device_id)))
     }
 
     fn model_condition(&self, alias: &str) -> Option<String> {
@@ -1178,6 +1418,7 @@ fn load_usage(db_path: &PathBuf, filters: UsageFilters) -> Result<UsageResponse>
         status: "ok",
         filters: filters.clone(),
         usage_grain: filters.usage_grain().to_string(),
+        profile_options: load_profile_options(&conn, filters.profile_id.as_deref())?,
         source_options: load_source_options(&conn)?,
         model_options: load_model_options(&conn)?,
         summary,
@@ -1199,11 +1440,14 @@ fn load_menubar(
     db_path: &PathBuf,
     query: MenubarQuery,
     sync: SyncStatus,
+    identity: &Identity,
 ) -> Result<MenubarResponse> {
     let conn =
         Connection::open(db_path).with_context(|| format!("open sqlite {}", db_path.display()))?;
     let range = normalize_menubar_range(query.range.as_deref());
-    let filters = menubar_filters(range);
+    let selected_profile_id =
+        normalize_filter_value(query.profile_id).or_else(|| Some(identity.profile_id.clone()));
+    let filters = menubar_filters(range, selected_profile_id);
     let summary = UsageSummary::from_totals(&load_usage_totals(&conn, &filters)?);
     let latency_observations = load_latency_observations(&conn, &filters)?;
     let latency = latency_summary_from_observations(&latency_observations);
@@ -1225,6 +1469,11 @@ fn load_menubar(
     Ok(MenubarResponse {
         status: "ok",
         range: range.to_string(),
+        profile_options: load_profile_options(&conn, filters.profile_id.as_deref())?,
+        current_profile_id: filters
+            .profile_id
+            .clone()
+            .unwrap_or_else(|| "all".to_string()),
         summary,
         latency,
         latency_panel,
@@ -1249,13 +1498,15 @@ fn normalize_menubar_range(value: Option<&str>) -> &'static str {
     }
 }
 
-fn menubar_filters(range: &str) -> UsageFilters {
+fn menubar_filters(range: &str, profile_id: Option<String>) -> UsageFilters {
     UsageFilters {
         preset: range.to_string(),
         range: range.to_string(),
         from: None,
         to: None,
         grain: "day".to_string(),
+        profile_id,
+        device_id: None,
         source: None,
         model: None,
     }
@@ -1269,6 +1520,131 @@ fn load_sessions(db_path: &PathBuf) -> Result<SessionListResponse> {
         status: "ok",
         sessions: load_recent_sessions_scoped_limit(&conn, &UsageFilters::all(), 80)?,
     })
+}
+
+fn load_workspace_status(
+    db_path: &FsPath,
+    identity: &Identity,
+    restart_required: bool,
+) -> Result<WorkspaceStatusResponse> {
+    let default_shared_dir = workspace::default_shared_workspace_dir();
+    let shared_dir = shared_workspace_dir(db_path).map(PathBuf::from);
+    let mode = if shared_dir.is_some() {
+        "shared"
+    } else {
+        "local"
+    };
+    let workspace_dir = shared_dir
+        .clone()
+        .or_else(|| db_path.parent().map(PathBuf::from))
+        .unwrap_or_else(|| PathBuf::from("."));
+    let shared_workspace_exists = default_shared_dir.join("workspace.json").exists();
+    let profile_count = load_profile_count(db_path).unwrap_or_default();
+    let (writable, mut issue) = if let Some(shared_dir) = shared_dir.as_deref() {
+        check_shared_workspace_writable(shared_dir)
+    } else {
+        (true, None)
+    };
+
+    if mode == "local" && shared_workspace_exists && issue.is_none() {
+        issue = Some("Shared workspace is ready. Restart Shirabe to use it.".to_string());
+    }
+
+    if restart_required {
+        issue = Some(format!(
+            "Shared workspace is ready at {}. Restart Shirabe to use it.",
+            default_shared_dir.display()
+        ));
+    }
+
+    Ok(WorkspaceStatusResponse {
+        status: "ok",
+        mode,
+        workspace_dir: workspace_dir.display().to_string(),
+        catalog_db: db_path.display().to_string(),
+        shared_workspace_dir: default_shared_dir.display().to_string(),
+        shared_workspace_exists,
+        current_profile_id: identity.profile_id.clone(),
+        current_profile_label: identity.profile_label.clone(),
+        current_device_id: identity.device_id.clone(),
+        current_device_label: identity.device_label.clone(),
+        profile_count,
+        writable,
+        repair_available: true,
+        restart_required,
+        issue,
+    })
+}
+
+fn repair_workspace_inner(state: &AppState) -> Result<WorkspaceStatusResponse> {
+    let current_shared_dir = shared_workspace_dir(&state.db_path).map(PathBuf::from);
+    let target_dir = current_shared_dir
+        .clone()
+        .unwrap_or_else(workspace::default_shared_workspace_dir);
+    let report = workspace::prepare(Some(target_dir.clone()))?;
+    let shared_db = Database::open(&report.catalog_db)?;
+    shared_db.migrate()?;
+    shared_db.register_identity(&state.identity)?;
+    let mut pricing_changed = workspace::seed_pricing_cache(&shared_db, &state.db_path)?;
+    if !pricing_changed {
+        pricing_changed = workspace::seed_pricing_cache_from_default_local(&shared_db)?;
+    }
+    if pricing_changed {
+        rollup::refresh_all(&shared_db)?;
+    }
+
+    load_workspace_status(
+        &state.db_path,
+        &state.identity,
+        current_shared_dir.is_none(),
+    )
+}
+
+fn load_profile_count(db_path: &FsPath) -> Result<i64> {
+    let conn =
+        Connection::open(db_path).with_context(|| format!("open sqlite {}", db_path.display()))?;
+    Ok(conn
+        .query_row("SELECT COUNT(*) FROM profiles", [], |row| row.get(0))
+        .optional()?
+        .unwrap_or_default())
+}
+
+fn check_shared_workspace_writable(workspace_dir: &FsPath) -> (bool, Option<String>) {
+    for child in ["inbox", "profiles", "collector-state", "logs"] {
+        let dir = workspace_dir.join(child);
+        if let Err(error) = fs::create_dir_all(&dir) {
+            return (
+                false,
+                Some(format!(
+                    "{} is not writable: {}. Run Repair from an admin account.",
+                    dir.display(),
+                    error
+                )),
+            );
+        }
+
+        let probe = dir.join(format!(
+            ".shirabe-write-check-{}-{}",
+            std::process::id(),
+            crate::db::now_ns()
+        ));
+        match fs::write(&probe, b"ok").and_then(|_| fs::remove_file(&probe)) {
+            Ok(()) => {}
+            Err(error) => {
+                let _ = fs::remove_file(&probe);
+                return (
+                    false,
+                    Some(format!(
+                        "{} is not writable: {}. Run Repair from an admin account.",
+                        dir.display(),
+                        error
+                    )),
+                );
+            }
+        }
+    }
+
+    (true, None)
 }
 
 fn current_sync_status(state: &AppState) -> SyncStatus {
@@ -1307,9 +1683,21 @@ fn run_sync_job_inner(state: &Arc<AppState>) -> Result<()> {
     db.migrate()?;
 
     let mut imported_files = 0usize;
+    let mut pricing_changed = false;
+    if let Some(workspace_dir) = shared_workspace_dir(&state.db_path) {
+        set_sync_phase(state, "sync pricing");
+        pricing_changed = workspace::seed_pricing_cache_from_default_local(&db)?;
+
+        set_sync_phase(state, "drain inbox");
+        let drain = workspace::drain_inbox(&db, workspace_dir)?;
+        if drain.events_projected > 0 {
+            imported_files = imported_files.saturating_add(drain.files_drained);
+        }
+    }
+
     for source in ["codex", "pi", "claude", "kanade"] {
         set_sync_phase(state, &format!("import {source}"));
-        let report = import_sync_source(&db, source, &state.source_paths);
+        let report = import_sync_source(&db, source, &state.source_paths, &state.identity);
         imported_files = imported_files.saturating_add(report.files_imported);
         state
             .sync
@@ -1319,7 +1707,7 @@ fn run_sync_job_inner(state: &Arc<AppState>) -> Result<()> {
             .push(report);
     }
 
-    if imported_files == 0 {
+    if imported_files == 0 && !pricing_changed {
         set_sync_phase(state, "complete");
         return Ok(());
     }
@@ -1339,27 +1727,52 @@ fn run_sync_job_inner(state: &Arc<AppState>) -> Result<()> {
     Ok(())
 }
 
+fn shared_workspace_dir(db_path: &FsPath) -> Option<&FsPath> {
+    db_path.parent().filter(|path| is_shared_workspace(path))
+}
+
+fn is_shared_workspace(path: &FsPath) -> bool {
+    path.join("workspace.json").exists() || path.starts_with(FsPath::new("/Users/Shared/Shirabe"))
+}
+
 fn set_sync_phase(state: &AppState, phase: &str) {
     state.sync.lock().expect("sync status lock poisoned").phase = phase.to_string();
 }
 
-fn import_sync_source(db: &Database, source: &str, source_paths: &SourcePaths) -> SyncSourceReport {
+fn import_sync_source(
+    db: &Database,
+    source: &str,
+    source_paths: &SourcePaths,
+    identity: &Identity,
+) -> SyncSourceReport {
     let started = Instant::now();
-    let modified_since_ns = sync_modified_since_ns(db, source);
+    let modified_since_ns = sync_modified_since_ns(db, source, &identity.profile_id);
+    let import_identity =
+        ImportIdentity::new(identity.profile_id.clone(), identity.device_id.clone());
     let result = match source {
-        "codex" => {
-            importers::codex::import_recent(db, Some(source_paths.codex.clone()), modified_since_ns)
-        }
-        "pi" => importers::pi::import_recent(db, Some(source_paths.pi.clone()), modified_since_ns),
-        "claude" => importers::claude::import_recent(
+        "codex" => importers::codex::import_recent_with_identity(
+            db,
+            Some(source_paths.codex.clone()),
+            modified_since_ns,
+            &import_identity,
+        ),
+        "pi" => importers::pi::import_recent_with_identity(
+            db,
+            Some(source_paths.pi.clone()),
+            modified_since_ns,
+            &import_identity,
+        ),
+        "claude" => importers::claude::import_recent_with_identity(
             db,
             Some(source_paths.claude.clone()),
             modified_since_ns,
+            &import_identity,
         ),
-        "kanade" => importers::kanade::import_recent(
+        "kanade" => importers::kanade::import_recent_with_identity(
             db,
             Some(source_paths.kanade.clone()),
             modified_since_ns,
+            &import_identity,
         ),
         _ => unreachable!("unsupported sync source"),
     };
@@ -1390,8 +1803,8 @@ fn import_sync_source(db: &Database, source: &str, source_paths: &SourcePaths) -
     }
 }
 
-fn sync_modified_since_ns(db: &Database, source: &str) -> i64 {
-    db.latest_import_source_scan_ns(source)
+fn sync_modified_since_ns(db: &Database, source: &str, profile_id: &str) -> i64 {
+    db.latest_import_source_scan_ns_for_profile(source, profile_id)
         .ok()
         .flatten()
         .map(|last_scan_ns| last_scan_ns.saturating_sub(SYNC_WATERMARK_OVERLAP_NS))
@@ -1615,9 +2028,9 @@ fn load_latency_observations(
     let bucket_expr = if filters.preset == "today" {
         "printf('%02d:00', CAST(strftime('%H', l.started_at_ns / 1000000000, 'unixepoch', 'localtime') AS INTEGER))"
     } else if filters.usage_grain() == "month" {
-        "strftime('%Y-%m', l.started_at_ns / 1000000000, 'unixepoch', 'localtime')"
+        "COALESCE(l.started_month, strftime('%Y-%m', l.started_at_ns / 1000000000, 'unixepoch', 'localtime'))"
     } else {
-        "date(l.started_at_ns / 1000000000, 'unixepoch', 'localtime')"
+        "COALESCE(l.started_day, date(l.started_at_ns / 1000000000, 'unixepoch', 'localtime'))"
     };
     let sql = format!(
         "SELECT
@@ -2182,6 +2595,46 @@ fn load_import_summaries(conn: &Connection) -> Result<Vec<ImportSourceSummary>> 
     collect_rows(rows)
 }
 
+fn load_profile_options(
+    conn: &Connection,
+    selected_profile_id: Option<&str>,
+) -> Result<Vec<ProfileOption>> {
+    let mut statement = conn.prepare(
+        "WITH profile_ids AS (
+            SELECT profile_id FROM profiles
+            UNION
+            SELECT profile_id FROM runs
+            UNION
+            SELECT profile_id FROM sessions
+            UNION
+            SELECT profile_id FROM import_sources
+         )
+         SELECT
+            ids.profile_id,
+            COALESCE(p.profile_label, ids.profile_id) AS profile_label,
+            COALESCE(p.device_id, 'local_device') AS device_id,
+            d.device_label,
+            p.macos_username
+         FROM profile_ids ids
+         LEFT JOIN profiles p ON p.profile_id = ids.profile_id
+         LEFT JOIN devices d ON d.device_id = p.device_id
+         WHERE ids.profile_id IS NOT NULL AND ids.profile_id != ''
+         ORDER BY profile_label, ids.profile_id",
+    )?;
+    let rows = statement.query_map([], |row| {
+        let profile_id: String = row.get(0)?;
+        Ok(ProfileOption {
+            is_current: selected_profile_id == Some(profile_id.as_str()),
+            profile_id,
+            profile_label: row.get(1)?,
+            device_id: row.get(2)?,
+            device_label: row.get(3)?,
+            macos_username: row.get(4)?,
+        })
+    })?;
+    collect_rows(rows)
+}
+
 fn load_source_options(conn: &Connection) -> Result<Vec<String>> {
     let mut statement = conn.prepare(
         "WITH sources AS (
@@ -2341,42 +2794,8 @@ fn load_today_hourly_usage_buckets(
     conn: &Connection,
     filters: &UsageFilters,
 ) -> Result<Vec<UsageBucketSummary>> {
-    let source_llm_condition = filters
-        .source
-        .as_ref()
-        .map(|source| format!("AND l.source = {}", sql_literal(source)))
-        .unwrap_or_default();
-    let source_tool_condition = filters
-        .source
-        .as_ref()
-        .map(|source| format!("AND tc.source = {}", sql_literal(source)))
-        .unwrap_or_default();
-    let model_llm_condition = filters
-        .model
-        .as_ref()
-        .map(|model| {
-            format!(
-                "AND COALESCE(NULLIF(l.model, ''), 'unknown') = {}",
-                sql_literal(model)
-            )
-        })
-        .unwrap_or_default();
-    let model_tool_condition = filters
-        .model
-        .as_ref()
-        .map(|model| {
-            format!(
-                "AND EXISTS (
-                    SELECT 1
-                    FROM llm_calls lm
-                    WHERE lm.run_id = tc.run_id
-                      AND lm.source = tc.source
-                      AND COALESCE(NULLIF(lm.model, ''), 'unknown') = {}
-                )",
-                sql_literal(model)
-            )
-        })
-        .unwrap_or_default();
+    let llm_where = filters.llm_where("l");
+    let tool_where = filters.tool_where("tc");
     let sql = format!(
         "WITH RECURSIVE hours(hour) AS (
             SELECT 0
@@ -2404,10 +2823,7 @@ fn load_today_hourly_usage_buckets(
                 COALESCE(SUM({LLM_COST_SQL}), 0) AS total_cost_usd
             FROM llm_calls l
             LEFT JOIN model_prices mp ON mp.model_name = l.model
-            WHERE l.started_at_ns >= {today_start_ns}
-              AND l.started_at_ns < {tomorrow_start_ns}
-              {source_llm_condition}
-              {model_llm_condition}
+            WHERE {llm_where}
             GROUP BY hour
          ),
          tool_buckets AS (
@@ -2416,10 +2832,7 @@ fn load_today_hourly_usage_buckets(
                 COUNT(*) AS tool_calls,
                 COALESCE(SUM(CASE WHEN tc.status = 'failed' THEN 1 ELSE 0 END), 0) AS failed_tool_calls
             FROM tool_calls tc
-            WHERE tc.started_at_ns >= {today_start_ns}
-              AND tc.started_at_ns < {tomorrow_start_ns}
-              {source_tool_condition}
-              {model_tool_condition}
+            WHERE {tool_where}
             GROUP BY hour
          )
          SELECT
@@ -2439,14 +2852,8 @@ fn load_today_hourly_usage_buckets(
          LEFT JOIN llm_buckets lb ON lb.hour = hb.hour
          LEFT JOIN tool_buckets tb ON tb.hour = hb.hour
          ORDER BY hb.hour DESC",
-        today_start_ns =
-            date_expr_start_ns_sql("date('now', 'localtime', 'start of day')"),
-        tomorrow_start_ns =
-            date_expr_start_ns_sql("date('now', 'localtime', 'start of day', '+1 day')"),
-        source_llm_condition = source_llm_condition,
-        source_tool_condition = source_tool_condition,
-        model_llm_condition = model_llm_condition,
-        model_tool_condition = model_tool_condition,
+        llm_where = llm_where,
+        tool_where = tool_where,
     );
     let mut statement = conn.prepare(&sql)?;
 
@@ -4057,6 +4464,20 @@ fn normalize_filter_value(value: Option<String>) -> Option<String> {
     })
 }
 
+fn normalize_model_filter_value(value: Option<String>) -> Option<String> {
+    let value = normalize_filter_value(value)?;
+    if value == "unknown" {
+        return Some(value);
+    }
+    if let Some((_, suffix)) = value.rsplit_once('/') {
+        return normalize_filter_value(Some(suffix.to_string()));
+    }
+    if let Some((_, suffix)) = value.rsplit_once(':') {
+        return normalize_filter_value(Some(suffix.to_string()));
+    }
+    Some(value)
+}
+
 fn normalize_date_value(value: Option<String>) -> Option<String> {
     value.and_then(|value| {
         let value = value.trim();
@@ -4198,11 +4619,12 @@ fn api_error(error: anyhow::Error) -> Response {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::PathBuf};
+    use std::{fs, path::PathBuf, sync::Mutex};
 
     use anyhow::Result;
 
     use crate::{
+        config::{Identity, SourcePaths},
         db::Database,
         projection::{
             event::{
@@ -4211,12 +4633,14 @@ mod tests {
             },
             projector::Projector,
         },
-        rollup,
+        rollup, workspace,
     };
 
     use super::{
-        LatencySample, UsageFilters, UsageQuery, load_overview, load_pattern_latency_panel,
-        load_run_detail, load_session_detail, load_sessions, load_today_latency_panel, load_usage,
+        AppState, LatencySample, MenubarQuery, SyncStatus, UsageFilters, UsageQuery, load_menubar,
+        load_overview, load_pattern_latency_panel, load_run_detail, load_session_detail,
+        load_sessions, load_today_latency_panel, load_usage, load_workspace_status,
+        repair_workspace_inner,
     };
 
     #[test]
@@ -4231,6 +4655,8 @@ mod tests {
         )?;
 
         let event = NormalizedEvent {
+            profile_id: "local".to_string(),
+            device_id: "local_device".to_string(),
             source: "kanade".to_string(),
             source_kind: "otlp_jsonl_span".to_string(),
             source_event_id: Some("span-1".to_string()),
@@ -4309,6 +4735,8 @@ mod tests {
         db.migrate()?;
 
         let event = NormalizedEvent {
+            profile_id: "local".to_string(),
+            device_id: "local_device".to_string(),
             source: "codex".to_string(),
             source_kind: "session_jsonl_event".to_string(),
             source_event_id: Some("event-1".to_string()),
@@ -4390,6 +4818,8 @@ mod tests {
             from: Some("1970-01-01".to_string()),
             to: Some("1970-01-02".to_string()),
             grain: Some("day".to_string()),
+            profile_id: None,
+            device_id: None,
             source: None,
             model: None,
         });
@@ -4407,10 +4837,70 @@ mod tests {
             from: Some("1970-01-01".to_string()),
             to: Some("1970-05-02".to_string()),
             grain: Some("auto".to_string()),
+            profile_id: None,
+            device_id: None,
             source: None,
             model: None,
         });
         assert_eq!(long_custom.usage_grain(), "month");
+
+        let normalized_model = UsageFilters::from_query(UsageQuery {
+            preset: Some("7d".to_string()),
+            range: None,
+            from: None,
+            to: None,
+            grain: Some("auto".to_string()),
+            profile_id: None,
+            device_id: None,
+            source: None,
+            model: Some("cline-pass/deepseek-v4-pro".to_string()),
+        });
+        assert_eq!(normalized_model.model.as_deref(), Some("deepseek-v4-pro"));
+
+        let _ = fs::remove_file(db_path);
+        Ok(())
+    }
+
+    #[test]
+    fn usage_cost_fallback_prices_uncached_input_and_cache_once() -> Result<()> {
+        let db_path = temp_db_path("usage-cost-fallback");
+        let db = Database::open(&db_path)?;
+        db.migrate()?;
+        db.connection().execute(
+            "INSERT INTO pricing_sources (
+                pricing_source_id, source_url, fetched_at_ns, model_count, raw_json, metadata_json
+             )
+             VALUES ('source_1', 'https://example.test/prices.json', 10, 1, '{}', NULL)",
+            [],
+        )?;
+        db.connection().execute(
+            "INSERT INTO model_prices (
+                model_name, source_id, provider, input_cost_per_token, output_cost_per_token,
+                cache_read_input_token_cost, cache_creation_input_token_cost, updated_at_ns, metadata_json
+             )
+             VALUES ('gpt-priced', 'source_1', 'openai', 0.001, 0.01, 0.0001, 0.0002, 10, NULL)",
+            [],
+        )?;
+
+        let mut event = usage_test_event("priced", 100, 1000, 250);
+        event.usage.model = Some("gpt-priced".to_string());
+        event.usage.uncached_input_tokens = 600;
+        event.usage.cache_read_tokens = 400;
+        event.usage.cache_write_tokens = 50;
+        Projector::new(&db).project(&event)?;
+        rollup::refresh_all(&db)?;
+
+        let usage = load_usage(&db_path, UsageFilters::all())?;
+        let expected_cost = 3.15;
+        assert!((usage.summary.total_cost_usd - expected_cost).abs() < 0.000001);
+        assert!((usage.buckets[0].total_cost_usd - expected_cost).abs() < 0.000001);
+
+        let source_rollup_cost: f64 = db.connection().query_row(
+            "SELECT total_cost_usd FROM usage_source_rollups WHERE bucket = 'day'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert!((source_rollup_cost - expected_cost).abs() < 0.000001);
 
         let _ = fs::remove_file(db_path);
         Ok(())
@@ -4435,6 +4925,8 @@ mod tests {
                 from: Some("1970-01-10".to_string()),
                 to: Some("1970-02-10".to_string()),
                 grain: Some("day".to_string()),
+                profile_id: None,
+                device_id: None,
                 source: None,
                 model: None,
             }),
@@ -4447,6 +4939,8 @@ mod tests {
                 from: Some("1970-01-10".to_string()),
                 to: Some("1970-02-10".to_string()),
                 grain: Some("month".to_string()),
+                profile_id: None,
+                device_id: None,
                 source: None,
                 model: None,
             }),
@@ -4463,6 +4957,233 @@ mod tests {
         assert_eq!(month_usage.buckets[0].output_tokens, 10);
 
         let _ = fs::remove_file(db_path);
+        Ok(())
+    }
+
+    #[test]
+    fn usage_all_keeps_lifetime_scope_beyond_30d() -> Result<()> {
+        let db_path = temp_db_path("usage-all-lifetime");
+        let db = Database::open(&db_path)?;
+        db.migrate()?;
+
+        let now = crate::db::now_ns();
+        let day_ns = 86_400 * 1_000_000_000;
+        let projector = Projector::new(&db);
+        projector.project(&usage_test_event("today", now, 100, 10))?;
+        projector.project(&usage_test_event("ten-days", now - 10 * day_ns, 200, 20))?;
+        projector.project(&usage_test_event("forty-days", now - 40 * day_ns, 300, 30))?;
+        rollup::refresh_all(&db)?;
+
+        let seven_days = load_usage(
+            &db_path,
+            UsageFilters::from_query(UsageQuery {
+                preset: Some("7d".to_string()),
+                range: None,
+                from: None,
+                to: None,
+                grain: Some("auto".to_string()),
+                profile_id: None,
+                device_id: None,
+                source: None,
+                model: None,
+            }),
+        )?;
+        let thirty_days = load_usage(
+            &db_path,
+            UsageFilters::from_query(UsageQuery {
+                preset: Some("30d".to_string()),
+                range: None,
+                from: None,
+                to: None,
+                grain: Some("auto".to_string()),
+                profile_id: None,
+                device_id: None,
+                source: None,
+                model: None,
+            }),
+        )?;
+        let all = load_usage(&db_path, UsageFilters::all())?;
+
+        assert_eq!(seven_days.summary.input_tokens, 100);
+        assert_eq!(thirty_days.summary.input_tokens, 300);
+        assert_eq!(all.summary.input_tokens, 600);
+        assert_eq!(seven_days.buckets.len(), 1);
+        assert_eq!(thirty_days.buckets.len(), 2);
+        assert!(
+            all.buckets.len() >= 2,
+            "all keeps the older month instead of collapsing to 30d"
+        );
+
+        let _ = fs::remove_file(db_path);
+        Ok(())
+    }
+
+    #[test]
+    fn usage_filters_profile_scoped_imports_without_id_collisions() -> Result<()> {
+        let db_path = temp_db_path("usage-profile-filter");
+        let db = Database::open(&db_path)?;
+        db.migrate()?;
+
+        let mut profile_a = usage_test_event("shared", epoch_day_noon_ns(20), 100, 10);
+        profile_a.profile_id = "profile_a".to_string();
+        profile_a.device_id = "device_1".to_string();
+        let mut profile_b = usage_test_event("shared", epoch_day_noon_ns(20), 200, 20);
+        profile_b.profile_id = "profile_b".to_string();
+        profile_b.device_id = "device_1".to_string();
+
+        let projector = Projector::new(&db);
+        let result_a = projector.project(&profile_a)?;
+        let result_b = projector.project(&profile_b)?;
+        rollup::refresh_all(&db)?;
+
+        assert_ne!(result_a.run_id, result_b.run_id);
+
+        let all_usage = load_usage(&db_path, UsageFilters::all())?;
+        assert_eq!(all_usage.summary.sessions, 2);
+        assert_eq!(all_usage.summary.runs, 2);
+        assert_eq!(all_usage.summary.input_tokens, 300);
+
+        let profile_usage = load_usage(
+            &db_path,
+            UsageFilters {
+                profile_id: Some("profile_a".to_string()),
+                ..UsageFilters::all()
+            },
+        )?;
+        assert_eq!(profile_usage.summary.sessions, 1);
+        assert_eq!(profile_usage.summary.runs, 1);
+        assert_eq!(profile_usage.summary.input_tokens, 100);
+        assert!(
+            all_usage
+                .profile_options
+                .iter()
+                .any(|profile| profile.profile_id == "profile_a")
+        );
+
+        let _ = fs::remove_file(db_path);
+        Ok(())
+    }
+
+    #[test]
+    fn menubar_today_trend_respects_profile_filter() -> Result<()> {
+        let db_path = temp_db_path("menubar-profile-trend-filter");
+        let db = Database::open(&db_path)?;
+        db.migrate()?;
+
+        let timestamp_ns = crate::db::now_ns();
+        let mut profile_a = usage_test_event("today-a", timestamp_ns, 77, 11);
+        profile_a.profile_id = "profile_a".to_string();
+        profile_a.device_id = "device_1".to_string();
+        let mut profile_b = usage_test_event("today-b", timestamp_ns + 1, 33, 7);
+        profile_b.profile_id = "profile_b".to_string();
+        profile_b.device_id = "device_1".to_string();
+
+        let projector = Projector::new(&db);
+        projector.project(&profile_a)?;
+        projector.project(&profile_b)?;
+        rollup::refresh_all(&db)?;
+
+        let menubar = load_menubar(
+            &db_path,
+            MenubarQuery {
+                range: None,
+                profile_id: Some("profile_b".to_string()),
+            },
+            SyncStatus::default(),
+            &test_identity("profile_a"),
+        )?;
+
+        let trend_tokens = menubar
+            .trend
+            .iter()
+            .map(|bucket| bucket.input_tokens)
+            .sum::<i64>();
+        assert_eq!(menubar.current_profile_id, "profile_b");
+        assert_eq!(menubar.summary.input_tokens, 33);
+        assert_eq!(trend_tokens, 33);
+
+        let _ = fs::remove_file(db_path);
+        Ok(())
+    }
+
+    #[test]
+    fn menubar_defaults_to_current_profile() -> Result<()> {
+        let db_path = temp_db_path("menubar-default-current-profile");
+        let db = Database::open(&db_path)?;
+        db.migrate()?;
+
+        let timestamp_ns = crate::db::now_ns();
+        let mut profile_a = usage_test_event("default-all-a", timestamp_ns, 70, 7);
+        profile_a.profile_id = "profile_a".to_string();
+        profile_a.device_id = "device_1".to_string();
+        let mut profile_b = usage_test_event("default-all-b", timestamp_ns + 1, 30, 3);
+        profile_b.profile_id = "profile_b".to_string();
+        profile_b.device_id = "device_1".to_string();
+
+        let projector = Projector::new(&db);
+        projector.project(&profile_a)?;
+        projector.project(&profile_b)?;
+        rollup::refresh_all(&db)?;
+
+        let menubar = load_menubar(
+            &db_path,
+            MenubarQuery {
+                range: None,
+                profile_id: None,
+            },
+            SyncStatus::default(),
+            &test_identity("profile_a"),
+        )?;
+
+        let trend_tokens = menubar
+            .trend
+            .iter()
+            .map(|bucket| bucket.input_tokens)
+            .sum::<i64>();
+        assert_eq!(menubar.current_profile_id, "profile_a");
+        assert_eq!(menubar.summary.input_tokens, 70);
+        assert_eq!(trend_tokens, 70);
+
+        let _ = fs::remove_file(db_path);
+        Ok(())
+    }
+
+    #[test]
+    fn workspace_status_reports_shared_workspace_after_repair() -> Result<()> {
+        let root =
+            std::env::temp_dir().join(format!("shirabe-server-workspace-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let workspace_dir = root.join("workspace");
+        let workspace_report = workspace::prepare(Some(workspace_dir.clone()))?;
+        let db = Database::open(&workspace_report.catalog_db)?;
+        db.migrate()?;
+
+        let identity = test_identity("profile_shared");
+        let state = AppState {
+            db_path: workspace_report.catalog_db.clone(),
+            ui_dir: root.join("ui"),
+            source_paths: test_source_paths(&root),
+            identity: identity.clone(),
+            sync: Mutex::new(SyncStatus::default()),
+        };
+
+        let repaired = repair_workspace_inner(&state)?;
+        assert_eq!(repaired.status, "ok");
+        assert_eq!(repaired.mode, "shared");
+        assert_eq!(repaired.workspace_dir, workspace_dir.display().to_string());
+        assert_eq!(repaired.current_profile_id, "profile_shared");
+        assert_eq!(repaired.current_profile_label, "profile_shared");
+        assert_eq!(repaired.profile_count, 1);
+        assert!(repaired.writable);
+        assert!(!repaired.restart_required);
+        assert!(repaired.issue.is_none());
+
+        let status = load_workspace_status(&workspace_report.catalog_db, &identity, false)?;
+        assert_eq!(status.mode, "shared");
+        assert_eq!(status.profile_count, 1);
+        assert_eq!(status.current_device_id, "device_1");
+
+        let _ = fs::remove_dir_all(root);
         Ok(())
     }
 
@@ -4560,6 +5281,8 @@ mod tests {
         db.migrate()?;
 
         let event = NormalizedEvent {
+            profile_id: "local".to_string(),
+            device_id: "local_device".to_string(),
             source: "pi".to_string(),
             source_kind: "session_jsonl_event".to_string(),
             source_event_id: Some("pi-tool-1".to_string()),
@@ -4660,6 +5383,8 @@ mod tests {
         output_tokens: i64,
     ) -> NormalizedEvent {
         NormalizedEvent {
+            profile_id: "local".to_string(),
+            device_id: "local_device".to_string(),
             source: "codex".to_string(),
             source_kind: "session_jsonl_event".to_string(),
             source_event_id: Some(format!("event-{id}")),
@@ -4699,6 +5424,26 @@ mod tests {
             },
             skill_events: Vec::new(),
             confidence: 1.0,
+        }
+    }
+
+    fn test_identity(profile_id: &str) -> Identity {
+        Identity {
+            device_id: "device_1".to_string(),
+            device_label: "Test Mac".to_string(),
+            profile_id: profile_id.to_string(),
+            profile_label: profile_id.to_string(),
+            macos_uid: None,
+            macos_username: profile_id.to_string(),
+        }
+    }
+
+    fn test_source_paths(root: &std::path::Path) -> SourcePaths {
+        SourcePaths {
+            codex: root.join("codex"),
+            pi: root.join("pi"),
+            claude: root.join("claude"),
+            kanade: root.join("kanade"),
         }
     }
 

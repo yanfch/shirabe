@@ -675,7 +675,7 @@
       repeating-linear-gradient(0deg, transparent 0, transparent 23px, rgba(231, 224, 210, 0.034) 24px),
       repeating-linear-gradient(90deg, transparent 0, transparent 23px, rgba(231, 224, 210, 0.03) 24px),
       radial-gradient(circle at 12% 0%, rgba(231, 224, 210, 0.03), transparent 30%),
-      linear-gradient(rgba(15, 18, 18, 0.95), rgba(15, 18, 18, 0.95));
+      linear-gradient(rgba(15, 18, 18, 0.9), rgba(15, 18, 18, 0.9));
     box-shadow:
       0 18px 34px rgba(0, 0, 0, 0.26),
       inset 0 1px 0 rgba(242, 238, 226, 0.035),
@@ -754,7 +754,7 @@
     border-radius: 4px;
     background:
       linear-gradient(180deg, rgba(231, 224, 210, 0.025), transparent),
-      rgba(13, 15, 14, 0.74);
+      rgba(13, 15, 14, 0.64);
     color: var(--muted);
     cursor: pointer;
     transition: border-color 120ms ease, background 120ms ease, color 120ms ease;
@@ -791,24 +791,29 @@
 
   .range-tabs {
     width: 100%;
+    height: 24px;
     margin-top: 8px;
     border: 1px solid var(--border);
     border-radius: 4px;
     overflow: hidden;
     background:
       repeating-linear-gradient(90deg, transparent 0, transparent 23px, rgba(231, 224, 210, 0.014) 24px),
-      rgba(8, 10, 9, 0.36);
+      rgba(8, 10, 9, 0.32);
   }
 
   .range-tabs button {
+    display: flex;
+    align-items: center;
+    justify-content: center;
     flex: 1;
-    height: 20px;
+    height: 100%;
     border: 0;
     border-radius: 0;
     border-right: 1px solid rgba(231, 224, 210, 0.08);
     background: transparent;
     color: var(--dim);
-    font-size: 10px;
+    font-size: 11px;
+    line-height: 1;
   }
 
   .range-tabs button:last-child {
@@ -844,7 +849,7 @@
       repeating-linear-gradient(0deg, transparent 0, transparent 23px, rgba(231, 224, 210, 0.026) 24px),
       repeating-linear-gradient(90deg, transparent 0, transparent 23px, rgba(231, 224, 210, 0.022) 24px),
       radial-gradient(circle at 18% 0%, rgba(141, 181, 106, 0.035), transparent 34%),
-      rgba(11, 13, 12, 0.6);
+      rgba(11, 13, 12, 0.53);
     box-shadow: inset 0 1px 0 rgba(242, 238, 226, 0.02);
   }
 
@@ -861,7 +866,7 @@
       repeating-linear-gradient(0deg, transparent 0, transparent 23px, rgba(231, 224, 210, 0.024) 24px),
       repeating-linear-gradient(90deg, transparent 0, transparent 23px, rgba(231, 224, 210, 0.02) 24px),
       linear-gradient(90deg, rgba(141, 181, 106, 0.065), transparent 58%),
-      rgba(11, 13, 12, 0.6);
+      rgba(11, 13, 12, 0.53);
   }
 
   .hero-block::after {
@@ -1081,11 +1086,11 @@
     border-radius: 3px 3px 0 0;
     background: linear-gradient(
       180deg,
-      rgb(141 181 106 / var(--fill-top, 0.72)),
-      rgb(141 181 106 / var(--fill-bottom, 0.24))
+      rgb(143 185 105 / var(--fill-top, 0.72)),
+      rgb(143 185 105 / var(--fill-bottom, 0.24))
     );
-    border: 1px solid rgb(141 181 106 / var(--border-alpha, 0.58));
-    box-shadow: 0 0 12px rgb(141 181 106 / var(--glow-alpha, 0.1));
+    border: 1px solid rgb(143 185 105 / var(--border-alpha, 0.58));
+    box-shadow: 0 0 12px rgb(143 185 105 / var(--glow-alpha, 0.1));
     cursor: default;
     padding: 0;
   }
@@ -1111,8 +1116,10 @@
 
   .trend-bar.active,
   .trend-bar:focus-visible {
-    border-color: rgba(141, 181, 106, 0.92);
-    box-shadow: 0 0 0 1px rgba(141, 181, 106, 0.2), 0 0 16px rgba(141, 181, 106, 0.22);
+    border-color: var(--text);
+    box-shadow:
+      0 0 0 1px rgba(231, 224, 210, 0.42),
+      0 0 16px rgba(143, 185, 105, 0.22);
     outline: none;
   }
 

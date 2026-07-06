@@ -16,6 +16,7 @@ export type Usage = {
   status: string;
   filters: UsageFilters;
   usage_grain: "day" | "month";
+  profile_options: ProfileOption[];
   source_options: string[];
   model_options: string[];
   summary: UsageSummary;
@@ -35,6 +36,8 @@ export type Usage = {
 export type MenubarUsage = {
   status: string;
   range: "today" | "7d" | "30d" | string;
+  profile_options: ProfileOption[];
+  current_profile_id: string;
   summary: UsageSummary;
   latency: LatencySummary;
   latency_panel: LatencyPanel;
@@ -54,8 +57,19 @@ export type UsageFilters = {
   from: string | null;
   to: string | null;
   grain: UsageGrain;
+  profile_id: string | null;
+  device_id: string | null;
   source: string | null;
   model: string | null;
+};
+
+export type ProfileOption = {
+  profile_id: string;
+  profile_label: string;
+  device_id: string;
+  device_label: string | null;
+  macos_username: string | null;
+  is_current: boolean;
 };
 
 export type SyncStatus = {
@@ -89,6 +103,24 @@ export type SyncRollupReport = {
   tool_rollups: number;
   tool_model_rollups: number;
   elapsed_ms: number;
+};
+
+export type WorkspaceStatus = {
+  status: string;
+  mode: "local" | "shared" | string;
+  workspace_dir: string;
+  catalog_db: string;
+  shared_workspace_dir: string;
+  shared_workspace_exists: boolean;
+  current_profile_id: string;
+  current_profile_label: string;
+  current_device_id: string;
+  current_device_label: string;
+  profile_count: number;
+  writable: boolean;
+  repair_available: boolean;
+  restart_required: boolean;
+  issue: string | null;
 };
 
 export type Totals = {

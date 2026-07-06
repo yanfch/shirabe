@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     env, fs,
-    io::{BufRead, BufReader},
+    io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
     time::Instant,
 };
@@ -19,24 +19,106 @@ use crate::projection::{
     projector::{ProjectionCache, Projector},
 };
 
-use super::{ImportReport, ImportTiming};
+use super::{ImportIdentity, ImportReport, ImportTiming, write_collected_event};
 
+#[allow(dead_code)]
 pub fn import(db: &Database, path: Option<PathBuf>) -> Result<ImportReport> {
-    import_with_modified_since(db, path, None)
+    import_with_identity(db, path, &ImportIdentity::local())
 }
 
+pub fn import_with_identity(
+    db: &Database,
+    path: Option<PathBuf>,
+    identity: &ImportIdentity,
+) -> Result<ImportReport> {
+    import_with_modified_since(db, path, None, identity)
+}
+
+#[allow(dead_code)]
 pub fn import_recent(
     db: &Database,
     path: Option<PathBuf>,
     modified_since_ns: i64,
 ) -> Result<ImportReport> {
-    import_with_modified_since(db, path, Some(modified_since_ns))
+    import_recent_with_identity(db, path, modified_since_ns, &ImportIdentity::local())
+}
+
+pub fn import_recent_with_identity(
+    db: &Database,
+    path: Option<PathBuf>,
+    modified_since_ns: i64,
+    identity: &ImportIdentity,
+) -> Result<ImportReport> {
+    import_with_modified_since(db, path, Some(modified_since_ns), identity)
+}
+
+#[allow(dead_code)]
+pub fn collect(
+    path: Option<PathBuf>,
+    identity: &ImportIdentity,
+    writer: &mut dyn Write,
+) -> Result<ImportReport> {
+    collect_with_modified_since(path, identity, writer, None)
+}
+
+pub fn collect_recent(
+    path: Option<PathBuf>,
+    identity: &ImportIdentity,
+    writer: &mut dyn Write,
+    modified_since_ns: i64,
+) -> Result<ImportReport> {
+    collect_with_modified_since(path, identity, writer, Some(modified_since_ns))
+}
+
+fn collect_with_modified_since(
+    path: Option<PathBuf>,
+    identity: &ImportIdentity,
+    writer: &mut dyn Write,
+    modified_since_ns: Option<i64>,
+) -> Result<ImportReport> {
+    let total_started = Instant::now();
+    let trace_path = path.unwrap_or_else(default_kanade_traces_dir);
+    let scan_started = Instant::now();
+    let scan = collect_trace_path(&trace_path, identity, writer, modified_since_ns)?;
+    let scan_elapsed_ms = scan_started.elapsed().as_millis();
+    let warnings = if scan.warnings > 0 {
+        vec![format!(
+            "{} trace lines could not be parsed and were skipped",
+            scan.warnings
+        )]
+    } else {
+        Vec::new()
+    };
+
+    Ok(ImportReport {
+        source: "kanade".to_string(),
+        source_id: format!("{}:kanade:collector", identity.profile_id),
+        root_path: trace_path,
+        files_seen: scan.files_seen,
+        files_imported: scan.files_seen,
+        files_skipped: 0,
+        events_projected: scan.events,
+        source_bytes_scanned: scan.bytes,
+        shirabe_bytes_written: 0,
+        timings: vec![
+            ImportTiming {
+                stage: "collect",
+                elapsed_ms: scan_elapsed_ms,
+            },
+            ImportTiming {
+                stage: "total_collector",
+                elapsed_ms: total_started.elapsed().as_millis(),
+            },
+        ],
+        warnings,
+    })
 }
 
 fn import_with_modified_since(
     db: &Database,
     path: Option<PathBuf>,
     modified_since_ns: Option<i64>,
+    identity: &ImportIdentity,
 ) -> Result<ImportReport> {
     let total_started = Instant::now();
     let trace_path = path.unwrap_or_else(default_kanade_traces_dir);
@@ -45,11 +127,17 @@ fn import_with_modified_since(
     } else {
         "otlp_jsonl_directory"
     };
-    let source_id = db.record_import_source("kanade", source_kind, &trace_path)?;
+    let source_id = db.record_import_source_for_profile(
+        "kanade",
+        source_kind,
+        &trace_path,
+        &identity.profile_id,
+        &identity.device_id,
+    )?;
 
     let scan_started = Instant::now();
     let tx = db.begin_batch()?;
-    let scan = scan_trace_path(db, &source_id, &trace_path, modified_since_ns)?;
+    let scan = scan_trace_path(db, &source_id, &trace_path, modified_since_ns, identity)?;
     tx.commit()?;
     let scan_elapsed_ms = scan_started.elapsed().as_millis();
 
@@ -105,11 +193,95 @@ fn default_kanade_traces_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(".kanade").join("traces"))
 }
 
+fn collect_trace_path(
+    path: &Path,
+    identity: &ImportIdentity,
+    writer: &mut dyn Write,
+    modified_since_ns: Option<i64>,
+) -> Result<ScanSize> {
+    if path.is_file() {
+        let metadata = fs::metadata(path).with_context(|| format!("stat {}", path.display()))?;
+        let modified_ns = metadata.modified().map(system_time_ns).unwrap_or_default();
+        if modified_since_ns.is_some_and(|since| modified_ns < since) {
+            return Ok(ScanSize::default());
+        }
+        let collected = collect_trace_file(path, identity, writer)?;
+        return Ok(ScanSize {
+            files_seen: 1,
+            files_imported: 1,
+            files_skipped: 0,
+            bytes: metadata.len(),
+            events: collected.events,
+            warnings: collected.warnings,
+        });
+    }
+
+    let mut files_seen = 0usize;
+    let mut bytes = 0u64;
+    let mut events = 0usize;
+    let mut warnings = 0usize;
+
+    if !path.exists() {
+        return Ok(ScanSize::default());
+    }
+
+    for entry in WalkDir::new(path).follow_links(false) {
+        let entry = entry.with_context(|| format!("scan {}", path.display()))?;
+        if entry.file_type().is_file() && is_jsonl(entry.path()) {
+            let metadata = entry.metadata()?;
+            let modified_ns = metadata.modified().map(system_time_ns).unwrap_or_default();
+            if modified_since_ns.is_some_and(|since| modified_ns < since) {
+                continue;
+            }
+            files_seen += 1;
+            bytes = bytes.saturating_add(metadata.len());
+            let collected = collect_trace_file(entry.path(), identity, writer)?;
+            events += collected.events;
+            warnings += collected.warnings;
+        }
+    }
+
+    Ok(ScanSize {
+        files_seen,
+        files_imported: files_seen,
+        files_skipped: 0,
+        bytes,
+        events,
+        warnings,
+    })
+}
+
+fn collect_trace_file(
+    path: &Path,
+    identity: &ImportIdentity,
+    writer: &mut dyn Write,
+) -> Result<ImportedFile> {
+    let file = fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let reader = BufReader::new(file);
+    let mut events = 0usize;
+    let mut warnings = 0usize;
+
+    for (index, line) in reader.lines().enumerate() {
+        let line = line.with_context(|| format!("read {}", path.display()))?;
+        match parse_span_line(&line, path, index + 1, identity) {
+            Ok(Some(event)) => {
+                write_collected_event(writer, &event)?;
+                events += 1;
+            }
+            Ok(None) => {}
+            Err(_) => warnings += 1,
+        }
+    }
+
+    Ok(ImportedFile { events, warnings })
+}
+
 fn scan_trace_path(
     db: &Database,
     source_id: &str,
     path: &Path,
     modified_since_ns: Option<i64>,
+    identity: &ImportIdentity,
 ) -> Result<ScanSize> {
     if path.is_file() {
         let metadata = fs::metadata(path).with_context(|| format!("stat {}", path.display()))?;
@@ -119,7 +291,7 @@ fn scan_trace_path(
         }
         let prepared = db.prepare_import_file(source_id, path, metadata.len(), modified_ns)?;
         let imported = if prepared.should_import {
-            import_trace_file(db, &prepared.file_id, path)?
+            import_trace_file(db, &prepared.file_id, path, identity)?
         } else {
             ImportedFile::skipped()
         };
@@ -170,7 +342,7 @@ fn scan_trace_path(
             }
 
             files_imported += 1;
-            let imported = import_trace_file(db, &prepared.file_id, entry.path())?;
+            let imported = import_trace_file(db, &prepared.file_id, entry.path(), identity)?;
             events += imported.events;
             warnings += imported.warnings;
         }
@@ -186,7 +358,12 @@ fn scan_trace_path(
     })
 }
 
-fn import_trace_file(db: &Database, file_id: &str, path: &Path) -> Result<ImportedFile> {
+fn import_trace_file(
+    db: &Database,
+    file_id: &str,
+    path: &Path,
+    identity: &ImportIdentity,
+) -> Result<ImportedFile> {
     let file = fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
     let mut reader = BufReader::new(file);
     let projector = Projector::new(db);
@@ -214,7 +391,7 @@ fn import_trace_file(db: &Database, file_id: &str, path: &Path) -> Result<Import
         line_number += 1;
         offset = offset.saturating_add(bytes_read as u64);
 
-        match parse_span_line(&line, path, line_number) {
+        match parse_span_line(&line, path, line_number, identity) {
             Ok(Some(mut event)) => {
                 if let Some(turn) = event.turn.as_mut() {
                     let index = turn_indexes
@@ -259,7 +436,12 @@ fn import_trace_file(db: &Database, file_id: &str, path: &Path) -> Result<Import
     Ok(ImportedFile { events, warnings })
 }
 
-fn parse_span_line(line: &str, path: &Path, line_number: usize) -> Result<Option<NormalizedEvent>> {
+fn parse_span_line(
+    line: &str,
+    path: &Path,
+    line_number: usize,
+    identity: &ImportIdentity,
+) -> Result<Option<NormalizedEvent>> {
     let value: Value = serde_json::from_str(line).context("parse kanade trace json")?;
     let attributes = value
         .get("attributes")
@@ -297,6 +479,8 @@ fn parse_span_line(line: &str, path: &Path, line_number: usize) -> Result<Option
     }
 
     Ok(Some(NormalizedEvent {
+        profile_id: identity.profile_id.clone(),
+        device_id: identity.device_id.clone(),
         source: "kanade".to_string(),
         source_kind: "otlp_jsonl_span".to_string(),
         source_event_id,

@@ -44,6 +44,13 @@ pub enum Commands {
         path: Option<PathBuf>,
     },
 
+    /// Collect current-account events into the shared workspace inbox.
+    Collect {
+        /// Shared workspace directory.
+        #[arg(long)]
+        workspace: Option<PathBuf>,
+    },
+
     /// Manage model pricing cache.
     Pricing {
         #[command(subcommand)]
@@ -54,6 +61,12 @@ pub enum Commands {
     Rollup {
         #[command(subcommand)]
         command: RollupCommand,
+    },
+
+    /// Manage the local shared Mac workspace.
+    Workspace {
+        #[command(subcommand)]
+        command: WorkspaceCommand,
     },
 }
 
@@ -79,4 +92,21 @@ pub enum PricingCommand {
 pub enum RollupCommand {
     /// Rebuild all usage rollups.
     Refresh,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum WorkspaceCommand {
+    /// Create or repair /Users/Shared/Shirabe for multi-account local use.
+    Init {
+        /// Shared workspace directory.
+        #[arg(long)]
+        path: Option<PathBuf>,
+    },
+
+    /// Re-apply shared workspace permissions.
+    Repair {
+        /// Shared workspace directory.
+        #[arg(long)]
+        path: Option<PathBuf>,
+    },
 }

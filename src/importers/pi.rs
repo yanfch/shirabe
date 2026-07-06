@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     env, fs,
-    io::{BufRead, BufReader},
+    io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
@@ -20,24 +20,106 @@ use crate::projection::{
 };
 use crate::skills;
 
-use super::{ImportReport, ImportTiming};
+use super::{ImportIdentity, ImportReport, ImportTiming, write_collected_event};
 
+#[allow(dead_code)]
 pub fn import(db: &Database, path: Option<PathBuf>) -> Result<ImportReport> {
-    import_with_modified_since(db, path, None)
+    import_with_identity(db, path, &ImportIdentity::local())
 }
 
+pub fn import_with_identity(
+    db: &Database,
+    path: Option<PathBuf>,
+    identity: &ImportIdentity,
+) -> Result<ImportReport> {
+    import_with_modified_since(db, path, None, identity)
+}
+
+#[allow(dead_code)]
 pub fn import_recent(
     db: &Database,
     path: Option<PathBuf>,
     modified_since_ns: i64,
 ) -> Result<ImportReport> {
-    import_with_modified_since(db, path, Some(modified_since_ns))
+    import_recent_with_identity(db, path, modified_since_ns, &ImportIdentity::local())
+}
+
+pub fn import_recent_with_identity(
+    db: &Database,
+    path: Option<PathBuf>,
+    modified_since_ns: i64,
+    identity: &ImportIdentity,
+) -> Result<ImportReport> {
+    import_with_modified_since(db, path, Some(modified_since_ns), identity)
+}
+
+#[allow(dead_code)]
+pub fn collect(
+    path: Option<PathBuf>,
+    identity: &ImportIdentity,
+    writer: &mut dyn Write,
+) -> Result<ImportReport> {
+    collect_with_modified_since(path, identity, writer, None)
+}
+
+pub fn collect_recent(
+    path: Option<PathBuf>,
+    identity: &ImportIdentity,
+    writer: &mut dyn Write,
+    modified_since_ns: i64,
+) -> Result<ImportReport> {
+    collect_with_modified_since(path, identity, writer, Some(modified_since_ns))
+}
+
+fn collect_with_modified_since(
+    path: Option<PathBuf>,
+    identity: &ImportIdentity,
+    writer: &mut dyn Write,
+    modified_since_ns: Option<i64>,
+) -> Result<ImportReport> {
+    let total_started = Instant::now();
+    let root_path = path.unwrap_or_else(default_pi_sessions_dir);
+    let scan_started = Instant::now();
+    let scan = collect_sessions(&root_path, identity, writer, modified_since_ns)?;
+    let scan_elapsed_ms = scan_started.elapsed().as_millis();
+    let warnings = if scan.warnings > 0 {
+        vec![format!(
+            "{} session lines could not be parsed and were skipped",
+            scan.warnings
+        )]
+    } else {
+        Vec::new()
+    };
+
+    Ok(ImportReport {
+        source: "pi".to_string(),
+        source_id: format!("{}:pi:collector", identity.profile_id),
+        root_path,
+        files_seen: scan.files_seen,
+        files_imported: scan.files_seen,
+        files_skipped: 0,
+        events_projected: scan.events,
+        source_bytes_scanned: scan.bytes,
+        shirabe_bytes_written: 0,
+        timings: vec![
+            ImportTiming {
+                stage: "collect",
+                elapsed_ms: scan_elapsed_ms,
+            },
+            ImportTiming {
+                stage: "total_collector",
+                elapsed_ms: total_started.elapsed().as_millis(),
+            },
+        ],
+        warnings,
+    })
 }
 
 fn import_with_modified_since(
     db: &Database,
     path: Option<PathBuf>,
     modified_since_ns: Option<i64>,
+    identity: &ImportIdentity,
 ) -> Result<ImportReport> {
     let total_started = Instant::now();
     let root_path = path.unwrap_or_else(default_pi_sessions_dir);
@@ -46,11 +128,17 @@ fn import_with_modified_since(
     } else {
         "session_jsonl_directory"
     };
-    let source_id = db.record_import_source("pi", source_kind, &root_path)?;
+    let source_id = db.record_import_source_for_profile(
+        "pi",
+        source_kind,
+        &root_path,
+        &identity.profile_id,
+        &identity.device_id,
+    )?;
 
     let scan_started = Instant::now();
     let tx = db.begin_batch()?;
-    let scan = scan_sessions(db, &source_id, &root_path, modified_since_ns)?;
+    let scan = scan_sessions(db, &source_id, &root_path, modified_since_ns, identity)?;
     tx.commit()?;
     let scan_elapsed_ms = scan_started.elapsed().as_millis();
 
@@ -129,11 +217,122 @@ fn default_pi_sessions_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(".pi").join("agent").join("sessions"))
 }
 
+fn collect_sessions(
+    root: &Path,
+    identity: &ImportIdentity,
+    writer: &mut dyn Write,
+    modified_since_ns: Option<i64>,
+) -> Result<ScanSize> {
+    if root.is_file() {
+        let metadata = fs::metadata(root).with_context(|| format!("stat {}", root.display()))?;
+        let modified_ns = metadata.modified().map(system_time_ns).unwrap_or_default();
+        if modified_since_ns.is_some_and(|since| modified_ns < since) {
+            return Ok(ScanSize::default());
+        }
+        let collected = collect_session_file(root, identity, writer)?;
+        return Ok(ScanSize {
+            files_seen: 1,
+            files_imported: 1,
+            files_skipped: 0,
+            bytes: metadata.len(),
+            events: collected.events,
+            parse_elapsed_ms: 0,
+            project_elapsed_ms: 0,
+            summary_elapsed_ms: 0,
+            finish_elapsed_ms: 0,
+            warnings: collected.warnings,
+        });
+    }
+
+    let mut files_seen = 0usize;
+    let mut bytes = 0u64;
+    let mut events = 0usize;
+    let mut warnings = 0usize;
+
+    if !root.exists() {
+        return Ok(ScanSize::default());
+    }
+
+    for entry in WalkDir::new(root).follow_links(false) {
+        let entry = entry.with_context(|| format!("scan {}", root.display()))?;
+        if entry.file_type().is_file() && is_jsonl(entry.path()) {
+            let metadata = entry.metadata()?;
+            let modified_ns = metadata.modified().map(system_time_ns).unwrap_or_default();
+            if modified_since_ns.is_some_and(|since| modified_ns < since) {
+                continue;
+            }
+            files_seen += 1;
+            bytes = bytes.saturating_add(metadata.len());
+            let collected = collect_session_file(entry.path(), identity, writer)?;
+            events += collected.events;
+            warnings += collected.warnings;
+        }
+    }
+
+    Ok(ScanSize {
+        files_seen,
+        files_imported: files_seen,
+        files_skipped: 0,
+        bytes,
+        events,
+        parse_elapsed_ms: 0,
+        project_elapsed_ms: 0,
+        summary_elapsed_ms: 0,
+        finish_elapsed_ms: 0,
+        warnings,
+    })
+}
+
+fn collect_session_file(
+    path: &Path,
+    identity: &ImportIdentity,
+    writer: &mut dyn Write,
+) -> Result<ImportedFile> {
+    let file = fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let mut reader = BufReader::new(file);
+    let mut state = SessionState::from_path(path);
+    let mut line = String::new();
+    let mut line_number = 0usize;
+    let mut events = 0usize;
+    let mut warnings = 0usize;
+
+    loop {
+        line.clear();
+        let bytes_read = reader
+            .read_line(&mut line)
+            .with_context(|| format!("read {}", path.display()))?;
+        if bytes_read == 0 {
+            break;
+        }
+
+        line_number += 1;
+        match parse_session_line(&mut state, &line, path, line_number, identity) {
+            Ok(parsed) => {
+                for event in parsed {
+                    write_collected_event(writer, &event)?;
+                    events += 1;
+                }
+            }
+            Err(_) => warnings += 1,
+        }
+    }
+
+    Ok(ImportedFile {
+        events,
+        parse_elapsed_ms: 0,
+        project_elapsed_ms: 0,
+        summary_elapsed_ms: 0,
+        finish_elapsed_ms: 0,
+        warnings,
+    })
+}
+
 fn scan_sessions(
     db: &Database,
     source_id: &str,
     root: &Path,
     modified_since_ns: Option<i64>,
+    identity: &ImportIdentity,
 ) -> Result<ScanSize> {
     if root.is_file() {
         let metadata = fs::metadata(root).with_context(|| format!("stat {}", root.display()))?;
@@ -143,7 +342,7 @@ fn scan_sessions(
         }
         let prepared = db.prepare_import_file(source_id, root, metadata.len(), modified_ns)?;
         let imported = if prepared.should_import {
-            import_session_file(db, &prepared.file_id, root)?
+            import_session_file(db, &prepared.file_id, root, identity)?
         } else {
             ImportedFile::skipped()
         };
@@ -205,7 +404,7 @@ fn scan_sessions(
             }
 
             files_imported += 1;
-            let imported = import_session_file(db, &prepared.file_id, entry.path())?;
+            let imported = import_session_file(db, &prepared.file_id, entry.path(), identity)?;
             events += imported.events;
             parse_elapsed_ms += imported.parse_elapsed_ms;
             project_elapsed_ms += imported.project_elapsed_ms;
@@ -229,7 +428,12 @@ fn scan_sessions(
     })
 }
 
-fn import_session_file(db: &Database, file_id: &str, path: &Path) -> Result<ImportedFile> {
+fn import_session_file(
+    db: &Database,
+    file_id: &str,
+    path: &Path,
+    identity: &ImportIdentity,
+) -> Result<ImportedFile> {
     let file = fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
     let mut reader = BufReader::new(file);
     let projector = Projector::new(db);
@@ -260,7 +464,7 @@ fn import_session_file(db: &Database, file_id: &str, path: &Path) -> Result<Impo
         offset = offset.saturating_add(bytes_read as u64);
 
         let parse_started = Instant::now();
-        let parsed = parse_session_line(&mut state, &line, path, line_number);
+        let parsed = parse_session_line(&mut state, &line, path, line_number, identity);
         parse_elapsed += parse_started.elapsed();
 
         match parsed {
@@ -322,6 +526,7 @@ fn parse_session_line(
     line: &str,
     path: &Path,
     line_number: usize,
+    identity: &ImportIdentity,
 ) -> Result<Vec<NormalizedEvent>> {
     let entry: Map<String, Value> = serde_json::from_str(line).context("parse pi session json")?;
     let timestamp_ns = entry_timestamp_ns(&entry).unwrap_or_else(now_ns);
@@ -344,11 +549,12 @@ fn parse_session_line(
             state.apply_thinking_level(&entry);
             Ok(Vec::new())
         }
-        "message" => parse_message_entry(state, &entry, path, line_number, timestamp_ns),
+        "message" => parse_message_entry(state, &entry, path, line_number, timestamp_ns, identity),
         "compaction" => Ok(state
             .has_turn()
             .then(|| {
                 state.event(
+                    identity,
                     path,
                     line_number,
                     0,
@@ -373,6 +579,7 @@ fn parse_message_entry(
     path: &Path,
     line_number: usize,
     timestamp_ns: i64,
+    identity: &ImportIdentity,
 ) -> Result<Vec<NormalizedEvent>> {
     let Some(message) = entry.get("message").and_then(Value::as_object) else {
         return Ok(Vec::new());
@@ -384,6 +591,7 @@ fn parse_message_entry(
         "user" => {
             state.start_next_turn();
             let mut event = state.event(
+                identity,
                 path,
                 line_number,
                 0,
@@ -407,6 +615,7 @@ fn parse_message_entry(
             let usage = state.usage_from_message(message);
             let metadata = message_metadata(entry, message);
             let mut events = vec![state.event(
+                identity,
                 path,
                 line_number,
                 0,
@@ -427,6 +636,7 @@ fn parse_message_entry(
                     .tool_names
                     .insert(call_id.clone(), tool_call.name.clone());
                 let mut event = state.event(
+                    identity,
                     path,
                     line_number,
                     index.saturating_add(1),
@@ -451,6 +661,7 @@ fn parse_message_entry(
                 .or_else(|| state.tool_names.get(&call_id).cloned())
                 .unwrap_or_else(|| "tool".to_string());
             Ok(vec![state.event(
+                identity,
                 path,
                 line_number,
                 0,
@@ -466,6 +677,7 @@ fn parse_message_entry(
         "bashExecution" => {
             state.ensure_turn();
             Ok(vec![state.event(
+                identity,
                 path,
                 line_number,
                 0,
@@ -526,8 +738,11 @@ impl SessionState {
     }
 
     fn apply_model_change(&mut self, entry: &Map<String, Value>) {
-        self.model = string_field(entry, "modelId").or_else(|| self.model.clone());
-        self.provider = string_field(entry, "provider").or_else(|| self.provider.clone());
+        let provider = string_field(entry, "provider").or_else(|| self.provider.clone());
+        let model = string_field(entry, "modelId").or_else(|| self.model.clone());
+        let (provider, model) = normalize_provider_and_model(provider, model);
+        self.provider = provider;
+        self.model = model;
     }
 
     fn apply_thinking_level(&mut self, entry: &Map<String, Value>) {
@@ -584,12 +799,18 @@ impl SessionState {
     }
 
     fn message_model(&self, message: &Map<String, Value>) -> Option<String> {
-        string_field(message, "model").or_else(|| self.model.clone())
+        let provider = string_field(message, "provider").or_else(|| self.provider.clone());
+        let model = string_field(message, "model").or_else(|| self.model.clone());
+        let (_, model) = normalize_provider_and_model(provider, model);
+        model
     }
 
     fn usage_from_message(&mut self, message: &Map<String, Value>) -> Usage {
-        self.provider = string_field(message, "provider").or_else(|| self.provider.clone());
-        self.model = string_field(message, "model").or_else(|| self.model.clone());
+        let provider = string_field(message, "provider").or_else(|| self.provider.clone());
+        let model = string_field(message, "model").or_else(|| self.model.clone());
+        let (provider, model) = normalize_provider_and_model(provider, model);
+        self.provider = provider;
+        self.model = model;
         self.api = string_field(message, "api").or_else(|| self.api.clone());
 
         let usage = message.get("usage").and_then(Value::as_object);
@@ -629,6 +850,7 @@ impl SessionState {
 
     fn event(
         &self,
+        identity: &ImportIdentity,
         path: &Path,
         line_number: usize,
         sub_index: usize,
@@ -646,6 +868,8 @@ impl SessionState {
             .saturating_add(sub_index)
             .min(i64::MAX as usize) as i64;
         NormalizedEvent {
+            profile_id: identity.profile_id.clone(),
+            device_id: identity.device_id.clone(),
             source: "pi".to_string(),
             source_kind: "session_jsonl".to_string(),
             source_event_id: Some(source_event_id),
@@ -810,6 +1034,52 @@ fn entry_timestamp_ns(entry: &Map<String, Value>) -> Option<i64> {
         })
 }
 
+fn normalize_provider_and_model(
+    provider: Option<String>,
+    model: Option<String>,
+) -> (Option<String>, Option<String>) {
+    let provider = provider.and_then(|value| non_empty(&value));
+    let model = model.and_then(|value| non_empty(&value));
+
+    let Some(model) = model else {
+        return (provider, None);
+    };
+
+    if let Some(provider_value) = provider.as_deref() {
+        for separator in ['/', ':'] {
+            if let Some(rest) = model.strip_prefix(provider_value)
+                && let Some(rest) = rest.strip_prefix(separator)
+            {
+                return (provider, non_empty(rest));
+            }
+        }
+        if let Some((_, derived_model)) = split_model_slug(&model) {
+            return (provider, Some(derived_model));
+        }
+        return (provider, Some(model));
+    }
+
+    if let Some((_, derived_model)) = split_model_slug(&model) {
+        return (None, Some(derived_model));
+    }
+
+    (provider, Some(model))
+}
+
+fn split_model_slug(model: &str) -> Option<(String, String)> {
+    for separator in ['/', ':'] {
+        if let Some((derived_provider, derived_model)) = model.split_once(separator) {
+            let derived_provider = non_empty(derived_provider);
+            let derived_model = non_empty(derived_model);
+            if let (Some(derived_provider), Some(derived_model)) = (derived_provider, derived_model)
+            {
+                return Some((derived_provider, derived_model));
+            }
+        }
+    }
+    None
+}
+
 fn string_field(payload: &Map<String, Value>, key: &str) -> Option<String> {
     payload.get(key).and_then(|value| match value {
         Value::String(value) => Some(value.clone()),
@@ -845,6 +1115,11 @@ fn bool_field(payload: &Map<String, Value>, key: &str) -> Option<bool> {
         Value::String(value) => value.parse().ok(),
         _ => None,
     })
+}
+
+fn non_empty(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
 fn value_len(value: &Value) -> usize {
@@ -1011,6 +1286,74 @@ mod tests {
         assert_eq!(input_tokens, 100);
         assert_eq!(cache_read_tokens, 40);
         assert!((total_cost_usd - 0.033).abs() < f64::EPSILON);
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn splits_provider_prefix_from_pi_model_names() -> Result<()> {
+        let root = temp_dir("pi-import-provider-model");
+        fs::create_dir_all(&root)?;
+        let session_path = root.join("pi-session.jsonl");
+        fs::write(
+            &session_path,
+            r#"{"type":"session","id":"session-1","timestamp":"2026-01-01T00:00:00.000Z","cwd":"/tmp/project","version":1}"#
+                .to_string()
+                + "\n"
+                + r#"{"type":"model_change","id":"model-1","parentId":"session-1","timestamp":"2026-01-01T00:00:00.100Z","provider":"cline-pass","modelId":"cline-pass/deepseek-v4-flash"}"#
+                + "\n"
+                + r#"{"type":"message","id":"assistant-1","parentId":"model-1","timestamp":"2026-01-01T00:00:02.000Z","message":{"role":"assistant","content":[],"provider":"cline-pass","model":"cline-pass/deepseek-v4-flash","usage":{"input":60,"output":20,"cacheRead":40,"totalTokens":120},"timestamp":1767225602000}}"#
+                + "\n",
+        )?;
+
+        let db_path = root.join("catalog.sqlite");
+        let db = Database::open(&db_path)?;
+        db.migrate()?;
+
+        import(&db, Some(session_path))?;
+
+        let (provider, model): (Option<String>, Option<String>) = db.connection().query_row(
+            "SELECT provider, model FROM llm_calls LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(provider.as_deref(), Some("cline-pass"));
+        assert_eq!(model.as_deref(), Some("deepseek-v4-flash"));
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn derives_provider_from_model_slug_when_pi_provider_is_generic() -> Result<()> {
+        let root = temp_dir("pi-import-generic-provider-model");
+        fs::create_dir_all(&root)?;
+        let session_path = root.join("pi-session.jsonl");
+        fs::write(
+            &session_path,
+            r#"{"type":"session","id":"session-1","timestamp":"2026-01-01T00:00:00.000Z","cwd":"/tmp/project","version":1}"#
+                .to_string()
+                + "\n"
+                + r#"{"type":"model_change","id":"model-1","parentId":"session-1","timestamp":"2026-01-01T00:00:00.100Z","provider":"cline","modelId":"cline-pass/deepseek-v4-flash"}"#
+                + "\n"
+                + r#"{"type":"message","id":"assistant-1","parentId":"model-1","timestamp":"2026-01-01T00:00:02.000Z","message":{"role":"assistant","content":[],"provider":"cline","model":"cline-pass/deepseek-v4-flash","usage":{"input":60,"output":20,"cacheRead":40,"totalTokens":120},"timestamp":1767225602000}}"#
+                + "\n",
+        )?;
+
+        let db_path = root.join("catalog.sqlite");
+        let db = Database::open(&db_path)?;
+        db.migrate()?;
+
+        import(&db, Some(session_path))?;
+
+        let (provider, model): (Option<String>, Option<String>) = db.connection().query_row(
+            "SELECT provider, model FROM llm_calls LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(provider.as_deref(), Some("cline"));
+        assert_eq!(model.as_deref(), Some("deepseek-v4-flash"));
 
         let _ = fs::remove_dir_all(root);
         Ok(())
