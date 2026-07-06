@@ -93,6 +93,13 @@ macos-run:
 macos-verify:
     ./script/build_and_run.sh --verify
 
+copyapp dest="/Users/Shared/ShirabeBar.app":
+    ./script/build_and_run.sh --build-only
+    rm -rf "{{dest}}"
+    ditto dist/ShirabeBar.app "{{dest}}"
+    chmod -R a+rX "{{dest}}"
+    echo "copied ShirabeBar.app to {{dest}}"
+
 package-cli:
     ./script/package_cli.sh
 
