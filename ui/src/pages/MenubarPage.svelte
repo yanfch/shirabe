@@ -24,7 +24,6 @@
   const refreshIntervalMs = 60_000;
 
   let range: RangeOption = normalizeRange(new URLSearchParams(location.search).get("range"));
-  let profileId: string | null = new URLSearchParams(location.search).get("profile_id");
   let data: MenubarUsage | null = null;
   let loading = true;
   let syncing = false;
@@ -43,8 +42,6 @@
   $: summary = data?.summary;
   $: trend = [...(data?.trend ?? [])].reverse();
   $: sourceUsage = data?.source_usage ?? [];
-  $: profileOptions = data?.profile_options ?? [];
-  $: selectedProfileId = profileId ?? data?.current_profile_id ?? null;
   $: latencyPanel = data?.latency_panel ?? null;
   $: trendRange = normalizeRange(data?.range ?? range);
   $: totalTokens = summary?.total_tokens ?? 0;
@@ -114,7 +111,7 @@
     loading = !data;
     error = null;
     try {
-      const nextData = await fetchMenubarUsage(requestedRange, profileId);
+      const nextData = await fetchMenubarUsage(requestedRange);
       if (requestId !== loadRequestId) return;
       data = nextData;
       range = normalizeRange(nextData.range);
@@ -132,25 +129,8 @@
     const params = new URLSearchParams(location.search);
     params.set("view", "menubar");
     params.set("range", nextRange);
-    if (profileId) params.set("profile_id", profileId);
     history.replaceState(history.state, "", `/?${params.toString()}`);
     await load(nextRange);
-  }
-
-  async function chooseProfile(event: Event) {
-    const target = event.currentTarget as HTMLSelectElement;
-    profileId = target.value || null;
-    trendHover = null;
-    const params = new URLSearchParams(location.search);
-    params.set("view", "menubar");
-    params.set("range", range);
-    if (profileId) {
-      params.set("profile_id", profileId);
-    } else {
-      params.delete("profile_id");
-    }
-    history.replaceState(history.state, "", `/?${params.toString()}`);
-    await load(range);
   }
 
   async function syncNow() {
@@ -365,18 +345,6 @@
         </button>
       {/each}
     </div>
-
-    {#if profileOptions.length > 1}
-      <label class="account-filter">
-        <span>Account</span>
-        <select value={selectedProfileId ?? ""} on:change={chooseProfile}>
-          <option value="all">All accounts</option>
-          {#each profileOptions as profile}
-            <option value={profile.profile_id}>{profile.profile_label}</option>
-          {/each}
-        </select>
-      </label>
-    {/if}
 
     {#if error}
       <div class="menubar-error">{error}</div>
@@ -823,6 +791,7 @@
 
   .range-tabs {
     width: 100%;
+    height: 24px;
     margin-top: 8px;
     border: 1px solid var(--border);
     border-radius: 4px;
@@ -833,14 +802,18 @@
   }
 
   .range-tabs button {
+    display: flex;
+    align-items: center;
+    justify-content: center;
     flex: 1;
-    height: 20px;
+    height: 100%;
     border: 0;
     border-radius: 0;
     border-right: 1px solid rgba(231, 224, 210, 0.08);
     background: transparent;
     color: var(--dim);
-    font-size: 10px;
+    font-size: 11px;
+    line-height: 1;
   }
 
   .range-tabs button:last-child {
@@ -853,28 +826,6 @@
       rgba(45, 52, 39, 0.28);
     color: var(--text);
     box-shadow: inset 0 0 0 1px rgba(141, 181, 106, 0.1);
-  }
-
-  .account-filter {
-    display: grid;
-    grid-template-columns: auto minmax(0, 1fr);
-    align-items: center;
-    gap: 8px;
-    margin-top: 8px;
-    padding: 0 2px;
-    color: var(--dim);
-    font-size: 10px;
-    text-transform: uppercase;
-  }
-
-  .account-filter select {
-    min-width: 0;
-    height: 24px;
-    border: 1px solid var(--border);
-    border-radius: 4px;
-    background: rgba(8, 10, 9, 0.56);
-    color: var(--text);
-    font-size: 11px;
   }
 
   .menubar-error,

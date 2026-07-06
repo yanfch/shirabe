@@ -77,6 +77,8 @@ impl Database {
     }
 
     pub fn migrate(&self) -> Result<()> {
+        self.prepare_legacy_profile_columns()?;
+        self.drop_legacy_rollups_if_needed()?;
         self.conn
             .execute_batch(SCHEMA_SQL)
             .context("apply schema")?;
@@ -90,6 +92,11 @@ impl Database {
             "usage_model_rollups",
             "total_cost_usd",
             "REAL NOT NULL DEFAULT 0",
+        )?;
+        self.ensure_column(
+            "usage_model_rollups",
+            "uncached_input_tokens",
+            "INTEGER NOT NULL DEFAULT 0",
         )?;
         for table in ["runs", "turns", "llm_calls", "tool_calls"] {
             self.ensure_column(table, "started_day", "TEXT")?;
@@ -169,6 +176,51 @@ impl Database {
         )?;
 
         Ok(())
+    }
+
+    pub fn adopt_legacy_local_profile(&self, identity: &Identity) -> Result<bool> {
+        if identity.profile_id == "local" && identity.device_id == "local_device" {
+            return Ok(false);
+        }
+
+        let legacy_rows = self.count_legacy_local_rows()?;
+        let legacy_ids = self.count_legacy_unscoped_ids(&identity.profile_id)?;
+        if legacy_rows == 0 && legacy_ids == 0 {
+            return Ok(false);
+        }
+
+        let tx = self.begin_batch()?;
+        self.conn.execute_batch("PRAGMA defer_foreign_keys = ON;")?;
+        self.remap_legacy_import_ids(&identity.profile_id)?;
+        for table in [
+            "import_sources",
+            "import_files",
+            "sessions",
+            "runs",
+            "turns",
+            "run_steps",
+            "llm_calls",
+            "tool_calls",
+            "run_signals",
+            "skill_events",
+        ] {
+            if self.table_exists(table)?
+                && self.table_has_column(table, "profile_id")?
+                && self.table_has_column(table, "device_id")?
+            {
+                self.conn.execute(
+                    &format!(
+                        "UPDATE {table}
+                         SET profile_id = ?1, device_id = ?2
+                         WHERE profile_id = 'local'"
+                    ),
+                    params![identity.profile_id, identity.device_id],
+                )?;
+            }
+        }
+        self.clear_usage_rollups()?;
+        tx.commit()?;
+        Ok(true)
     }
 
     pub fn refresh_observed_llm_latency_for_runs<'a, I>(&self, run_ids: I) -> Result<()>
@@ -394,6 +446,160 @@ impl Database {
                 [],
             )?;
         }
+        Ok(())
+    }
+
+    fn prepare_legacy_profile_columns(&self) -> Result<()> {
+        for table in [
+            "import_sources",
+            "import_files",
+            "sessions",
+            "runs",
+            "turns",
+            "run_steps",
+            "llm_calls",
+            "tool_calls",
+            "run_signals",
+            "skill_events",
+        ] {
+            if self.table_exists(table)? {
+                self.ensure_column(table, "profile_id", "TEXT NOT NULL DEFAULT 'local'")?;
+                self.ensure_column(table, "device_id", "TEXT NOT NULL DEFAULT 'local_device'")?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn drop_legacy_rollups_if_needed(&self) -> Result<()> {
+        if self.table_exists("usage_source_rollups")?
+            && !self.table_has_column("usage_source_rollups", "profile_id")?
+        {
+            self.conn.execute_batch(
+                "DROP TABLE IF EXISTS usage_source_rollups;
+                 DROP TABLE IF EXISTS usage_model_rollups;
+                 DROP TABLE IF EXISTS usage_tool_rollups;
+                 DROP TABLE IF EXISTS usage_tool_model_rollups;",
+            )?;
+        }
+
+        Ok(())
+    }
+
+    fn table_exists(&self, table: &str) -> Result<bool> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            params![table],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    fn count_legacy_local_rows(&self) -> Result<i64> {
+        let mut total = 0;
+        for table in [
+            "import_sources",
+            "import_files",
+            "sessions",
+            "runs",
+            "turns",
+            "run_steps",
+            "llm_calls",
+            "tool_calls",
+            "run_signals",
+            "skill_events",
+        ] {
+            if self.table_exists(table)? && self.table_has_column(table, "profile_id")? {
+                total += self.conn.query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE profile_id = 'local'"),
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )?;
+            }
+        }
+        Ok(total)
+    }
+
+    fn count_legacy_unscoped_ids(&self, profile_id: &str) -> Result<i64> {
+        let mut total = 0;
+        for (table, column) in [("import_sources", "source_id"), ("import_files", "file_id")] {
+            if self.table_exists(table)? && self.table_has_column(table, "profile_id")? {
+                total += self.conn.query_row(
+                    &format!(
+                        "SELECT COUNT(*) FROM {table}
+                         WHERE profile_id IN ('local', ?1)
+                           AND {column} NOT LIKE ?1 || ':%'"
+                    ),
+                    params![profile_id],
+                    |row| row.get::<_, i64>(0),
+                )?;
+            }
+        }
+        Ok(total)
+    }
+
+    fn remap_legacy_import_ids(&self, profile_id: &str) -> Result<()> {
+        self.prefix_column("import_files", "source_id", profile_id)?;
+        self.prefix_primary_key("import_sources", "source_id", profile_id)?;
+        self.prefix_primary_key("import_files", "file_id", profile_id)?;
+        Ok(())
+    }
+
+    fn prefix_column(&self, table: &str, column: &str, profile_id: &str) -> Result<()> {
+        if !self.table_exists(table)?
+            || !self.table_has_column(table, "profile_id")?
+            || !self.table_has_column(table, column)?
+        {
+            return Ok(());
+        }
+        self.conn.execute(
+            &format!(
+                "UPDATE {table}
+                 SET {column} = ?1 || ':' || {column}
+                 WHERE profile_id IN ('local', ?1)
+                   AND {column} IS NOT NULL
+                   AND {column} != ''
+                   AND {column} NOT LIKE ?1 || ':%'"
+            ),
+            params![profile_id],
+        )?;
+        Ok(())
+    }
+
+    fn prefix_primary_key(&self, table: &str, column: &str, profile_id: &str) -> Result<()> {
+        if !self.table_exists(table)?
+            || !self.table_has_column(table, "profile_id")?
+            || !self.table_has_column(table, column)?
+        {
+            return Ok(());
+        }
+        self.conn.execute(
+            &format!(
+                "UPDATE OR IGNORE {table}
+                 SET {column} = ?1 || ':' || {column}
+                 WHERE profile_id IN ('local', ?1)
+                   AND {column} NOT LIKE ?1 || ':%'"
+            ),
+            params![profile_id],
+        )?;
+        self.conn.execute(
+            &format!(
+                "DELETE FROM {table}
+                 WHERE profile_id IN ('local', ?1)
+                   AND {column} NOT LIKE ?1 || ':%'"
+            ),
+            params![profile_id],
+        )?;
+        Ok(())
+    }
+
+    fn clear_usage_rollups(&self) -> Result<()> {
+        self.conn.execute_batch(
+            "DELETE FROM usage_source_rollups;
+             DELETE FROM usage_model_rollups;
+             DELETE FROM usage_tool_rollups;
+             DELETE FROM usage_tool_model_rollups;",
+        )?;
         Ok(())
     }
 
@@ -1272,6 +1478,7 @@ CREATE TABLE IF NOT EXISTS usage_model_rollups (
     turns INTEGER NOT NULL DEFAULT 0,
     llm_calls INTEGER NOT NULL DEFAULT 0,
     input_tokens INTEGER NOT NULL DEFAULT 0,
+    uncached_input_tokens INTEGER NOT NULL DEFAULT 0,
     output_tokens INTEGER NOT NULL DEFAULT 0,
     cache_read_tokens INTEGER NOT NULL DEFAULT 0,
     cache_write_tokens INTEGER NOT NULL DEFAULT 0,
@@ -1315,3 +1522,204 @@ CREATE TABLE IF NOT EXISTS usage_tool_model_rollups (
 CREATE INDEX IF NOT EXISTS idx_usage_tool_model_rollups_lookup
 ON usage_tool_model_rollups(bucket, bucket_key, profile_id, source, model, tool_name);
 "#;
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use anyhow::Result;
+    use rusqlite::Connection;
+
+    use crate::config::Identity;
+
+    use super::Database;
+
+    #[test]
+    fn migrate_adds_profile_columns_before_creating_profile_indexes() -> Result<()> {
+        let db_path = std::env::temp_dir().join(format!(
+            "shirabe-legacy-profile-migration-{}.sqlite",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&db_path);
+
+        {
+            let conn = Connection::open(&db_path)?;
+            conn.execute_batch(
+                "CREATE TABLE import_sources (
+                    source_id TEXT PRIMARY KEY,
+                    source TEXT NOT NULL,
+                    source_kind TEXT NOT NULL,
+                    root_path TEXT NOT NULL,
+                    root_path_hash TEXT NOT NULL,
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    last_scan_ns INTEGER,
+                    last_success_ns INTEGER,
+                    cursor_time_ns INTEGER,
+                    parser_version TEXT,
+                    metadata_json TEXT
+                );
+                INSERT INTO import_sources (
+                    source_id, source, source_kind, root_path, root_path_hash
+                ) VALUES ('codex:abc', 'codex', 'session_jsonl', '/tmp/codex', 'abc');
+
+                CREATE TABLE usage_source_rollups (
+                    bucket TEXT NOT NULL,
+                    bucket_key TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    sessions INTEGER NOT NULL DEFAULT 0,
+                    updated_at_ns INTEGER NOT NULL,
+                    PRIMARY KEY (bucket, bucket_key, source)
+                );",
+            )?;
+        }
+
+        let db = Database::open(&db_path)?;
+        db.migrate()?;
+
+        assert!(db.table_has_column("import_sources", "profile_id")?);
+        assert!(db.table_has_column("import_sources", "device_id")?);
+        assert!(db.table_has_column("usage_source_rollups", "profile_id")?);
+
+        let profile_id: String = db.connection().query_row(
+            "SELECT profile_id FROM import_sources WHERE source_id = 'codex:abc'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(profile_id, "local");
+
+        let index_count: i64 = db.connection().query_row(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type = 'index' AND name = 'idx_import_sources_profile'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(index_count, 1);
+
+        let _ = fs::remove_file(db_path);
+        Ok(())
+    }
+
+    #[test]
+    fn adopt_legacy_local_profile_moves_existing_rows_and_clears_rollups() -> Result<()> {
+        let db_path = std::env::temp_dir().join(format!(
+            "shirabe-adopt-legacy-local-{}.sqlite",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&db_path);
+        let db = Database::open(&db_path)?;
+        db.migrate()?;
+
+        db.connection().execute_batch(
+            "INSERT INTO import_sources (
+                source_id, profile_id, device_id, source, source_kind, root_path, root_path_hash
+             ) VALUES (
+                'codex:abc', 'local', 'local_device', 'codex', 'session_jsonl', '/tmp/codex', 'abc'
+             );
+             INSERT INTO import_files (
+                file_id, profile_id, device_id, source_id, path, path_hash, size_bytes,
+                modified_ns, fingerprint, parser_version, status, last_offset, event_count
+             ) VALUES (
+                'codex:abc:file:filehash', 'local', 'local_device', 'codex:abc',
+                '/tmp/codex/session.jsonl', 'filehash', 123, 100, 'fingerprint',
+                'test', 'partial', 99, 3
+             );
+             INSERT INTO sessions (
+                session_id, profile_id, device_id, source, kind, external_id,
+                first_seen_ns, last_seen_ns
+             ) VALUES (
+                'codex:session-legacy', 'local', 'local_device', 'codex', 'session',
+                'session-legacy', 100, 100
+             );
+             INSERT INTO runs (
+                run_id, profile_id, device_id, source, kind, status, session_id,
+                external_id, started_at_ns
+             ) VALUES (
+                'codex:run-legacy', 'local', 'local_device', 'codex', 'session',
+                'success', 'codex:session-legacy', 'run-legacy', 100
+             );
+             INSERT INTO turns (
+                turn_id, profile_id, device_id, run_id, session_id, source, started_at_ns
+             ) VALUES (
+                'codex:turn-legacy', 'local', 'local_device', 'codex:run-legacy',
+                'codex:session-legacy', 'codex', 100
+             );
+             INSERT INTO run_steps (
+                step_id, profile_id, device_id, run_id, session_id, turn_id, source,
+                source_event_id, step_type, name, status, started_at_ns, llm_call_id
+             ) VALUES (
+                'codex:step:stephash', 'local', 'local_device', 'codex:run-legacy',
+                'codex:session-legacy', 'codex:turn-legacy', 'codex', 'event-1',
+                'llm', 'chat', 'success', 100, 'codex:llm:llmhash'
+             );
+             INSERT INTO llm_calls (
+                llm_call_id, profile_id, device_id, run_id, session_id, turn_id,
+                source, status, started_at_ns, observed_trigger_step_id
+             ) VALUES (
+                'codex:llm:llmhash', 'local', 'local_device', 'codex:run-legacy',
+                'codex:session-legacy', 'codex:turn-legacy', 'codex', 'success',
+                100, 'codex:step:stephash'
+             );
+             INSERT INTO usage_source_rollups (
+                bucket, bucket_key, profile_id, device_id, source, sessions, runs, updated_at_ns
+             ) VALUES (
+                'day', '1970-01-01', 'local', 'local_device', 'codex', 1, 1, 100
+             );",
+        )?;
+
+        let adopted = db.adopt_legacy_local_profile(&Identity {
+            device_id: "device_current".to_string(),
+            device_label: "Test Mac".to_string(),
+            profile_id: "profile_current".to_string(),
+            profile_label: "Current".to_string(),
+            macos_uid: Some("501".to_string()),
+            macos_username: "current".to_string(),
+        })?;
+
+        assert!(adopted);
+        let profile_id: String = db.connection().query_row(
+            "SELECT profile_id FROM runs WHERE run_id = 'codex:run-legacy'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(profile_id, "profile_current");
+        let source_profile_id: String = db.connection().query_row(
+            "SELECT profile_id FROM import_sources WHERE source_id = 'profile_current:codex:abc'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(source_profile_id, "profile_current");
+        let file: (String, i64, i64) = db.connection().query_row(
+            "SELECT source_id, last_offset, event_count
+             FROM import_files
+             WHERE file_id = 'profile_current:codex:abc:file:filehash'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        assert_eq!(file, ("profile_current:codex:abc".to_string(), 99, 3));
+        let llm_refs: (String, String, String, String) = db.connection().query_row(
+            "SELECT run_id, session_id, turn_id, observed_trigger_step_id
+             FROM llm_calls
+             WHERE llm_call_id = 'codex:llm:llmhash'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+        assert_eq!(
+            llm_refs,
+            (
+                "codex:run-legacy".to_string(),
+                "codex:session-legacy".to_string(),
+                "codex:turn-legacy".to_string(),
+                "codex:step:stephash".to_string()
+            )
+        );
+        let rollups: i64 =
+            db.connection()
+                .query_row("SELECT COUNT(*) FROM usage_source_rollups", [], |row| {
+                    row.get(0)
+                })?;
+        assert_eq!(rollups, 0);
+
+        let _ = fs::remove_file(db_path);
+        Ok(())
+    }
+}

@@ -1,12 +1,13 @@
 use std::{
-    collections::HashMap,
-    fs,
+    collections::{HashMap, HashSet},
+    env, fs,
     io::{BufRead, BufReader, BufWriter},
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
 };
 
 use anyhow::{Context, Result};
+use rusqlite::{Connection, OpenFlags, params};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -14,7 +15,10 @@ use crate::{
     config::{Identity, SourcePaths},
     db::{Database, now_ns, stable_hash},
     importers::{self, ImportIdentity, ImportReport},
-    projection::{event::NormalizedEvent, projector::Projector},
+    projection::{
+        event::NormalizedEvent,
+        projector::{ProjectionCache, Projector},
+    },
     rollup,
 };
 
@@ -115,6 +119,173 @@ pub fn prepare(path: Option<PathBuf>) -> Result<WorkspaceReport> {
         profiles_dir,
         logs_dir,
     })
+}
+
+pub fn seed_pricing_cache_from_default_local(db: &Database) -> Result<bool> {
+    let Some(home) = env::var_os("HOME") else {
+        return Ok(false);
+    };
+    seed_pricing_cache(db, &PathBuf::from(home).join(".shirabe/catalog.sqlite"))
+}
+
+pub fn seed_pricing_cache(db: &Database, source_catalog: &Path) -> Result<bool> {
+    if !source_catalog.exists() {
+        return Ok(false);
+    }
+
+    if let (Ok(source), Ok(target)) = (
+        fs::canonicalize(source_catalog),
+        fs::canonicalize(db.path()),
+    ) {
+        if source == target {
+            return Ok(false);
+        }
+    }
+
+    let source = Connection::open_with_flags(source_catalog, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .with_context(|| format!("open pricing seed sqlite {}", source_catalog.display()))?;
+    if !sqlite_table_exists(&source, "pricing_sources")?
+        || !sqlite_table_exists(&source, "model_prices")?
+    {
+        return Ok(false);
+    }
+
+    let (source_count, source_updated_at): (i64, i64) = source.query_row(
+        "SELECT COUNT(*), COALESCE(MAX(updated_at_ns), 0) FROM model_prices",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    if source_count == 0 {
+        return Ok(false);
+    }
+
+    let target = db.connection();
+    let (target_count, target_updated_at): (i64, i64) = target.query_row(
+        "SELECT COUNT(*), COALESCE(MAX(updated_at_ns), 0) FROM model_prices",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    if target_count >= source_count && target_updated_at >= source_updated_at {
+        return Ok(false);
+    }
+
+    type PricingSourceRow = (String, String, i64, i64, String, Option<String>);
+    type ModelPriceRow = (
+        String,
+        String,
+        Option<String>,
+        Option<f64>,
+        Option<f64>,
+        Option<f64>,
+        Option<f64>,
+        i64,
+        Option<String>,
+    );
+
+    let pricing_sources = source
+        .prepare(
+            "SELECT pricing_source_id, source_url, fetched_at_ns, model_count, raw_json, metadata_json
+             FROM pricing_sources",
+        )?
+        .query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<PricingSourceRow>>>()?;
+    let model_prices = source
+        .prepare(
+            "SELECT model_name, source_id, provider, input_cost_per_token, output_cost_per_token,
+                    cache_read_input_token_cost, cache_creation_input_token_cost, updated_at_ns, metadata_json
+             FROM model_prices",
+        )?
+        .query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+                row.get(7)?,
+                row.get(8)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<ModelPriceRow>>>()?;
+
+    let tx = db.begin_batch()?;
+    for (pricing_source_id, source_url, fetched_at_ns, model_count, raw_json, metadata_json) in
+        pricing_sources
+    {
+        target.execute(
+            "INSERT INTO pricing_sources (
+                pricing_source_id, source_url, fetched_at_ns, model_count, raw_json, metadata_json
+             )
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(pricing_source_id) DO UPDATE SET
+                source_url = excluded.source_url,
+                fetched_at_ns = excluded.fetched_at_ns,
+                model_count = excluded.model_count,
+                raw_json = excluded.raw_json,
+                metadata_json = excluded.metadata_json",
+            params![
+                pricing_source_id,
+                source_url,
+                fetched_at_ns,
+                model_count,
+                raw_json,
+                metadata_json
+            ],
+        )?;
+    }
+    for (
+        model_name,
+        source_id,
+        provider,
+        input_cost_per_token,
+        output_cost_per_token,
+        cache_read_input_token_cost,
+        cache_creation_input_token_cost,
+        updated_at_ns,
+        metadata_json,
+    ) in model_prices
+    {
+        target.execute(
+            "INSERT INTO model_prices (
+                model_name, source_id, provider, input_cost_per_token, output_cost_per_token,
+                cache_read_input_token_cost, cache_creation_input_token_cost, updated_at_ns, metadata_json
+             )
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT(model_name) DO UPDATE SET
+                source_id = excluded.source_id,
+                provider = excluded.provider,
+                input_cost_per_token = excluded.input_cost_per_token,
+                output_cost_per_token = excluded.output_cost_per_token,
+                cache_read_input_token_cost = excluded.cache_read_input_token_cost,
+                cache_creation_input_token_cost = excluded.cache_creation_input_token_cost,
+                updated_at_ns = excluded.updated_at_ns,
+                metadata_json = excluded.metadata_json",
+            params![
+                model_name,
+                source_id,
+                provider,
+                input_cost_per_token,
+                output_cost_per_token,
+                cache_read_input_token_cost,
+                cache_creation_input_token_cost,
+                updated_at_ns,
+                metadata_json
+            ],
+        )?;
+    }
+    tx.commit()?;
+    Ok(true)
 }
 
 pub fn collect_to_inbox(
@@ -240,7 +411,10 @@ pub fn drain_inbox(db: &Database, workspace_dir: &Path) -> Result<DrainReport> {
         let file = fs::File::open(&path).with_context(|| format!("open {}", path.display()))?;
         let reader = BufReader::new(file);
         let projector = Projector::new(db);
-        let mut touched_run_ids = Vec::<String>::new();
+        let tx = db.begin_batch()?;
+        let mut projection_cache = ProjectionCache::default();
+        let mut touched_session_ids = HashSet::<String>::new();
+        let mut touched_run_ids = HashSet::<String>::new();
         for line in reader.lines() {
             let line = line.with_context(|| format!("read {}", path.display()))?;
             if line.trim().is_empty() {
@@ -248,11 +422,17 @@ pub fn drain_inbox(db: &Database, workspace_dir: &Path) -> Result<DrainReport> {
             }
             let event: NormalizedEvent = serde_json::from_str(&line)
                 .with_context(|| format!("parse collected event from {}", path.display()))?;
-            let projection = projector.project(&event)?;
-            touched_run_ids.push(projection.run_id);
+            let projection = projector.project_with_cache(&event, &mut projection_cache)?;
+            if let Some(session_id) = projection.session_id {
+                touched_session_ids.insert(session_id);
+            }
+            touched_run_ids.insert(projection.run_id);
             events_projected += 1;
         }
+        projector.refresh_run_summaries(touched_run_ids.iter().map(String::as_str))?;
         db.refresh_observed_llm_latency_for_runs(touched_run_ids.iter().map(String::as_str))?;
+        projector.refresh_session_summaries(touched_session_ids.iter().map(String::as_str))?;
+        tx.commit()?;
         fs::remove_file(&path).with_context(|| format!("remove {}", path.display()))?;
         files_drained += 1;
     }
@@ -363,6 +543,15 @@ fn workspace_file_stem(value: &str) -> String {
     }
 }
 
+fn sqlite_table_exists(conn: &Connection, table: &str) -> Result<bool> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+        [table],
+        |row| row.get(0),
+    )?;
+    Ok(count > 0)
+}
+
 fn chmod_best_effort(path: &Path, mode: u32) -> Result<()> {
     let mut permissions = fs::metadata(path)
         .with_context(|| format!("stat {}", path.display()))?
@@ -392,7 +581,7 @@ mod tests {
         db::Database,
     };
 
-    use super::{collect_to_inbox, drain_inbox, prepare};
+    use super::{collect_to_inbox, drain_inbox, prepare, seed_pricing_cache};
 
     #[test]
     fn collector_inbox_drains_two_profiles_without_db_writes_from_collectors() -> Result<()> {
@@ -482,6 +671,48 @@ mod tests {
             claude: PathBuf::from("/tmp/shirabe-missing-claude"),
             kanade: PathBuf::from("/tmp/shirabe-missing-kanade"),
         }
+    }
+
+    #[test]
+    fn shared_workspace_seeds_pricing_cache_from_local_catalog() -> Result<()> {
+        let root =
+            std::env::temp_dir().join(format!("shirabe-pricing-seed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root)?;
+        let source_path = root.join("local.sqlite");
+        let target_path = root.join("shared.sqlite");
+        let source_db = Database::open(&source_path)?;
+        source_db.migrate()?;
+        source_db.connection().execute(
+            "INSERT INTO pricing_sources (
+                pricing_source_id, source_url, fetched_at_ns, model_count, raw_json, metadata_json
+             )
+             VALUES ('source_1', 'https://example.test/prices.json', 10, 1, '{}', NULL)",
+            [],
+        )?;
+        source_db.connection().execute(
+            "INSERT INTO model_prices (
+                model_name, source_id, provider, input_cost_per_token, output_cost_per_token,
+                cache_read_input_token_cost, cache_creation_input_token_cost, updated_at_ns, metadata_json
+             )
+             VALUES ('gpt-test', 'source_1', 'openai', 0.001, 0.002, 0.0001, NULL, 10, NULL)",
+            [],
+        )?;
+
+        let target_db = Database::open(&target_path)?;
+        target_db.migrate()?;
+        assert!(seed_pricing_cache(&target_db, &source_path)?);
+        assert!(!seed_pricing_cache(&target_db, &source_path)?);
+
+        let count: i64 = target_db.connection().query_row(
+            "SELECT COUNT(*) FROM model_prices WHERE model_name = 'gpt-test'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(count, 1);
+
+        let _ = std::fs::remove_dir_all(root);
+        Ok(())
     }
 
     #[test]

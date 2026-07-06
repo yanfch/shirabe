@@ -175,6 +175,85 @@ button {
   white-space: nowrap;
 }
 
+.workspace-card {
+  margin-top: 16px;
+  border: 1px solid rgba(231, 224, 210, 0.08);
+  border-radius: 4px;
+  background: rgba(12, 15, 13, 0.36);
+  padding: 10px;
+}
+
+.workspace-card.attention {
+  border-color: rgba(197, 169, 94, 0.34);
+}
+
+.workspace-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.workspace-head span {
+  color: var(--green);
+  font-size: 11px;
+}
+
+.workspace-head strong {
+  min-width: 0;
+  color: var(--text);
+  font-weight: 400;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.workspace-path {
+  margin-top: 8px;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.4;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.workspace-foot {
+  display: grid;
+  grid-template-columns: 1fr;
+  align-items: start;
+  gap: 7px;
+  margin-top: 10px;
+}
+
+.workspace-foot button {
+  justify-self: start;
+  height: 26px;
+  border: 1px solid rgba(141, 181, 106, 0.3);
+  border-radius: 4px;
+  background: rgba(45, 52, 39, 0.52);
+  color: var(--text);
+  padding: 0 8px;
+  cursor: pointer;
+}
+
+.workspace-foot button:hover {
+  border-color: rgba(141, 181, 106, 0.55);
+}
+
+.workspace-foot button:disabled {
+  cursor: default;
+  opacity: 0.62;
+}
+
+.workspace-foot span {
+  min-width: 0;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
 .main {
   min-width: 0;
   padding: 0 12px 16px;
@@ -1037,15 +1116,23 @@ button {
 
 .topbar-filter-bar .filter-dropdown {
   min-width: 0;
-  width: 184px;
+  flex: 0 0 196px;
+  width: 196px;
 }
 
 .topbar-filter-bar .time-filter-dropdown {
+  flex-basis: 184px;
   width: 184px;
+}
+
+.topbar-filter-bar .filter-dropdown:nth-of-type(2) {
+  flex-basis: 218px;
+  width: 218px;
 }
 
 .topbar-filter-bar .filter-dropdown:nth-of-type(3) {
   min-width: 0;
+  flex-basis: 184px;
   width: 184px;
 }
 

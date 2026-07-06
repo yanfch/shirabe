@@ -8,6 +8,7 @@
 *.sqlite-wal
 
 # Frontend dependencies and build output
+/package-lock.json
 /ui/node_modules/
 /ui/dist/
 

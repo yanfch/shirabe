@@ -581,7 +581,7 @@ private struct OfflineView: View {
                 Text("Local server is offline")
                     .font(.system(size: 18, weight: .semibold, design: .monospaced))
                     .foregroundStyle(Color(red: 0.9, green: 0.88, blue: 0.82))
-                Text("Start Shirabe with `just restart`, then retry.")
+                Text("Retry, or check ~/.shirabe/shirabe-server.log.")
                     .font(.system(size: 13, design: .monospaced))
                     .foregroundStyle(Color(red: 0.58, green: 0.62, blue: 0.56))
             }

@@ -105,6 +105,24 @@ export type SyncRollupReport = {
   elapsed_ms: number;
 };
 
+export type WorkspaceStatus = {
+  status: string;
+  mode: "local" | "shared" | string;
+  workspace_dir: string;
+  catalog_db: string;
+  shared_workspace_dir: string;
+  shared_workspace_exists: boolean;
+  current_profile_id: string;
+  current_profile_label: string;
+  current_device_id: string;
+  current_device_label: string;
+  profile_count: number;
+  writable: boolean;
+  repair_available: boolean;
+  restart_required: boolean;
+  issue: string | null;
+};
+
 export type Totals = {
   import_sources: number;
   import_files: number;

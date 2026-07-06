@@ -69,6 +69,8 @@ pub async fn serve(
         .route("/api/overview", get(overview))
         .route("/api/usage", get(usage))
         .route("/api/menubar", get(menubar))
+        .route("/api/workspace", get(workspace_status))
+        .route("/api/workspace/repair", post(repair_workspace))
         .route("/api/sync", post(start_sync))
         .route("/api/sync/status", get(sync_status))
         .route("/api/sessions", get(sessions))
@@ -231,6 +233,20 @@ async fn sync_status(State(state): State<Arc<AppState>>) -> Response {
     Json(current_sync_status(&state)).into_response()
 }
 
+async fn workspace_status(State(state): State<Arc<AppState>>) -> Response {
+    match load_workspace_status(&state.db_path, &state.identity, false) {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => api_error(error),
+    }
+}
+
+async fn repair_workspace(State(state): State<Arc<AppState>>) -> Response {
+    match repair_workspace_inner(&state) {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => api_error(error),
+    }
+}
+
 async fn start_sync(State(state): State<Arc<AppState>>) -> Response {
     match try_start_sync_job(state.clone()) {
         Some(response) => (StatusCode::ACCEPTED, Json(response)).into_response(),
@@ -309,6 +325,25 @@ struct HealthResponse {
     status: &'static str,
     database: String,
     ui_dir: String,
+}
+
+#[derive(Debug, Serialize)]
+struct WorkspaceStatusResponse {
+    status: &'static str,
+    mode: &'static str,
+    workspace_dir: String,
+    catalog_db: String,
+    shared_workspace_dir: String,
+    shared_workspace_exists: bool,
+    current_profile_id: String,
+    current_profile_label: String,
+    current_device_id: String,
+    current_device_label: String,
+    profile_count: i64,
+    writable: bool,
+    repair_available: bool,
+    restart_required: bool,
+    issue: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -940,7 +975,10 @@ struct ProfileOption {
 const LLM_COST_SQL: &str = "CASE
     WHEN l.total_cost_usd > 0 THEN l.total_cost_usd
     ELSE
-        (l.input_tokens * COALESCE(mp.input_cost_per_token, 0)) +
+        ((CASE
+            WHEN l.uncached_input_tokens > 0 THEN l.uncached_input_tokens
+            ELSE MAX(l.input_tokens - l.cache_read_tokens - l.cache_write_tokens, 0)
+        END) * COALESCE(mp.input_cost_per_token, 0)) +
         (l.output_tokens * COALESCE(mp.output_cost_per_token, 0)) +
         (l.cache_read_tokens * COALESCE(mp.cache_read_input_token_cost, 0)) +
         (l.cache_write_tokens * COALESCE(mp.cache_creation_input_token_cost, 0))
@@ -949,7 +987,10 @@ const LLM_COST_SQL: &str = "CASE
 const MODEL_ROLLUP_COST_SQL: &str = "CASE
     WHEN m.total_cost_usd > 0 THEN m.total_cost_usd
     ELSE
-        (m.input_tokens * COALESCE(mp.input_cost_per_token, 0)) +
+        ((CASE
+            WHEN m.uncached_input_tokens > 0 THEN m.uncached_input_tokens
+            ELSE MAX(m.input_tokens - m.cache_read_tokens - m.cache_write_tokens, 0)
+        END) * COALESCE(mp.input_cost_per_token, 0)) +
         (m.output_tokens * COALESCE(mp.output_cost_per_token, 0)) +
         (m.cache_read_tokens * COALESCE(mp.cache_read_input_token_cost, 0)) +
         (m.cache_write_tokens * COALESCE(mp.cache_creation_input_token_cost, 0))
@@ -1404,11 +1445,8 @@ fn load_menubar(
     let conn =
         Connection::open(db_path).with_context(|| format!("open sqlite {}", db_path.display()))?;
     let range = normalize_menubar_range(query.range.as_deref());
-    let selected_profile_id = if query.profile_id.as_deref() == Some("all") {
-        None
-    } else {
-        normalize_filter_value(query.profile_id).or_else(|| Some(identity.profile_id.clone()))
-    };
+    let selected_profile_id =
+        normalize_filter_value(query.profile_id).or_else(|| Some(identity.profile_id.clone()));
     let filters = menubar_filters(range, selected_profile_id);
     let summary = UsageSummary::from_totals(&load_usage_totals(&conn, &filters)?);
     let latency_observations = load_latency_observations(&conn, &filters)?;
@@ -1484,6 +1522,131 @@ fn load_sessions(db_path: &PathBuf) -> Result<SessionListResponse> {
     })
 }
 
+fn load_workspace_status(
+    db_path: &PathBuf,
+    identity: &Identity,
+    restart_required: bool,
+) -> Result<WorkspaceStatusResponse> {
+    let default_shared_dir = workspace::default_shared_workspace_dir();
+    let shared_dir = shared_workspace_dir(db_path).map(PathBuf::from);
+    let mode = if shared_dir.is_some() {
+        "shared"
+    } else {
+        "local"
+    };
+    let workspace_dir = shared_dir
+        .clone()
+        .or_else(|| db_path.parent().map(PathBuf::from))
+        .unwrap_or_else(|| PathBuf::from("."));
+    let shared_workspace_exists = default_shared_dir.join("workspace.json").exists();
+    let profile_count = load_profile_count(db_path).unwrap_or_default();
+    let (writable, mut issue) = if let Some(shared_dir) = shared_dir.as_deref() {
+        check_shared_workspace_writable(shared_dir)
+    } else {
+        (true, None)
+    };
+
+    if mode == "local" && shared_workspace_exists && issue.is_none() {
+        issue = Some("Shared workspace is ready. Restart Shirabe to use it.".to_string());
+    }
+
+    if restart_required {
+        issue = Some(format!(
+            "Shared workspace is ready at {}. Restart Shirabe to use it.",
+            default_shared_dir.display()
+        ));
+    }
+
+    Ok(WorkspaceStatusResponse {
+        status: "ok",
+        mode,
+        workspace_dir: workspace_dir.display().to_string(),
+        catalog_db: db_path.display().to_string(),
+        shared_workspace_dir: default_shared_dir.display().to_string(),
+        shared_workspace_exists,
+        current_profile_id: identity.profile_id.clone(),
+        current_profile_label: identity.profile_label.clone(),
+        current_device_id: identity.device_id.clone(),
+        current_device_label: identity.device_label.clone(),
+        profile_count,
+        writable,
+        repair_available: true,
+        restart_required,
+        issue,
+    })
+}
+
+fn repair_workspace_inner(state: &AppState) -> Result<WorkspaceStatusResponse> {
+    let current_shared_dir = shared_workspace_dir(&state.db_path).map(PathBuf::from);
+    let target_dir = current_shared_dir
+        .clone()
+        .unwrap_or_else(workspace::default_shared_workspace_dir);
+    let report = workspace::prepare(Some(target_dir.clone()))?;
+    let shared_db = Database::open(&report.catalog_db)?;
+    shared_db.migrate()?;
+    shared_db.register_identity(&state.identity)?;
+    let mut pricing_changed = workspace::seed_pricing_cache(&shared_db, &state.db_path)?;
+    if !pricing_changed {
+        pricing_changed = workspace::seed_pricing_cache_from_default_local(&shared_db)?;
+    }
+    if pricing_changed {
+        rollup::refresh_all(&shared_db)?;
+    }
+
+    load_workspace_status(
+        &state.db_path,
+        &state.identity,
+        current_shared_dir.is_none(),
+    )
+}
+
+fn load_profile_count(db_path: &FsPath) -> Result<i64> {
+    let conn =
+        Connection::open(db_path).with_context(|| format!("open sqlite {}", db_path.display()))?;
+    Ok(conn
+        .query_row("SELECT COUNT(*) FROM profiles", [], |row| row.get(0))
+        .optional()?
+        .unwrap_or_default())
+}
+
+fn check_shared_workspace_writable(workspace_dir: &FsPath) -> (bool, Option<String>) {
+    for child in ["inbox", "profiles", "collector-state", "logs"] {
+        let dir = workspace_dir.join(child);
+        if let Err(error) = fs::create_dir_all(&dir) {
+            return (
+                false,
+                Some(format!(
+                    "{} is not writable: {}. Run Repair from an admin account.",
+                    dir.display(),
+                    error
+                )),
+            );
+        }
+
+        let probe = dir.join(format!(
+            ".shirabe-write-check-{}-{}",
+            std::process::id(),
+            crate::db::now_ns()
+        ));
+        match fs::write(&probe, b"ok").and_then(|_| fs::remove_file(&probe)) {
+            Ok(()) => {}
+            Err(error) => {
+                let _ = fs::remove_file(&probe);
+                return (
+                    false,
+                    Some(format!(
+                        "{} is not writable: {}. Run Repair from an admin account.",
+                        dir.display(),
+                        error
+                    )),
+                );
+            }
+        }
+    }
+
+    (true, None)
+}
+
 fn current_sync_status(state: &AppState) -> SyncStatus {
     state
         .sync
@@ -1520,7 +1683,11 @@ fn run_sync_job_inner(state: &Arc<AppState>) -> Result<()> {
     db.migrate()?;
 
     let mut imported_files = 0usize;
+    let mut pricing_changed = false;
     if let Some(workspace_dir) = shared_workspace_dir(&state.db_path) {
+        set_sync_phase(state, "sync pricing");
+        pricing_changed = workspace::seed_pricing_cache_from_default_local(&db)?;
+
         set_sync_phase(state, "drain inbox");
         let drain = workspace::drain_inbox(&db, workspace_dir)?;
         if drain.events_projected > 0 {
@@ -1540,7 +1707,7 @@ fn run_sync_job_inner(state: &Arc<AppState>) -> Result<()> {
             .push(report);
     }
 
-    if imported_files == 0 {
+    if imported_files == 0 && !pricing_changed {
         set_sync_phase(state, "complete");
         return Ok(());
     }
@@ -1861,9 +2028,9 @@ fn load_latency_observations(
     let bucket_expr = if filters.preset == "today" {
         "printf('%02d:00', CAST(strftime('%H', l.started_at_ns / 1000000000, 'unixepoch', 'localtime') AS INTEGER))"
     } else if filters.usage_grain() == "month" {
-        "strftime('%Y-%m', l.started_at_ns / 1000000000, 'unixepoch', 'localtime')"
+        "COALESCE(l.started_month, strftime('%Y-%m', l.started_at_ns / 1000000000, 'unixepoch', 'localtime'))"
     } else {
-        "date(l.started_at_ns / 1000000000, 'unixepoch', 'localtime')"
+        "COALESCE(l.started_day, date(l.started_at_ns / 1000000000, 'unixepoch', 'localtime'))"
     };
     let sql = format!(
         "SELECT
@@ -4452,12 +4619,12 @@ fn api_error(error: anyhow::Error) -> Response {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::PathBuf};
+    use std::{fs, path::PathBuf, sync::Mutex};
 
     use anyhow::Result;
 
     use crate::{
-        config::Identity,
+        config::{Identity, SourcePaths},
         db::Database,
         projection::{
             event::{
@@ -4466,13 +4633,14 @@ mod tests {
             },
             projector::Projector,
         },
-        rollup,
+        rollup, workspace,
     };
 
     use super::{
-        LatencySample, MenubarQuery, SyncStatus, UsageFilters, UsageQuery, load_menubar,
+        AppState, LatencySample, MenubarQuery, SyncStatus, UsageFilters, UsageQuery, load_menubar,
         load_overview, load_pattern_latency_panel, load_run_detail, load_session_detail,
-        load_sessions, load_today_latency_panel, load_usage,
+        load_sessions, load_today_latency_panel, load_usage, load_workspace_status,
+        repair_workspace_inner,
     };
 
     #[test]
@@ -4694,6 +4862,51 @@ mod tests {
     }
 
     #[test]
+    fn usage_cost_fallback_prices_uncached_input_and_cache_once() -> Result<()> {
+        let db_path = temp_db_path("usage-cost-fallback");
+        let db = Database::open(&db_path)?;
+        db.migrate()?;
+        db.connection().execute(
+            "INSERT INTO pricing_sources (
+                pricing_source_id, source_url, fetched_at_ns, model_count, raw_json, metadata_json
+             )
+             VALUES ('source_1', 'https://example.test/prices.json', 10, 1, '{}', NULL)",
+            [],
+        )?;
+        db.connection().execute(
+            "INSERT INTO model_prices (
+                model_name, source_id, provider, input_cost_per_token, output_cost_per_token,
+                cache_read_input_token_cost, cache_creation_input_token_cost, updated_at_ns, metadata_json
+             )
+             VALUES ('gpt-priced', 'source_1', 'openai', 0.001, 0.01, 0.0001, 0.0002, 10, NULL)",
+            [],
+        )?;
+
+        let mut event = usage_test_event("priced", 100, 1000, 250);
+        event.usage.model = Some("gpt-priced".to_string());
+        event.usage.uncached_input_tokens = 600;
+        event.usage.cache_read_tokens = 400;
+        event.usage.cache_write_tokens = 50;
+        Projector::new(&db).project(&event)?;
+        rollup::refresh_all(&db)?;
+
+        let usage = load_usage(&db_path, UsageFilters::all())?;
+        let expected_cost = 3.15;
+        assert!((usage.summary.total_cost_usd - expected_cost).abs() < 0.000001);
+        assert!((usage.buckets[0].total_cost_usd - expected_cost).abs() < 0.000001);
+
+        let source_rollup_cost: f64 = db.connection().query_row(
+            "SELECT total_cost_usd FROM usage_source_rollups WHERE bucket = 'day'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert!((source_rollup_cost - expected_cost).abs() < 0.000001);
+
+        let _ = fs::remove_file(db_path);
+        Ok(())
+    }
+
+    #[test]
     fn usage_month_sampling_keeps_range_totals_exact() -> Result<()> {
         let db_path = temp_db_path("usage-month-range");
         let db = Database::open(&db_path)?;
@@ -4742,6 +4955,64 @@ mod tests {
         assert_eq!(month_usage.buckets[0].bucket_key, "1970-01");
         assert_eq!(month_usage.buckets[0].input_tokens, 100);
         assert_eq!(month_usage.buckets[0].output_tokens, 10);
+
+        let _ = fs::remove_file(db_path);
+        Ok(())
+    }
+
+    #[test]
+    fn usage_all_keeps_lifetime_scope_beyond_30d() -> Result<()> {
+        let db_path = temp_db_path("usage-all-lifetime");
+        let db = Database::open(&db_path)?;
+        db.migrate()?;
+
+        let now = crate::db::now_ns();
+        let day_ns = 86_400 * 1_000_000_000;
+        let projector = Projector::new(&db);
+        projector.project(&usage_test_event("today", now, 100, 10))?;
+        projector.project(&usage_test_event("ten-days", now - 10 * day_ns, 200, 20))?;
+        projector.project(&usage_test_event("forty-days", now - 40 * day_ns, 300, 30))?;
+        rollup::refresh_all(&db)?;
+
+        let seven_days = load_usage(
+            &db_path,
+            UsageFilters::from_query(UsageQuery {
+                preset: Some("7d".to_string()),
+                range: None,
+                from: None,
+                to: None,
+                grain: Some("auto".to_string()),
+                profile_id: None,
+                device_id: None,
+                source: None,
+                model: None,
+            }),
+        )?;
+        let thirty_days = load_usage(
+            &db_path,
+            UsageFilters::from_query(UsageQuery {
+                preset: Some("30d".to_string()),
+                range: None,
+                from: None,
+                to: None,
+                grain: Some("auto".to_string()),
+                profile_id: None,
+                device_id: None,
+                source: None,
+                model: None,
+            }),
+        )?;
+        let all = load_usage(&db_path, UsageFilters::all())?;
+
+        assert_eq!(seven_days.summary.input_tokens, 100);
+        assert_eq!(thirty_days.summary.input_tokens, 300);
+        assert_eq!(all.summary.input_tokens, 600);
+        assert_eq!(seven_days.buckets.len(), 1);
+        assert_eq!(thirty_days.buckets.len(), 2);
+        assert!(
+            all.buckets.len() >= 2,
+            "all keeps the older month instead of collapsing to 30d"
+        );
 
         let _ = fs::remove_file(db_path);
         Ok(())
@@ -4832,6 +5103,87 @@ mod tests {
         assert_eq!(trend_tokens, 33);
 
         let _ = fs::remove_file(db_path);
+        Ok(())
+    }
+
+    #[test]
+    fn menubar_defaults_to_current_profile() -> Result<()> {
+        let db_path = temp_db_path("menubar-default-current-profile");
+        let db = Database::open(&db_path)?;
+        db.migrate()?;
+
+        let timestamp_ns = crate::db::now_ns();
+        let mut profile_a = usage_test_event("default-all-a", timestamp_ns, 70, 7);
+        profile_a.profile_id = "profile_a".to_string();
+        profile_a.device_id = "device_1".to_string();
+        let mut profile_b = usage_test_event("default-all-b", timestamp_ns + 1, 30, 3);
+        profile_b.profile_id = "profile_b".to_string();
+        profile_b.device_id = "device_1".to_string();
+
+        let projector = Projector::new(&db);
+        projector.project(&profile_a)?;
+        projector.project(&profile_b)?;
+        rollup::refresh_all(&db)?;
+
+        let menubar = load_menubar(
+            &db_path,
+            MenubarQuery {
+                range: None,
+                profile_id: None,
+            },
+            SyncStatus::default(),
+            &test_identity("profile_a"),
+        )?;
+
+        let trend_tokens = menubar
+            .trend
+            .iter()
+            .map(|bucket| bucket.input_tokens)
+            .sum::<i64>();
+        assert_eq!(menubar.current_profile_id, "profile_a");
+        assert_eq!(menubar.summary.input_tokens, 70);
+        assert_eq!(trend_tokens, 70);
+
+        let _ = fs::remove_file(db_path);
+        Ok(())
+    }
+
+    #[test]
+    fn workspace_status_reports_shared_workspace_after_repair() -> Result<()> {
+        let root =
+            std::env::temp_dir().join(format!("shirabe-server-workspace-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let workspace_dir = root.join("workspace");
+        let workspace_report = workspace::prepare(Some(workspace_dir.clone()))?;
+        let db = Database::open(&workspace_report.catalog_db)?;
+        db.migrate()?;
+
+        let identity = test_identity("profile_shared");
+        let state = AppState {
+            db_path: workspace_report.catalog_db.clone(),
+            ui_dir: root.join("ui"),
+            source_paths: test_source_paths(&root),
+            identity: identity.clone(),
+            sync: Mutex::new(SyncStatus::default()),
+        };
+
+        let repaired = repair_workspace_inner(&state)?;
+        assert_eq!(repaired.status, "ok");
+        assert_eq!(repaired.mode, "shared");
+        assert_eq!(repaired.workspace_dir, workspace_dir.display().to_string());
+        assert_eq!(repaired.current_profile_id, "profile_shared");
+        assert_eq!(repaired.current_profile_label, "profile_shared");
+        assert_eq!(repaired.profile_count, 1);
+        assert!(repaired.writable);
+        assert!(!repaired.restart_required);
+        assert!(repaired.issue.is_none());
+
+        let status = load_workspace_status(&workspace_report.catalog_db, &identity, false)?;
+        assert_eq!(status.mode, "shared");
+        assert_eq!(status.profile_count, 1);
+        assert_eq!(status.current_device_id, "device_1");
+
+        let _ = fs::remove_dir_all(root);
         Ok(())
     }
 
@@ -5083,6 +5435,15 @@ mod tests {
             profile_label: profile_id.to_string(),
             macos_uid: None,
             macos_username: profile_id.to_string(),
+        }
+    }
+
+    fn test_source_paths(root: &std::path::Path) -> SourcePaths {
+        SourcePaths {
+            codex: root.join("codex"),
+            pi: root.join("pi"),
+            claude: root.join("claude"),
+            kanade: root.join("kanade"),
         }
     }
 

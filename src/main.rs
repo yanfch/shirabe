@@ -27,9 +27,7 @@ async fn main() -> Result<()> {
     match cli.command {
         Commands::Init => {
             ensure_not_shared_workspace_direct_write(&paths, "init")?;
-            let database = Database::open(&paths.catalog_db)?;
-            database.migrate()?;
-            database.register_identity(&paths.identity)?;
+            let (_database, _adopted_legacy_profile) = open_registered_database(&paths)?;
             println!("initialized {}", paths.data_dir.display());
             println!("config {}", paths.config_dir.display());
             println!("catalog {}", paths.catalog_db.display());
@@ -39,10 +37,13 @@ async fn main() -> Result<()> {
             ui_dir,
             exit_when_parent_exits,
         } => {
-            let database = Database::open(&paths.catalog_db)?;
-            database.migrate()?;
-            database.register_identity(&paths.identity)?;
-            if let Some(report) = rollup::refresh_if_missing(&database)? {
+            let (database, adopted_legacy_profile) = open_registered_database(&paths)?;
+            let rollup_report = if adopted_legacy_profile {
+                Some(rollup::refresh_all(&database)?)
+            } else {
+                rollup::refresh_if_missing(&database)?
+            };
+            if let Some(report) = rollup_report {
                 tracing::info!(
                     source_rollups = report.source_rollups,
                     model_rollups = report.model_rollups,
@@ -64,9 +65,7 @@ async fn main() -> Result<()> {
         }
         Commands::Import { source, path } => {
             ensure_not_shared_workspace_direct_write(&paths, "import")?;
-            let database = Database::open(&paths.catalog_db)?;
-            database.migrate()?;
-            database.register_identity(&paths.identity)?;
+            let (database, _adopted_legacy_profile) = open_registered_database(&paths)?;
             let import_identity = importers::ImportIdentity::new(
                 paths.identity.profile_id.clone(),
                 paths.identity.device_id.clone(),
@@ -109,9 +108,7 @@ async fn main() -> Result<()> {
         }
         Commands::Pricing { command } => {
             ensure_not_shared_workspace_direct_write(&paths, "pricing refresh")?;
-            let database = Database::open(&paths.catalog_db)?;
-            database.migrate()?;
-            database.register_identity(&paths.identity)?;
+            let (database, _adopted_legacy_profile) = open_registered_database(&paths)?;
             let report = match command {
                 PricingCommand::Refresh { url } => {
                     pricing::refresh_litellm_pricing(
@@ -125,9 +122,7 @@ async fn main() -> Result<()> {
         }
         Commands::Rollup { command } => {
             ensure_not_shared_workspace_direct_write(&paths, "rollup refresh")?;
-            let database = Database::open(&paths.catalog_db)?;
-            database.migrate()?;
-            database.register_identity(&paths.identity)?;
+            let (database, _adopted_legacy_profile) = open_registered_database(&paths)?;
             let report = match command {
                 RollupCommand::Refresh => rollup::refresh_all(&database)?,
             };
@@ -142,11 +137,30 @@ async fn main() -> Result<()> {
             let shared_db = Database::open(&shared_paths.catalog_db)?;
             shared_db.migrate()?;
             shared_db.register_identity(&shared_paths.identity)?;
+            let mut pricing_changed = workspace::seed_pricing_cache(&shared_db, &paths.catalog_db)?;
+            if !pricing_changed {
+                pricing_changed = workspace::seed_pricing_cache_from_default_local(&shared_db)?;
+            }
+            if pricing_changed {
+                rollup::refresh_all(&shared_db)?;
+            }
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
     }
 
     Ok(())
+}
+
+fn open_registered_database(paths: &Paths) -> Result<(Database, bool)> {
+    let database = Database::open(&paths.catalog_db)?;
+    database.migrate()?;
+    database.register_identity(&paths.identity)?;
+    let adopted_legacy_profile = if is_shared_workspace_dir(&paths.data_dir) {
+        false
+    } else {
+        database.adopt_legacy_local_profile(&paths.identity)?
+    };
+    Ok((database, adopted_legacy_profile))
 }
 
 fn ensure_not_shared_workspace_direct_write(paths: &Paths, action: &str) -> Result<()> {

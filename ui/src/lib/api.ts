@@ -1,4 +1,4 @@
-import type { MenubarUsage, Overview, RunDetail, SessionDetail, SessionList, SyncStatus, Usage, UsageFilters } from "./types";
+import type { MenubarUsage, Overview, RunDetail, SessionDetail, SessionList, SyncStatus, Usage, UsageFilters, WorkspaceStatus } from "./types";
 
 async function fetchJson<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, init);
@@ -48,6 +48,14 @@ export function fetchSessionDetail(sessionId: string) {
 
 export function fetchSyncStatus() {
   return fetchJson<SyncStatus>("/api/sync/status");
+}
+
+export function fetchWorkspaceStatus() {
+  return fetchJson<WorkspaceStatus>("/api/workspace");
+}
+
+export function repairWorkspace() {
+  return fetchJson<WorkspaceStatus>("/api/workspace/repair", { method: "POST" });
 }
 
 export function startSync() {
