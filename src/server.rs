@@ -1523,7 +1523,7 @@ fn load_sessions(db_path: &PathBuf) -> Result<SessionListResponse> {
 }
 
 fn load_workspace_status(
-    db_path: &PathBuf,
+    db_path: &FsPath,
     identity: &Identity,
     restart_required: bool,
 ) -> Result<WorkspaceStatusResponse> {

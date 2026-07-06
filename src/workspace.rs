@@ -133,13 +133,12 @@ pub fn seed_pricing_cache(db: &Database, source_catalog: &Path) -> Result<bool> 
         return Ok(false);
     }
 
-    if let (Ok(source), Ok(target)) = (
+    match (
         fs::canonicalize(source_catalog),
         fs::canonicalize(db.path()),
     ) {
-        if source == target {
-            return Ok(false);
-        }
+        (Ok(source), Ok(target)) if source == target => return Ok(false),
+        _ => {}
     }
 
     let source = Connection::open_with_flags(source_catalog, OpenFlags::SQLITE_OPEN_READ_ONLY)
@@ -748,12 +747,13 @@ mod tests {
     }
 
     fn write_codex_session(path: &std::path::Path, input_tokens: i64) -> Result<()> {
+        let event_msg = format!(
+            r#"{{"timestamp":"2026-01-01T00:00:01.000Z","type":"event_msg","payload":{{"type":"token_count","info":{{"last_token_usage":{{"input_tokens":{input_tokens},"cached_input_tokens":0,"output_tokens":10,"reasoning_output_tokens":0,"total_tokens":110}},"model_context_window":1000}}}}}}"#
+        );
         let content = format!(
             "{}\n{}\n",
             r#"{"timestamp":"2026-01-01T00:00:00.000Z","type":"session_meta","payload":{"id":"same-session","cwd":"/tmp/project","model":"gpt-test","model_provider":"openai"}}"#,
-            format!(
-                r#"{{"timestamp":"2026-01-01T00:00:01.000Z","type":"event_msg","payload":{{"type":"token_count","info":{{"last_token_usage":{{"input_tokens":{input_tokens},"cached_input_tokens":0,"output_tokens":10,"reasoning_output_tokens":0,"total_tokens":110}},"model_context_window":1000}}}}}}"#
-            )
+            event_msg
         );
         std::fs::write(path, content)?;
         Ok(())
