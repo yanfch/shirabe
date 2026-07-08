@@ -207,12 +207,7 @@ fn default_pi_sessions_dir() -> PathBuf {
             env::var_os("PI_DIR").map(|root| PathBuf::from(root).join("agent").join("sessions"))
         })
         .or_else(|| {
-            env::var_os("HOME").map(|home| {
-                PathBuf::from(home)
-                    .join(".pi")
-                    .join("agent")
-                    .join("sessions")
-            })
+            crate::config::home_dir().map(|home| home.join(".pi").join("agent").join("sessions"))
         })
         .unwrap_or_else(|| PathBuf::from(".pi").join("agent").join("sessions"))
 }

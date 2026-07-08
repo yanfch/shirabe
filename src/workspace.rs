@@ -1,8 +1,9 @@
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::{
     collections::{HashMap, HashSet},
-    env, fs,
+    fs,
     io::{BufRead, BufReader, BufWriter},
-    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
 };
 
@@ -12,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::{
-    config::{Identity, SourcePaths},
+    config::{Identity, SourcePaths, home_dir},
     db::{Database, now_ns, stable_hash},
     importers::{self, ImportIdentity, ImportReport},
     projection::{
@@ -67,8 +68,18 @@ struct WorkspaceProfile {
     updated_at_ns: i64,
 }
 
+#[cfg(not(windows))]
 pub fn default_shared_workspace_dir() -> PathBuf {
     PathBuf::from("/Users/Shared/Shirabe")
+}
+
+#[cfg(windows)]
+pub fn default_shared_workspace_dir() -> PathBuf {
+    std::env::var_os("PROGRAMDATA")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"))
+        .join("Shirabe")
 }
 
 pub fn prepare(path: Option<PathBuf>) -> Result<WorkspaceReport> {
@@ -122,10 +133,25 @@ pub fn prepare(path: Option<PathBuf>) -> Result<WorkspaceReport> {
 }
 
 pub fn seed_pricing_cache_from_default_local(db: &Database) -> Result<bool> {
-    let Some(home) = env::var_os("HOME") else {
+    #[cfg(windows)]
+    {
+        if let Some(app_data) = std::env::var_os("LOCALAPPDATA")
+            .filter(|value| !value.is_empty())
+            .or_else(|| std::env::var_os("APPDATA").filter(|value| !value.is_empty()))
+        {
+            return seed_pricing_cache(
+                db,
+                &PathBuf::from(app_data)
+                    .join("Shirabe")
+                    .join("catalog.sqlite"),
+            );
+        }
+    }
+
+    let Some(home) = home_dir() else {
         return Ok(false);
     };
-    seed_pricing_cache(db, &PathBuf::from(home).join(".shirabe/catalog.sqlite"))
+    seed_pricing_cache(db, &home.join(".shirabe").join("catalog.sqlite"))
 }
 
 pub fn seed_pricing_cache(db: &Database, source_catalog: &Path) -> Result<bool> {
@@ -551,6 +577,7 @@ fn sqlite_table_exists(conn: &Connection, table: &str) -> Result<bool> {
     Ok(count > 0)
 }
 
+#[cfg(unix)]
 fn chmod_best_effort(path: &Path, mode: u32) -> Result<()> {
     let mut permissions = fs::metadata(path)
         .with_context(|| format!("stat {}", path.display()))?
@@ -566,6 +593,12 @@ fn chmod_best_effort(path: &Path, mode: u32) -> Result<()> {
             )
         }),
     }
+}
+
+#[cfg(not(unix))]
+fn chmod_best_effort(path: &Path, _mode: u32) -> Result<()> {
+    fs::metadata(path).with_context(|| format!("stat {}", path.display()))?;
+    Ok(())
 }
 
 #[cfg(test)]

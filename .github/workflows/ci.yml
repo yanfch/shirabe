@@ -37,6 +37,23 @@ jobs:
       - name: Check whitespace
         run: git diff --check
 
+  windows:
+    name: Windows CLI/server
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Check
+        run: cargo check --all-targets --all-features
+
+      - name: Test
+        run: cargo test --all-targets --all-features
+
   ui:
     name: UI
     runs-on: ubuntu-latest

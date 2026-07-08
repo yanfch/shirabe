@@ -1,7 +1,8 @@
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::{
     collections::{HashMap, HashSet},
     fs,
-    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -965,6 +966,7 @@ impl Database {
     }
 }
 
+#[cfg(unix)]
 fn set_shared_sqlite_modes(path: &Path) {
     if !path.starts_with(Path::new("/Users/Shared/Shirabe")) {
         return;
@@ -983,6 +985,9 @@ fn set_shared_sqlite_modes(path: &Path) {
         let _ = fs::set_permissions(&candidate, permissions);
     }
 }
+
+#[cfg(not(unix))]
+fn set_shared_sqlite_modes(_path: &Path) {}
 
 impl BatchTransaction<'_> {
     pub fn commit(mut self) -> Result<()> {

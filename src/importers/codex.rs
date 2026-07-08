@@ -188,9 +188,7 @@ fn import_with_modified_since(
 fn default_codex_sessions_dir() -> PathBuf {
     env::var_os("CODEX_SESSIONS_DIR")
         .map(PathBuf::from)
-        .or_else(|| {
-            env::var_os("HOME").map(|home| PathBuf::from(home).join(".codex").join("sessions"))
-        })
+        .or_else(|| crate::config::home_dir().map(|home| home.join(".codex").join("sessions")))
         .unwrap_or_else(|| PathBuf::from(".codex").join("sessions"))
 }
 

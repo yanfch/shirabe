@@ -188,9 +188,7 @@ fn default_claude_projects_dir() -> PathBuf {
     env::var_os("CLAUDE_PROJECTS_DIR")
         .map(PathBuf::from)
         .or_else(|| env::var_os("CLAUDE_DIR").map(|root| PathBuf::from(root).join("projects")))
-        .or_else(|| {
-            env::var_os("HOME").map(|home| PathBuf::from(home).join(".claude").join("projects"))
-        })
+        .or_else(|| crate::config::home_dir().map(|home| home.join(".claude").join("projects")))
         .unwrap_or_else(|| PathBuf::from(".claude").join("projects"))
 }
 

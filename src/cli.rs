@@ -44,7 +44,7 @@ pub enum Commands {
         path: Option<PathBuf>,
     },
 
-    /// Collect current-account events into the shared workspace inbox.
+    /// Collect current-account events into a shared workspace inbox.
     Collect {
         /// Shared workspace directory.
         #[arg(long)]
@@ -63,7 +63,7 @@ pub enum Commands {
         command: RollupCommand,
     },
 
-    /// Manage the local shared Mac workspace.
+    /// Manage the local shared workspace.
     Workspace {
         #[command(subcommand)]
         command: WorkspaceCommand,
@@ -96,7 +96,7 @@ pub enum RollupCommand {
 
 #[derive(Debug, Subcommand)]
 pub enum WorkspaceCommand {
-    /// Create or repair /Users/Shared/Shirabe for multi-account local use.
+    /// Create or repair the default shared workspace for multi-account local use.
     Init {
         /// Shared workspace directory.
         #[arg(long)]

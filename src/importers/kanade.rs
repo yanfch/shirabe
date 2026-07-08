@@ -187,9 +187,7 @@ fn default_kanade_traces_dir() -> PathBuf {
     env::var_os("KANADE_TRACES_DIR")
         .map(PathBuf::from)
         .or_else(|| env::var_os("KANADE_DIR").map(|root| PathBuf::from(root).join("traces")))
-        .or_else(|| {
-            env::var_os("HOME").map(|home| PathBuf::from(home).join(".kanade").join("traces"))
-        })
+        .or_else(|| crate::config::home_dir().map(|home| home.join(".kanade").join("traces")))
         .unwrap_or_else(|| PathBuf::from(".kanade").join("traces"))
 }
 

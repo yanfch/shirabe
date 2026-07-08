@@ -1,11 +1,12 @@
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::{
     collections::HashMap,
     fs::{self, File, OpenOptions},
     io::Write,
     net::SocketAddr,
-    os::unix::fs::PermissionsExt,
     path::{Path as FsPath, PathBuf},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
@@ -133,6 +134,7 @@ fn acquire_server_lock_if_shared(db_path: &FsPath) -> Result<Option<ServerLock>>
     }))
 }
 
+#[cfg(unix)]
 fn set_shared_file_mode(path: &FsPath) -> Result<()> {
     let mut permissions = fs::metadata(path)
         .with_context(|| format!("stat {}", path.display()))?
@@ -143,6 +145,12 @@ fn set_shared_file_mode(path: &FsPath) -> Result<()> {
         Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => Ok(()),
         Err(error) => Err(error).with_context(|| format!("set permissions on {}", path.display())),
     }
+}
+
+#[cfg(not(unix))]
+fn set_shared_file_mode(path: &FsPath) -> Result<()> {
+    fs::metadata(path).with_context(|| format!("stat {}", path.display()))?;
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -1732,7 +1740,10 @@ fn shared_workspace_dir(db_path: &FsPath) -> Option<&FsPath> {
 }
 
 fn is_shared_workspace(path: &FsPath) -> bool {
-    path.join("workspace.json").exists() || path.starts_with(FsPath::new("/Users/Shared/Shirabe"))
+    let default_workspace = workspace::default_shared_workspace_dir();
+    path.join("workspace.json").exists()
+        || path.starts_with(FsPath::new("/Users/Shared/Shirabe"))
+        || path.starts_with(default_workspace)
 }
 
 fn set_sync_phase(state: &AppState, phase: &str) {
