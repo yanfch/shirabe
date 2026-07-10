@@ -68,18 +68,8 @@ struct WorkspaceProfile {
     updated_at_ns: i64,
 }
 
-#[cfg(not(windows))]
 pub fn default_shared_workspace_dir() -> PathBuf {
-    PathBuf::from("/Users/Shared/Shirabe")
-}
-
-#[cfg(windows)]
-pub fn default_shared_workspace_dir() -> PathBuf {
-    std::env::var_os("PROGRAMDATA")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"))
-        .join("Shirabe")
+    crate::config::default_shared_workspace_dir()
 }
 
 pub fn prepare(path: Option<PathBuf>) -> Result<WorkspaceReport> {

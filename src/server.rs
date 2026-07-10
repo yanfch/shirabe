@@ -26,10 +26,10 @@ use tokio::{net::TcpListener, time};
 use tower_http::{services::ServeDir, trace::TraceLayer};
 
 use crate::{
-    config::{Identity, SourcePaths},
+    config::{Identity, SourcePaths, is_shared_workspace_dir},
     db::Database,
     importers::{self, ImportIdentity},
-    rollup, workspace,
+    pricing, rollup, workspace,
 };
 
 const AUTO_SYNC_INTERVAL: Duration = Duration::from_secs(5 * 60);
@@ -285,8 +285,8 @@ fn try_start_sync_job(state: Arc<AppState>) -> Option<SyncStatus> {
 fn spawn_auto_sync(state: Arc<AppState>) {
     tokio::spawn(async move {
         loop {
-            time::sleep(AUTO_SYNC_INTERVAL).await;
             let _ = try_start_sync_job(state.clone());
+            time::sleep(AUTO_SYNC_INTERVAL).await;
         }
     });
 }
@@ -1703,6 +1703,26 @@ fn run_sync_job_inner(state: &Arc<AppState>) -> Result<()> {
         }
     }
 
+    set_sync_phase(state, "refresh pricing");
+    match pricing::refresh_litellm_pricing_if_stale(
+        &db,
+        pricing::LITELLM_PRICING_URL,
+        pricing::PRICING_REFRESH_INTERVAL,
+    ) {
+        Ok(Some(report)) => {
+            pricing_changed = true;
+            tracing::info!(
+                models = report.model_count,
+                aliases = report.alias_count,
+                "refreshed model pricing"
+            );
+        }
+        Ok(None) => {}
+        Err(error) => {
+            tracing::warn!(error = %format!("{error:#}"), "model pricing refresh failed; continuing usage sync");
+        }
+    }
+
     for source in ["codex", "pi", "claude", "kanade"] {
         set_sync_phase(state, &format!("import {source}"));
         let report = import_sync_source(&db, source, &state.source_paths, &state.identity);
@@ -1740,10 +1760,7 @@ fn shared_workspace_dir(db_path: &FsPath) -> Option<&FsPath> {
 }
 
 fn is_shared_workspace(path: &FsPath) -> bool {
-    let default_workspace = workspace::default_shared_workspace_dir();
-    path.join("workspace.json").exists()
-        || path.starts_with(FsPath::new("/Users/Shared/Shirabe"))
-        || path.starts_with(default_workspace)
+    is_shared_workspace_dir(path)
 }
 
 fn set_sync_phase(state: &AppState, phase: &str) {

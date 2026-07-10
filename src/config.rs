@@ -262,8 +262,19 @@ fn config_dir_for_data_dir(data_dir: &Path) -> Result<PathBuf> {
 }
 
 pub fn is_shared_workspace_dir(data_dir: &Path) -> bool {
-    data_dir.join("workspace.json").exists()
-        || data_dir.starts_with(Path::new("/Users/Shared/Shirabe"))
+    data_dir.join("workspace.json").exists() || data_dir.starts_with(default_shared_workspace_dir())
+}
+
+#[cfg(not(windows))]
+pub fn default_shared_workspace_dir() -> PathBuf {
+    PathBuf::from("/Users/Shared/Shirabe")
+}
+
+#[cfg(windows)]
+pub fn default_shared_workspace_dir() -> PathBuf {
+    env_path("PROGRAMDATA")
+        .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"))
+        .join("Shirabe")
 }
 
 fn expand_tilde(path: PathBuf) -> Result<PathBuf> {
@@ -421,7 +432,7 @@ fn parse_platform_uuid(output: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_platform_uuid;
+    use super::{default_shared_workspace_dir, is_shared_workspace_dir, parse_platform_uuid};
 
     #[test]
     fn parses_ioreg_platform_uuid() {
@@ -430,5 +441,10 @@ mod tests {
             parse_platform_uuid(output),
             Some("ABCDEF12-3456-7890-ABCD-EF1234567890".to_string())
         );
+    }
+
+    #[test]
+    fn recognizes_default_shared_workspace() {
+        assert!(is_shared_workspace_dir(&default_shared_workspace_dir()));
     }
 }
