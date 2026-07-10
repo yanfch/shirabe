@@ -67,15 +67,12 @@ impl Identity {
         let mut changed = false;
         let mut identity = config.identity.unwrap_or_default();
 
-        let macos_username = env::var("USER")
-            .or_else(|_| env::var("LOGNAME"))
-            .unwrap_or_else(|_| "local".to_string());
+        let macos_username = current_username();
         let macos_uid = env::var("SHIRABE_MACOS_UID").ok().or_else(current_uid);
         let device_label = env::var("SHIRABE_DEVICE_LABEL")
             .ok()
-            .or_else(current_computer_name)
-            .or_else(|| env::var("HOSTNAME").ok())
-            .unwrap_or_else(|| "This Mac".to_string());
+            .or_else(current_device_label)
+            .unwrap_or_else(|| "This device".to_string());
         let profile_label = env::var("SHIRABE_PROFILE_LABEL")
             .ok()
             .unwrap_or_else(|| macos_username.clone());
@@ -235,12 +232,20 @@ impl ConfigFile {
 }
 
 fn default_data_dir() -> PathBuf {
-    env::var_os("SHIRABE_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            let home = env::var_os("HOME").unwrap_or_else(|| ".".into());
-            PathBuf::from(home).join(".shirabe")
-        })
+    if let Some(data_dir) = env_path("SHIRABE_DIR") {
+        return data_dir;
+    }
+
+    #[cfg(windows)]
+    {
+        if let Some(app_data) = env_path("LOCALAPPDATA").or_else(|| env_path("APPDATA")) {
+            return app_data.join("Shirabe");
+        }
+    }
+
+    home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".shirabe")
 }
 
 fn config_dir_for_data_dir(data_dir: &Path) -> Result<PathBuf> {
@@ -249,28 +254,38 @@ fn config_dir_for_data_dir(data_dir: &Path) -> Result<PathBuf> {
     }
 
     if is_shared_workspace_dir(data_dir) {
-        let home = env::var_os("HOME").context("HOME is not set")?;
-        return Ok(PathBuf::from(home).join(".shirabe"));
+        let home = home_dir().context("home directory is not set")?;
+        return Ok(home.join(".shirabe"));
     }
 
     Ok(data_dir.to_path_buf())
 }
 
 pub fn is_shared_workspace_dir(data_dir: &Path) -> bool {
-    data_dir.join("workspace.json").exists()
-        || data_dir.starts_with(Path::new("/Users/Shared/Shirabe"))
+    data_dir.join("workspace.json").exists() || data_dir.starts_with(default_shared_workspace_dir())
+}
+
+#[cfg(not(windows))]
+pub fn default_shared_workspace_dir() -> PathBuf {
+    PathBuf::from("/Users/Shared/Shirabe")
+}
+
+#[cfg(windows)]
+pub fn default_shared_workspace_dir() -> PathBuf {
+    env_path("PROGRAMDATA")
+        .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"))
+        .join("Shirabe")
 }
 
 fn expand_tilde(path: PathBuf) -> Result<PathBuf> {
     let raw = path.to_string_lossy();
     if raw == "~" {
-        let home = env::var_os("HOME").context("HOME is not set")?;
-        return Ok(PathBuf::from(home));
+        return home_dir().context("home directory is not set");
     }
 
     if let Some(rest) = raw.strip_prefix("~/") {
-        let home = env::var_os("HOME").context("HOME is not set")?;
-        return Ok(Path::new(&home).join(rest));
+        let home = home_dir().context("home directory is not set")?;
+        return Ok(home.join(rest));
     }
 
     Ok(path)
@@ -298,11 +313,31 @@ fn configured_path(
         }
     }
 
-    if let Some(home) = env::var_os("HOME") {
-        return Ok(join_segments(PathBuf::from(home), home_suffix));
+    if let Some(home) = home_dir() {
+        return Ok(join_segments(home, home_suffix));
     }
 
     Ok(join_segments(PathBuf::new(), home_suffix))
+}
+
+pub fn home_dir() -> Option<PathBuf> {
+    env_path("HOME")
+        .or_else(|| env_path("USERPROFILE"))
+        .or_else(|| {
+            let drive = env::var_os("HOMEDRIVE")?;
+            let path = env::var_os("HOMEPATH")?;
+            Some(PathBuf::from(format!(
+                "{}{}",
+                drive.to_string_lossy(),
+                path.to_string_lossy()
+            )))
+        })
+}
+
+fn env_path(name: &str) -> Option<PathBuf> {
+    env::var_os(name)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
 }
 
 fn join_segments(mut path: PathBuf, segments: &[&str]) -> PathBuf {
@@ -327,20 +362,32 @@ fn current_uid() -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-fn current_computer_name() -> Option<String> {
-    Command::new("scutil")
-        .args(["--get", "ComputerName"])
-        .output()
+fn current_username() -> String {
+    env::var("USER")
+        .or_else(|_| env::var("LOGNAME"))
+        .or_else(|_| env::var("USERNAME"))
+        .unwrap_or_else(|_| "local".to_string())
+}
+
+fn current_device_label() -> Option<String> {
+    env::var("COMPUTERNAME")
         .ok()
-        .filter(|output| output.status.success())
-        .and_then(|output| String::from_utf8(output.stdout).ok())
-        .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+        .or_else(|| env::var("HOSTNAME").ok().filter(|value| !value.is_empty()))
+        .or_else(|| command_output("scutil", &["--get", "ComputerName"]))
+        .or_else(|| command_output("hostname", &[]))
 }
 
 fn current_machine_identifier_seed() -> Option<String> {
     current_platform_uuid()
         .map(|uuid| format!("macos-platform-uuid:{uuid}"))
+        .or_else(|| {
+            env::var("COMPUTERNAME")
+                .ok()
+                .filter(|value| !value.is_empty())
+                .map(|value| format!("windows-computer-name:{value}"))
+        })
+        .or_else(|| command_output("hostname", &[]).map(|value| format!("hostname:{value}")))
         .or_else(|| {
             Command::new("scutil")
                 .args(["--get", "LocalHostName"])
@@ -351,6 +398,17 @@ fn current_machine_identifier_seed() -> Option<String> {
                 .map(|value| format!("macos-local-hostname:{}", value.trim()))
                 .filter(|value| !value.ends_with(':'))
         })
+}
+
+fn command_output(program: &str, args: &[&str]) -> Option<String> {
+    Command::new(program)
+        .args(args)
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 fn current_platform_uuid() -> Option<String> {
@@ -374,7 +432,7 @@ fn parse_platform_uuid(output: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_platform_uuid;
+    use super::{default_shared_workspace_dir, is_shared_workspace_dir, parse_platform_uuid};
 
     #[test]
     fn parses_ioreg_platform_uuid() {
@@ -383,5 +441,10 @@ mod tests {
             parse_platform_uuid(output),
             Some("ABCDEF12-3456-7890-ABCD-EF1234567890".to_string())
         );
+    }
+
+    #[test]
+    fn recognizes_default_shared_workspace() {
+        assert!(is_shared_workspace_dir(&default_shared_workspace_dir()));
     }
 }

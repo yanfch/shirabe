@@ -84,3 +84,10 @@ SHIRABE_PI_DIR=/path/to/.pi
 SHIRABE_CLAUDE_DIR=/path/to/.claude
 SHIRABE_KANADE_DIR=/path/to/.kanade
 ```
+
+## Pricing Refresh
+
+The server checks pricing on startup, during each automatic five-minute sync,
+and on each manual sync. It downloads the public LiteLLM pricing snapshot when
+the cache is missing or more than 24 hours old. A pricing download failure does
+not block local usage imports; the next sync retries it.

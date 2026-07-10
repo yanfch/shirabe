@@ -1,9 +1,10 @@
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::{
     collections::{HashMap, HashSet},
     fs,
-    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result};
@@ -44,6 +45,7 @@ impl Database {
 
         let conn =
             Connection::open(path).with_context(|| format!("open sqlite {}", path.display()))?;
+        conn.busy_timeout(Duration::from_secs(5))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
@@ -965,6 +967,7 @@ impl Database {
     }
 }
 
+#[cfg(unix)]
 fn set_shared_sqlite_modes(path: &Path) {
     if !path.starts_with(Path::new("/Users/Shared/Shirabe")) {
         return;
@@ -983,6 +986,9 @@ fn set_shared_sqlite_modes(path: &Path) {
         let _ = fs::set_permissions(&candidate, permissions);
     }
 }
+
+#[cfg(not(unix))]
+fn set_shared_sqlite_modes(_path: &Path) {}
 
 impl BatchTransaction<'_> {
     pub fn commit(mut self) -> Result<()> {

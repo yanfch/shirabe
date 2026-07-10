@@ -1,5 +1,7 @@
+use std::time::Duration;
+
 use anyhow::{Context, Result, bail};
-use rusqlite::params;
+use rusqlite::{OptionalExtension, params};
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 
@@ -7,6 +9,9 @@ use crate::db::{Database, now_ns, stable_hash};
 
 pub const LITELLM_PRICING_URL: &str =
     "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json";
+pub const PRICING_REFRESH_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+const PRICING_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+const PRICING_USER_AGENT: &str = concat!("shirabe/", env!("CARGO_PKG_VERSION"));
 
 #[derive(Debug, Serialize)]
 pub struct PricingRefreshReport {
@@ -23,7 +28,13 @@ pub async fn refresh_litellm_pricing(
     db: &Database,
     source_url: &str,
 ) -> Result<PricingRefreshReport> {
-    let raw_json = reqwest::get(source_url)
+    let raw_json = reqwest::Client::builder()
+        .timeout(PRICING_HTTP_TIMEOUT)
+        .user_agent(PRICING_USER_AGENT)
+        .build()
+        .context("build pricing HTTP client")?
+        .get(source_url)
+        .send()
         .await
         .with_context(|| format!("fetch pricing from {source_url}"))?
         .error_for_status()
@@ -33,6 +44,48 @@ pub async fn refresh_litellm_pricing(
         .context("read pricing response")?;
 
     cache_litellm_pricing(db, source_url, &raw_json)
+}
+
+pub fn refresh_litellm_pricing_if_stale(
+    db: &Database,
+    source_url: &str,
+    max_age: Duration,
+) -> Result<Option<PricingRefreshReport>> {
+    if !pricing_refresh_due(db, source_url, max_age)? {
+        return Ok(None);
+    }
+
+    let raw_json = reqwest::blocking::Client::builder()
+        .timeout(PRICING_HTTP_TIMEOUT)
+        .user_agent(PRICING_USER_AGENT)
+        .build()
+        .context("build pricing HTTP client")?
+        .get(source_url)
+        .send()
+        .with_context(|| format!("fetch pricing from {source_url}"))?
+        .error_for_status()
+        .with_context(|| format!("pricing source returned error for {source_url}"))?
+        .text()
+        .context("read pricing response")?;
+
+    cache_litellm_pricing(db, source_url, &raw_json).map(Some)
+}
+
+fn pricing_refresh_due(db: &Database, source_url: &str, max_age: Duration) -> Result<bool> {
+    let pricing_source_id = format!("litellm:{}", stable_hash(source_url));
+    let fetched_at_ns: Option<i64> = db
+        .connection()
+        .query_row(
+            "SELECT fetched_at_ns FROM pricing_sources WHERE pricing_source_id = ?1",
+            params![pricing_source_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(fetched_at_ns) = fetched_at_ns else {
+        return Ok(true);
+    };
+    let max_age_ns = max_age.as_nanos().min(i64::MAX as u128) as i64;
+    Ok(now_ns().saturating_sub(fetched_at_ns) >= max_age_ns)
 }
 
 fn cache_litellm_pricing(
@@ -49,6 +102,9 @@ fn cache_litellm_pricing(
     let pricing_source_id = format!("litellm:{}", stable_hash(source_url));
     let mut model_count = 0usize;
     let mut alias_count = 0usize;
+    let tx = db
+        .begin_batch()
+        .context("begin pricing cache transaction")?;
 
     db.connection().execute(
         "INSERT INTO pricing_sources (
@@ -139,6 +195,7 @@ fn cache_litellm_pricing(
         "UPDATE pricing_sources SET model_count = ?2 WHERE pricing_source_id = ?1",
         params![pricing_source_id, model_count.min(i64::MAX as usize) as i64],
     )?;
+    tx.commit().context("commit pricing cache transaction")?;
 
     Ok(PricingRefreshReport {
         status: "ok",
@@ -283,11 +340,18 @@ fn dedupe(values: Vec<String>) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use anyhow::Result;
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+        thread,
+        time::Duration,
+    };
+
+    use anyhow::{Context, Result};
 
     use crate::db::Database;
 
-    use super::cache_litellm_pricing;
+    use super::{cache_litellm_pricing, pricing_refresh_due, refresh_litellm_pricing_if_stale};
 
     #[test]
     fn caches_litellm_pricing() -> Result<()> {
@@ -368,6 +432,51 @@ mod tests {
             )?;
             assert_eq!(count, 1, "missing alias {model}");
         }
+
+        let _ = std::fs::remove_file(db_path);
+        Ok(())
+    }
+
+    #[test]
+    fn refreshes_stale_pricing_over_http() -> Result<()> {
+        let db_path = std::env::temp_dir().join(format!(
+            "shirabe-pricing-http-{}.sqlite",
+            std::process::id()
+        ));
+        let db = Database::open(&db_path)?;
+        db.migrate()?;
+
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let address = listener.local_addr()?;
+        let server = thread::spawn(move || -> Result<()> {
+            let (mut stream, _) = listener.accept()?;
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request)?;
+            let body = r#"{"gpt-test":{"input_cost_per_token":0.000001}}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )?;
+            Ok(())
+        });
+        let source_url = format!("http://{address}/pricing.json");
+
+        assert!(pricing_refresh_due(
+            &db,
+            &source_url,
+            Duration::from_secs(60)
+        )?);
+        let report = refresh_litellm_pricing_if_stale(&db, &source_url, Duration::from_secs(60))?
+            .context("pricing should refresh")?;
+        assert_eq!(report.model_count, 1);
+        assert!(!pricing_refresh_due(
+            &db,
+            &source_url,
+            Duration::from_secs(60)
+        )?);
+        server.join().expect("pricing test server panicked")?;
 
         let _ = std::fs::remove_file(db_path);
         Ok(())
