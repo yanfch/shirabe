@@ -165,24 +165,13 @@ pub fn seed_pricing_cache(db: &Database, source_catalog: &Path) -> Result<bool> 
         return Ok(false);
     }
 
-    let (source_count, source_updated_at): (i64, i64) = source.query_row(
-        "SELECT COUNT(*), COALESCE(MAX(updated_at_ns), 0) FROM model_prices",
-        [],
-        |row| Ok((row.get(0)?, row.get(1)?)),
-    )?;
+    let source_count: i64 =
+        source.query_row("SELECT COUNT(*) FROM model_prices", [], |row| row.get(0))?;
     if source_count == 0 {
         return Ok(false);
     }
 
     let target = db.connection();
-    let (target_count, target_updated_at): (i64, i64) = target.query_row(
-        "SELECT COUNT(*), COALESCE(MAX(updated_at_ns), 0) FROM model_prices",
-        [],
-        |row| Ok((row.get(0)?, row.get(1)?)),
-    )?;
-    if target_count >= source_count && target_updated_at >= source_updated_at {
-        return Ok(false);
-    }
 
     type PricingSourceRow = (String, String, i64, i64, String, Option<String>);
     type ModelPriceRow = (
@@ -235,10 +224,11 @@ pub fn seed_pricing_cache(db: &Database, source_catalog: &Path) -> Result<bool> 
         .collect::<rusqlite::Result<Vec<ModelPriceRow>>>()?;
 
     let tx = db.begin_batch()?;
+    let mut changed = false;
     for (pricing_source_id, source_url, fetched_at_ns, model_count, raw_json, metadata_json) in
         pricing_sources
     {
-        target.execute(
+        changed |= target.execute(
             "INSERT INTO pricing_sources (
                 pricing_source_id, source_url, fetched_at_ns, model_count, raw_json, metadata_json
              )
@@ -248,7 +238,8 @@ pub fn seed_pricing_cache(db: &Database, source_catalog: &Path) -> Result<bool> 
                 fetched_at_ns = excluded.fetched_at_ns,
                 model_count = excluded.model_count,
                 raw_json = excluded.raw_json,
-                metadata_json = excluded.metadata_json",
+                metadata_json = excluded.metadata_json
+             WHERE excluded.fetched_at_ns > pricing_sources.fetched_at_ns",
             params![
                 pricing_source_id,
                 source_url,
@@ -257,7 +248,7 @@ pub fn seed_pricing_cache(db: &Database, source_catalog: &Path) -> Result<bool> 
                 raw_json,
                 metadata_json
             ],
-        )?;
+        )? > 0;
     }
     for (
         model_name,
@@ -271,7 +262,7 @@ pub fn seed_pricing_cache(db: &Database, source_catalog: &Path) -> Result<bool> 
         metadata_json,
     ) in model_prices
     {
-        target.execute(
+        changed |= target.execute(
             "INSERT INTO model_prices (
                 model_name, source_id, provider, input_cost_per_token, output_cost_per_token,
                 cache_read_input_token_cost, cache_creation_input_token_cost, updated_at_ns, metadata_json
@@ -285,7 +276,8 @@ pub fn seed_pricing_cache(db: &Database, source_catalog: &Path) -> Result<bool> 
                 cache_read_input_token_cost = excluded.cache_read_input_token_cost,
                 cache_creation_input_token_cost = excluded.cache_creation_input_token_cost,
                 updated_at_ns = excluded.updated_at_ns,
-                metadata_json = excluded.metadata_json",
+                metadata_json = excluded.metadata_json
+             WHERE excluded.updated_at_ns > model_prices.updated_at_ns",
             params![
                 model_name,
                 source_id,
@@ -297,10 +289,10 @@ pub fn seed_pricing_cache(db: &Database, source_catalog: &Path) -> Result<bool> 
                 updated_at_ns,
                 metadata_json
             ],
-        )?;
+        )? > 0;
     }
     tx.commit()?;
-    Ok(true)
+    Ok(changed)
 }
 
 pub fn collect_to_inbox(
@@ -732,6 +724,42 @@ mod tests {
             |row| row.get(0),
         )?;
         assert_eq!(count, 1);
+
+        target_db.connection().execute(
+            "UPDATE pricing_sources SET fetched_at_ns = 20 WHERE pricing_source_id = 'source_1'",
+            [],
+        )?;
+        target_db.connection().execute(
+            "UPDATE model_prices
+             SET input_cost_per_token = 0.009, updated_at_ns = 20
+             WHERE model_name = 'gpt-test'",
+            [],
+        )?;
+        source_db.connection().execute(
+            "INSERT INTO model_prices (
+                model_name, source_id, provider, input_cost_per_token, output_cost_per_token,
+                cache_read_input_token_cost, cache_creation_input_token_cost, updated_at_ns, metadata_json
+             )
+             VALUES ('gpt-new', 'source_1', 'openai', 0.003, 0.004, NULL, NULL, 10, NULL)",
+            [],
+        )?;
+
+        assert!(seed_pricing_cache(&target_db, &source_path)?);
+        let (fetched_at_ns, test_price, test_updated_at, new_count): (i64, f64, i64, i64) =
+            target_db.connection().query_row(
+                "SELECT ps.fetched_at_ns, mp.input_cost_per_token, mp.updated_at_ns,
+                        (SELECT COUNT(*) FROM model_prices WHERE model_name = 'gpt-new')
+                 FROM pricing_sources ps
+                 JOIN model_prices mp ON mp.model_name = 'gpt-test'
+                 WHERE ps.pricing_source_id = 'source_1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )?;
+        assert_eq!(fetched_at_ns, 20);
+        assert_eq!(test_price, 0.009);
+        assert_eq!(test_updated_at, 20);
+        assert_eq!(new_count, 1);
+        assert!(!seed_pricing_cache(&target_db, &source_path)?);
 
         let _ = std::fs::remove_dir_all(root);
         Ok(())
