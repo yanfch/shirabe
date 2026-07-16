@@ -111,13 +111,18 @@ impl<'a> Projector<'a> {
         self.upsert_skill_events(event, &run_id, session_id.as_deref(), turn_id.as_deref())?;
 
         let llm_call_id = if event.operation.operation_type == OperationType::LlmCall {
-            let id = ids::event_scoped_id(
+            let proposed_id = ids::event_scoped_id(
                 &event.profile_id,
                 &event.source,
                 "llm",
                 event.source_event_id.as_deref(),
                 &run_id,
             );
+            let id = if event.source == "pi" {
+                self.resolve_event_identity(event, "llm", &proposed_id)?
+            } else {
+                proposed_id
+            };
             self.upsert_llm_call(
                 event,
                 &run_id,
@@ -158,13 +163,18 @@ impl<'a> Projector<'a> {
             None
         };
 
-        let step_id = ids::event_scoped_id(
+        let proposed_step_id = ids::event_scoped_id(
             &event.profile_id,
             &event.source,
             "step",
             event.source_event_id.as_deref(),
             &format!("{}:{}", run_id, event.operation.name),
         );
+        let step_id = if event.source == "pi" && llm_call_id.is_some() {
+            self.resolve_event_identity(event, "step", &proposed_step_id)?
+        } else {
+            proposed_step_id
+        };
         if store_call_steps || (llm_call_id.is_none() && tool_call_id.is_none()) {
             self.upsert_run_step(
                 event,
@@ -186,6 +196,38 @@ impl<'a> Projector<'a> {
             llm_call_id,
             tool_call_id,
         })
+    }
+
+    fn resolve_event_identity(
+        &self,
+        event: &NormalizedEvent,
+        kind: &str,
+        proposed_id: &str,
+    ) -> Result<String> {
+        let Some(source_event_id) = event.source_event_id.as_deref() else {
+            return Ok(proposed_id.to_string());
+        };
+        self.conn.execute(
+            "INSERT INTO event_identities (
+                profile_id, device_id, source, kind, source_event_id, entity_id
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(profile_id, source, kind, source_event_id) DO NOTHING",
+            params![
+                event.profile_id,
+                event.device_id,
+                event.source,
+                kind,
+                source_event_id,
+                proposed_id,
+            ],
+        )?;
+        Ok(self.conn.query_row(
+            "SELECT entity_id
+             FROM event_identities
+             WHERE profile_id = ?1 AND source = ?2 AND kind = ?3 AND source_event_id = ?4",
+            params![event.profile_id, event.source, kind, source_event_id],
+            |row| row.get(0),
+        )?)
     }
 
     pub fn refresh_run_summaries<'b, I>(&self, run_ids: I) -> Result<()>

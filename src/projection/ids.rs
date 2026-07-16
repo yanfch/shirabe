@@ -27,6 +27,10 @@ pub fn event_scoped_id(
     }
 }
 
+pub fn timestamped_source_event_id(kind: &str, external_id: &str, occurred_at_ns: i64) -> String {
+    format!("{kind}:{external_id}:{occurred_at_ns}")
+}
+
 fn scoped_id(profile_id: &str, source: &str, external_id: &str) -> String {
     if profile_id == "local" {
         format!("{source}:{external_id}")

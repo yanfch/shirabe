@@ -11,10 +11,11 @@ use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
 
-use crate::config::Identity;
+use crate::{config::Identity, projection::ids};
 
-pub const SCHEMA_VERSION: i64 = 6;
-const IMPORT_PARSER_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "+import-v2");
+pub const SCHEMA_VERSION: i64 = 7;
+const IMPORT_PARSER_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "+import-v3");
+const PI_LLM_EVENT_ID_MIGRATION: &str = "pi_llm_event_ids_v2";
 
 pub struct Database {
     path: PathBuf,
@@ -112,6 +113,7 @@ impl Database {
         for table in [
             "import_sources",
             "import_files",
+            "event_identities",
             "sessions",
             "runs",
             "turns",
@@ -197,6 +199,7 @@ impl Database {
         for table in [
             "import_sources",
             "import_files",
+            "event_identities",
             "sessions",
             "runs",
             "turns",
@@ -223,6 +226,251 @@ impl Database {
         self.clear_usage_rollups()?;
         tx.commit()?;
         Ok(true)
+    }
+
+    pub fn migrate_pi_llm_event_ids(&self) -> Result<usize> {
+        let already_migrated = self
+            .conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = ?1",
+                params![PI_LLM_EVENT_ID_MIGRATION],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .as_deref()
+            == Some("complete");
+        if already_migrated {
+            return Ok(0);
+        }
+
+        #[derive(Debug)]
+        struct LegacyPiCall {
+            old_llm_call_id: String,
+            old_step_id: String,
+            canonical_source_event_id: String,
+            profile_id: String,
+            device_id: String,
+            session_first_seen_ns: i64,
+        }
+
+        let rows = {
+            let mut statement = self.conn.prepare(
+                "SELECT
+                    l.llm_call_id,
+                    rs.step_id,
+                    rs.source_event_id,
+                    l.profile_id,
+                    l.device_id,
+                    l.started_at_ns,
+                    COALESCE(s.first_seen_ns, l.started_at_ns)
+                 FROM llm_calls l
+                 INNER JOIN run_steps rs ON rs.llm_call_id = l.llm_call_id
+                 LEFT JOIN sessions s ON s.session_id = l.session_id
+                 WHERE l.source = 'pi'
+                   AND rs.source = 'pi'
+                   AND rs.source_event_id IS NOT NULL",
+            )?;
+            statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, i64>(6)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+
+        let mut groups = HashMap::<String, Vec<LegacyPiCall>>::new();
+        for (
+            old_llm_call_id,
+            old_step_id,
+            source_event_id,
+            profile_id,
+            device_id,
+            started_at_ns,
+            session_first_seen_ns,
+        ) in rows
+        {
+            let canonical_source_event_id = if source_event_id.starts_with("entry:") {
+                source_event_id
+            } else if let Some((_, entry_id)) = source_event_id.rsplit_once(':') {
+                ids::timestamped_source_event_id("entry", entry_id, started_at_ns)
+            } else {
+                continue;
+            };
+            let canonical_group_id = ids::event_scoped_id(
+                &profile_id,
+                "pi",
+                "llm",
+                Some(&canonical_source_event_id),
+                &canonical_source_event_id,
+            );
+            groups
+                .entry(canonical_group_id)
+                .or_default()
+                .push(LegacyPiCall {
+                    old_llm_call_id,
+                    old_step_id,
+                    canonical_source_event_id,
+                    profile_id,
+                    device_id,
+                    session_first_seen_ns,
+                });
+        }
+
+        for calls in groups.values_mut() {
+            calls.sort_by(|left, right| {
+                left.session_first_seen_ns
+                    .cmp(&right.session_first_seen_ns)
+                    .then(left.old_llm_call_id.cmp(&right.old_llm_call_id))
+            });
+        }
+
+        let tx = self.begin_batch()?;
+        self.conn.execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS pi_llm_id_migration (
+                old_llm_call_id TEXT PRIMARY KEY,
+                old_step_id TEXT NOT NULL,
+                canonical_source_event_id TEXT NOT NULL,
+                keeper_llm_call_id TEXT NOT NULL,
+                keeper_step_id TEXT NOT NULL,
+                profile_id TEXT NOT NULL,
+                device_id TEXT NOT NULL,
+                is_keeper INTEGER NOT NULL
+             );
+             DELETE FROM pi_llm_id_migration;",
+        )?;
+        {
+            let mut insert_mapping = self.conn.prepare(
+                "INSERT INTO pi_llm_id_migration (
+                    old_llm_call_id, old_step_id, canonical_source_event_id,
+                    keeper_llm_call_id, keeper_step_id, profile_id, device_id, is_keeper
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            )?;
+            for calls in groups.values() {
+                let keeper = &calls[0];
+                for (index, call) in calls.iter().enumerate() {
+                    insert_mapping.execute(params![
+                        call.old_llm_call_id,
+                        call.old_step_id,
+                        call.canonical_source_event_id,
+                        keeper.old_llm_call_id,
+                        keeper.old_step_id,
+                        call.profile_id,
+                        call.device_id,
+                        i64::from(index == 0),
+                    ])?;
+                }
+            }
+        }
+        self.conn.execute_batch(
+            "UPDATE tool_calls
+             SET parent_llm_call_id = (
+                SELECT keeper_llm_call_id
+                FROM pi_llm_id_migration
+                WHERE old_llm_call_id = tool_calls.parent_llm_call_id
+             )
+             WHERE parent_llm_call_id IN (SELECT old_llm_call_id FROM pi_llm_id_migration);
+
+             UPDATE llm_calls
+             SET previous_llm_call_id = (
+                SELECT keeper_llm_call_id
+                FROM pi_llm_id_migration
+                WHERE old_llm_call_id = llm_calls.previous_llm_call_id
+             )
+             WHERE previous_llm_call_id IN (SELECT old_llm_call_id FROM pi_llm_id_migration);
+
+             UPDATE llm_calls
+             SET next_llm_call_id = (
+                SELECT keeper_llm_call_id
+                FROM pi_llm_id_migration
+                WHERE old_llm_call_id = llm_calls.next_llm_call_id
+             )
+             WHERE next_llm_call_id IN (SELECT old_llm_call_id FROM pi_llm_id_migration);",
+        )?;
+
+        self.conn.execute(
+            "DELETE FROM run_steps
+             WHERE llm_call_id IN (
+                SELECT old_llm_call_id FROM pi_llm_id_migration WHERE is_keeper = 0
+             )",
+            [],
+        )?;
+        let removed = self.conn.execute(
+            "DELETE FROM llm_calls
+             WHERE llm_call_id IN (
+                SELECT old_llm_call_id FROM pi_llm_id_migration WHERE is_keeper = 0
+             )",
+            [],
+        )?;
+        self.conn.execute_batch(
+            "INSERT INTO event_identities (
+                profile_id, device_id, source, kind, source_event_id, entity_id
+             )
+             SELECT
+                profile_id, device_id, 'pi', 'llm', canonical_source_event_id,
+                keeper_llm_call_id
+             FROM pi_llm_id_migration
+             WHERE is_keeper = 1
+             ON CONFLICT(profile_id, source, kind, source_event_id) DO UPDATE SET
+                device_id = excluded.device_id,
+                entity_id = excluded.entity_id;
+
+             INSERT INTO event_identities (
+                profile_id, device_id, source, kind, source_event_id, entity_id
+             )
+             SELECT
+                profile_id, device_id, 'pi', 'step', canonical_source_event_id,
+                keeper_step_id
+             FROM pi_llm_id_migration
+             WHERE is_keeper = 1
+             ON CONFLICT(profile_id, source, kind, source_event_id) DO UPDATE SET
+                device_id = excluded.device_id,
+                entity_id = excluded.entity_id;",
+        )?;
+
+        self.refresh_pi_run_and_turn_summaries()?;
+        self.clear_usage_rollups()?;
+        self.conn.execute(
+            "INSERT INTO meta (key, value, updated_at_ns)
+             VALUES (?1, 'complete', ?2)
+             ON CONFLICT(key) DO UPDATE SET
+                value = excluded.value,
+                updated_at_ns = excluded.updated_at_ns",
+            params![PI_LLM_EVENT_ID_MIGRATION, now_ns()],
+        )?;
+        self.conn.execute_batch("DROP TABLE pi_llm_id_migration;")?;
+        tx.commit()?;
+        Ok(removed)
+    }
+
+    fn refresh_pi_run_and_turn_summaries(&self) -> Result<()> {
+        self.conn.execute_batch(
+            "UPDATE runs
+             SET llm_call_count = (SELECT COUNT(*) FROM llm_calls WHERE run_id = runs.run_id),
+                 tool_call_count = (SELECT COUNT(*) FROM tool_calls WHERE run_id = runs.run_id),
+                 failed_tool_count = (SELECT COUNT(*) FROM tool_calls WHERE run_id = runs.run_id AND status = 'failed'),
+                 input_tokens = COALESCE((SELECT SUM(input_tokens) FROM llm_calls WHERE run_id = runs.run_id), 0),
+                 output_tokens = COALESCE((SELECT SUM(output_tokens) FROM llm_calls WHERE run_id = runs.run_id), 0),
+                 cache_read_tokens = COALESCE((SELECT SUM(cache_read_tokens) FROM llm_calls WHERE run_id = runs.run_id), 0),
+                 cache_write_tokens = COALESCE((SELECT SUM(cache_write_tokens) FROM llm_calls WHERE run_id = runs.run_id), 0),
+                 total_cost_usd = COALESCE((SELECT SUM(total_cost_usd) FROM llm_calls WHERE run_id = runs.run_id), 0)
+             WHERE source = 'pi';
+
+             UPDATE turns
+             SET llm_call_count = (SELECT COUNT(*) FROM llm_calls WHERE turn_id = turns.turn_id),
+                 tool_call_count = (SELECT COUNT(*) FROM tool_calls WHERE turn_id = turns.turn_id),
+                 failed_tool_count = (SELECT COUNT(*) FROM tool_calls WHERE turn_id = turns.turn_id AND status = 'failed'),
+                 input_tokens = COALESCE((SELECT SUM(input_tokens) FROM llm_calls WHERE turn_id = turns.turn_id), 0),
+                 output_tokens = COALESCE((SELECT SUM(output_tokens) FROM llm_calls WHERE turn_id = turns.turn_id), 0)
+             WHERE source = 'pi';",
+        )?;
+        Ok(())
     }
 
     pub fn refresh_observed_llm_latency_for_runs<'a, I>(&self, run_ids: I) -> Result<()>
@@ -455,6 +703,7 @@ impl Database {
         for table in [
             "import_sources",
             "import_files",
+            "event_identities",
             "sessions",
             "runs",
             "turns",
@@ -1111,6 +1360,18 @@ CREATE INDEX IF NOT EXISTS idx_import_files_source ON import_files(source_id);
 CREATE INDEX IF NOT EXISTS idx_import_files_profile_source ON import_files(profile_id, source_id);
 CREATE INDEX IF NOT EXISTS idx_import_files_status ON import_files(status);
 
+CREATE TABLE IF NOT EXISTS event_identities (
+    profile_id TEXT NOT NULL DEFAULT 'local',
+    device_id TEXT NOT NULL DEFAULT 'local_device',
+    source TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    source_event_id TEXT NOT NULL,
+    entity_id TEXT NOT NULL,
+    PRIMARY KEY (profile_id, source, kind, source_event_id)
+);
+CREATE INDEX IF NOT EXISTS idx_event_identities_entity
+ON event_identities(kind, entity_id);
+
 CREATE TABLE IF NOT EXISTS pricing_sources (
     pricing_source_id TEXT PRIMARY KEY,
     source_url TEXT NOT NULL,
@@ -1536,7 +1797,11 @@ mod tests {
     use anyhow::Result;
     use rusqlite::Connection;
 
-    use crate::config::Identity;
+    use crate::{
+        config::Identity,
+        importers::{ImportIdentity, pi},
+        projection::ids,
+    };
 
     use super::Database;
 
@@ -1725,6 +1990,146 @@ mod tests {
                 })?;
         assert_eq!(rollups, 0);
 
+        let _ = fs::remove_file(db_path);
+        Ok(())
+    }
+
+    #[test]
+    fn pi_llm_event_migration_removes_usage_copied_across_sessions() -> Result<()> {
+        let db_path = std::env::temp_dir().join(format!(
+            "shirabe-pi-llm-event-migration-{}.sqlite",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&db_path);
+        let db = Database::open(&db_path)?;
+        db.migrate()?;
+
+        db.connection().execute_batch(
+            "INSERT INTO sessions (
+                session_id, profile_id, device_id, source, kind, external_id,
+                first_seen_ns, last_seen_ns
+             ) VALUES
+                ('profile:pi:session-a', 'profile', 'device', 'pi', 'pi_session', 'session-a', 100, 300),
+                ('profile:pi:session-b', 'profile', 'device', 'pi', 'pi_session', 'session-b', 200, 300);
+
+             INSERT INTO runs (
+                run_id, profile_id, device_id, source, kind, status, session_id,
+                external_id, started_at_ns, input_tokens, output_tokens
+             ) VALUES
+                ('profile:pi:run-a', 'profile', 'device', 'pi', 'pi_turn', 'success',
+                 'profile:pi:session-a', 'run-a', 300, 100, 20),
+                ('profile:pi:run-b', 'profile', 'device', 'pi', 'pi_turn', 'success',
+                 'profile:pi:session-b', 'run-b', 300, 100, 20);
+
+             INSERT INTO turns (
+                turn_id, profile_id, device_id, run_id, session_id, source, started_at_ns,
+                input_tokens, output_tokens
+             ) VALUES
+                ('profile:pi:turn-a', 'profile', 'device', 'profile:pi:run-a',
+                 'profile:pi:session-a', 'pi', 300, 100, 20),
+                ('profile:pi:turn-b', 'profile', 'device', 'profile:pi:run-b',
+                 'profile:pi:session-b', 'pi', 300, 100, 20);
+
+             INSERT INTO llm_calls (
+                llm_call_id, profile_id, device_id, run_id, session_id, turn_id,
+                source, status, input_tokens, output_tokens, started_at_ns
+             ) VALUES
+                ('profile:pi:llm:legacy-a', 'profile', 'device', 'profile:pi:run-a',
+                 'profile:pi:session-a', 'profile:pi:turn-a', 'pi', 'success', 100, 20, 300),
+                ('profile:pi:llm:legacy-b', 'profile', 'device', 'profile:pi:run-b',
+                 'profile:pi:session-b', 'profile:pi:turn-b', 'pi', 'success', 100, 20, 300);
+
+             INSERT INTO run_steps (
+                step_id, profile_id, device_id, run_id, session_id, turn_id, source,
+                source_event_id, step_type, name, status, started_at_ns, llm_call_id
+             ) VALUES
+                ('profile:pi:step:legacy-a', 'profile', 'device', 'profile:pi:run-a',
+                 'profile:pi:session-a', 'profile:pi:turn-a', 'pi',
+                 'session-a:assistant-shared', 'llm', 'gpt-test', 'success', 300,
+                 'profile:pi:llm:legacy-a'),
+                ('profile:pi:step:legacy-b', 'profile', 'device', 'profile:pi:run-b',
+                 'profile:pi:session-b', 'profile:pi:turn-b', 'pi',
+                 'session-b:assistant-shared', 'llm', 'gpt-test', 'success', 300,
+                 'profile:pi:llm:legacy-b');
+
+             INSERT INTO usage_source_rollups (
+                bucket, bucket_key, profile_id, device_id, source, input_tokens,
+                output_tokens, updated_at_ns
+             ) VALUES ('day', '1970-01-01', 'profile', 'device', 'pi', 200, 40, 300);",
+        )?;
+
+        assert_eq!(db.migrate_pi_llm_event_ids()?, 1);
+        let canonical_source_event_id =
+            ids::timestamped_source_event_id("entry", "assistant-shared", 300);
+        let migrated: (i64, i64, i64, String) = db.connection().query_row(
+            "SELECT COUNT(*), SUM(input_tokens), SUM(output_tokens), MIN(llm_call_id)
+             FROM llm_calls WHERE source = 'pi'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+        assert_eq!(
+            migrated,
+            (1, 100, 20, "profile:pi:llm:legacy-a".to_string())
+        );
+        let aliases: (String, String) = db.connection().query_row(
+            "SELECT
+                MAX(CASE WHEN kind = 'llm' THEN entity_id END),
+                MAX(CASE WHEN kind = 'step' THEN entity_id END)
+             FROM event_identities
+             WHERE profile_id = 'profile' AND source = 'pi' AND source_event_id = ?1",
+            [&canonical_source_event_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(
+            aliases,
+            (
+                "profile:pi:llm:legacy-a".to_string(),
+                "profile:pi:step:legacy-a".to_string()
+            )
+        );
+
+        let run_tokens: (i64, i64) = db.connection().query_row(
+            "SELECT SUM(input_tokens), SUM(output_tokens) FROM runs WHERE source = 'pi'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(run_tokens, (100, 20));
+        let rollups: i64 =
+            db.connection()
+                .query_row("SELECT COUNT(*) FROM usage_source_rollups", [], |row| {
+                    row.get(0)
+                })?;
+        assert_eq!(rollups, 0);
+
+        let session_path = db_path.with_extension("jsonl");
+        fs::write(
+            &session_path,
+            [
+                r#"{"type":"session","id":"session-c","timestamp":"1970-01-01T00:00:00.000000100Z","cwd":"/tmp/project","version":1}"#,
+                r#"{"type":"message","id":"user-new","parentId":"session-c","timestamp":"1970-01-01T00:00:00.000000200Z","message":{"role":"user","content":[]}}"#,
+                r#"{"type":"message","id":"assistant-shared","parentId":"user-new","timestamp":"1970-01-01T00:00:00.000000300Z","message":{"role":"assistant","content":[],"provider":"openai-codex","model":"gpt-test","usage":{"input":70,"output":20,"cacheRead":30,"totalTokens":120}}}"#,
+            ]
+            .join("\n")
+                + "\n",
+        )?;
+        pi::import_with_identity(
+            &db,
+            Some(session_path.clone()),
+            &ImportIdentity::new("profile", "device"),
+        )?;
+        let after_reimport: (i64, i64, String) = db.connection().query_row(
+            "SELECT COUNT(*), SUM(input_tokens), MIN(llm_call_id)
+             FROM llm_calls WHERE source = 'pi'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        assert_eq!(
+            after_reimport,
+            (1, 100, "profile:pi:llm:legacy-a".to_string())
+        );
+        assert_eq!(db.migrate_pi_llm_event_ids()?, 0);
+
+        let _ = fs::remove_file(session_path);
         let _ = fs::remove_file(db_path);
         Ok(())
     }

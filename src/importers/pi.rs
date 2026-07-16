@@ -609,13 +609,14 @@ fn parse_message_entry(
             let status = assistant_status(message);
             let usage = state.usage_from_message(message);
             let metadata = message_metadata(entry, message);
+            let llm_event_id = state.llm_event_id(entry, line_number, timestamp_ns);
             let mut events = vec![state.event(
                 identity,
                 path,
                 line_number,
                 0,
                 timestamp_ns,
-                entry_id.clone(),
+                llm_event_id,
                 OperationType::LlmCall,
                 operation_name,
                 status,
@@ -791,6 +792,19 @@ impl SessionState {
         string_field(entry, "id")
             .map(|id| self.scoped_id(&id))
             .unwrap_or_else(|| self.scoped_id(&format!("line-{line_number}")))
+    }
+
+    fn llm_event_id(
+        &self,
+        entry: &Map<String, Value>,
+        line_number: usize,
+        timestamp_ns: i64,
+    ) -> String {
+        string_field(entry, "id")
+            .map(|id| {
+                crate::projection::ids::timestamped_source_event_id("entry", &id, timestamp_ns)
+            })
+            .unwrap_or_else(|| self.entry_id(entry, line_number))
     }
 
     fn message_model(&self, message: &Map<String, Value>) -> Option<String> {
@@ -1349,6 +1363,72 @@ mod tests {
         )?;
         assert_eq!(provider.as_deref(), Some("cline"));
         assert_eq!(model.as_deref(), Some("deepseek-v4-flash"));
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn deduplicates_llm_usage_copied_into_a_resumed_session() -> Result<()> {
+        let root = temp_dir("pi-import-resumed-session");
+        fs::create_dir_all(&root)?;
+        let original_path = root.join("original.jsonl");
+        let resumed_path = root.join("resumed.jsonl");
+        let shared_user = r#"{"type":"message","id":"user-shared","parentId":"session-a","timestamp":"2026-01-01T00:00:01.000Z","message":{"role":"user","content":[],"timestamp":1767225601000}}"#;
+        let shared_assistant = r#"{"type":"message","id":"assistant-shared","parentId":"user-shared","timestamp":"2026-01-01T00:00:02.000Z","message":{"role":"assistant","content":[],"provider":"openai-codex","model":"gpt-test","usage":{"input":60,"output":20,"cacheRead":40,"totalTokens":120},"timestamp":1767225602000}}"#;
+
+        fs::write(
+            &original_path,
+            [
+                r#"{"type":"session","id":"session-a","timestamp":"2026-01-01T00:00:00.000Z","cwd":"/tmp/project","version":1}"#,
+                shared_user,
+                shared_assistant,
+            ]
+            .join("\n")
+                + "\n",
+        )?;
+        fs::write(
+            &resumed_path,
+            [
+                r#"{"type":"session","id":"session-b","timestamp":"2026-01-02T00:00:00.000Z","cwd":"/tmp/project","version":1}"#,
+                shared_user,
+                shared_assistant,
+                r#"{"type":"message","id":"user-new","parentId":"assistant-shared","timestamp":"2026-01-02T00:00:01.000Z","message":{"role":"user","content":[],"timestamp":1767312001000}}"#,
+                r#"{"type":"message","id":"assistant-new","parentId":"user-new","timestamp":"2026-01-02T00:00:02.000Z","message":{"role":"assistant","content":[],"provider":"openai-codex","model":"gpt-test","usage":{"input":30,"output":10,"cacheRead":20,"totalTokens":60},"timestamp":1767312002000}}"#,
+            ]
+            .join("\n")
+                + "\n",
+        )?;
+
+        let db_path = root.join("catalog.sqlite");
+        let db = Database::open(&db_path)?;
+        db.migrate()?;
+
+        import(&db, Some(root.clone()))?;
+        assert_eq!(count(&db, "sessions")?, 2);
+        assert_eq!(count(&db, "llm_calls")?, 2);
+        let totals: (i64, i64) = db.connection().query_row(
+            "SELECT SUM(input_tokens), SUM(output_tokens) FROM llm_calls WHERE source = 'pi'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(totals, (150, 30));
+
+        let resumed = fs::read_to_string(&resumed_path)?;
+        fs::write(
+            &resumed_path,
+            resumed
+                + r#"{"type":"session_info","id":"info-new","parentId":"assistant-new","timestamp":"2026-01-02T00:00:03.000Z","name":"Resumed"}"#
+                + "\n",
+        )?;
+        import(&db, Some(root.clone()))?;
+        assert_eq!(count(&db, "llm_calls")?, 2);
+        let totals_after_refresh: (i64, i64) = db.connection().query_row(
+            "SELECT SUM(input_tokens), SUM(output_tokens) FROM llm_calls WHERE source = 'pi'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(totals_after_refresh, totals);
 
         let _ = fs::remove_dir_all(root);
         Ok(())

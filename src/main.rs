@@ -160,6 +160,13 @@ fn open_registered_database(paths: &Paths) -> Result<(Database, bool)> {
     } else {
         database.adopt_legacy_local_profile(&paths.identity)?
     };
+    let removed_duplicate_pi_calls = database.migrate_pi_llm_event_ids()?;
+    if removed_duplicate_pi_calls > 0 {
+        tracing::info!(
+            removed_duplicate_pi_calls,
+            "removed duplicated Pi usage copied across sessions"
+        );
+    }
     Ok((database, adopted_legacy_profile))
 }
 
