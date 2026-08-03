@@ -100,6 +100,10 @@ fn collect_with_modified_since(
         events_projected: scan.events,
         source_bytes_scanned: scan.bytes,
         shirabe_bytes_written: 0,
+        mode: None,
+        threads_enumerated: None,
+        threads_exported: None,
+        unchanged_threads_skipped: None,
         timings: vec![
             ImportTiming {
                 stage: "collect",
@@ -165,6 +169,10 @@ fn import_with_modified_since(
         events_projected: scan.events,
         source_bytes_scanned: scan.bytes,
         shirabe_bytes_written,
+        mode: None,
+        threads_enumerated: None,
+        threads_exported: None,
+        unchanged_threads_skipped: None,
         timings: vec![
             ImportTiming {
                 stage: "scan_project",

@@ -3,7 +3,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::{
     collections::{HashMap, HashSet},
     fs,
-    io::{BufRead, BufReader, BufWriter},
+    io::{BufRead, BufReader, BufWriter, Write},
     path::{Path, PathBuf},
 };
 
@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::{
-    config::{Identity, SourcePaths, home_dir},
+    config::{Identity, SourcePaths, SourceSettings, home_dir},
     db::{Database, now_ns, stable_hash},
     importers::{self, ImportIdentity, ImportReport},
     projection::{
@@ -52,9 +52,12 @@ pub struct DrainReport {
     pub events_projected: usize,
 }
 
-#[derive(Debug, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 struct CollectorState {
+    #[serde(default)]
     sources: HashMap<String, i64>,
+    #[serde(default)]
+    amp: importers::amp::AmpCollectorState,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -298,6 +301,7 @@ pub fn seed_pricing_cache(db: &Database, source_catalog: &Path) -> Result<bool> 
 pub fn collect_to_inbox(
     workspace_path: Option<PathBuf>,
     source_paths: &SourcePaths,
+    source_settings: &SourceSettings,
     identity: &Identity,
 ) -> Result<CollectReport> {
     let workspace = prepare(workspace_path)?;
@@ -311,7 +315,8 @@ pub fn collect_to_inbox(
             "{}.json",
             workspace_file_stem(&identity.profile_id)
         ));
-    let mut state = read_collector_state(&state_path)?;
+    let state = read_collector_state(&state_path)?;
+    let mut staged_state = state.clone();
     let profile_file_stem = workspace_file_stem(&identity.profile_id);
     let temp_file = workspace.inbox_dir.join(format!(
         "{}-{}-{}.tmp",
@@ -324,47 +329,67 @@ pub fn collect_to_inbox(
         fs::File::create(&temp_file).with_context(|| format!("create {}", temp_file.display()))?;
     let mut writer = BufWriter::new(file);
 
-    let sources = vec![
-        importers::codex::collect_recent(
+    let mut sources = Vec::new();
+    if source_settings.is_enabled("codex") {
+        sources.push(importers::codex::collect_recent(
             Some(source_paths.codex.clone()),
             &import_identity,
             &mut writer,
             collector_since(&state, "codex"),
-        )?,
-        importers::pi::collect_recent(
+        )?);
+    }
+    if source_settings.is_enabled("pi") {
+        sources.push(importers::pi::collect_recent(
             Some(source_paths.pi.clone()),
             &import_identity,
             &mut writer,
             collector_since(&state, "pi"),
-        )?,
-        importers::claude::collect_recent(
+        )?);
+    }
+    if source_settings.is_enabled("claude") {
+        sources.push(importers::claude::collect_recent(
             Some(source_paths.claude.clone()),
             &import_identity,
             &mut writer,
             collector_since(&state, "claude"),
-        )?,
-        importers::kanade::collect_recent(
+        )?);
+    }
+    if source_settings.is_enabled("kanade") {
+        sources.push(importers::kanade::collect_recent(
             Some(source_paths.kanade.clone()),
             &import_identity,
             &mut writer,
             collector_since(&state, "kanade"),
-        )?,
-    ];
+        )?);
+    }
+    if source_settings.is_enabled("amp") {
+        sources.push(importers::amp::collect_cli_first_recent(
+            &source_paths.amp,
+            &mut staged_state.amp,
+            &import_identity,
+            &mut writer,
+        )?);
+    }
     let events_collected = sources
         .iter()
         .map(|source| source.events_projected)
         .sum::<usize>();
 
+    writer
+        .flush()
+        .with_context(|| format!("flush {}", temp_file.display()))?;
     drop(writer);
     let collected_at_ns = now_ns();
     for source in &sources {
         if source.files_seen > 0 {
-            state.sources.insert(source.source.clone(), collected_at_ns);
+            staged_state
+                .sources
+                .insert(source.source.clone(), collected_at_ns);
         }
     }
-    write_collector_state(&state_path, &state)?;
     if events_collected == 0 {
         let _ = fs::remove_file(&temp_file);
+        write_collector_state(&state_path, &staged_state)?;
         return Ok(CollectReport {
             status: "ok",
             workspace_dir: workspace.workspace_dir,
@@ -382,6 +407,7 @@ pub fn collect_to_inbox(
         )
     })?;
     chmod_best_effort(&inbox_file, 0o666)?;
+    write_collector_state(&state_path, &staged_state)?;
 
     Ok(CollectReport {
         status: "ok",
@@ -591,11 +617,19 @@ mod tests {
     use rusqlite::Connection;
 
     use crate::{
-        config::{Identity, SourcePaths},
+        config::{Identity, SourcePaths, SourceSettings},
         db::Database,
     };
 
     use super::{collect_to_inbox, drain_inbox, prepare, seed_pricing_cache};
+
+    #[test]
+    fn collector_state_without_amp_field_remains_compatible() -> Result<()> {
+        let state: super::CollectorState = serde_json::from_str(r#"{"sources":{"codex":123}}"#)?;
+        assert_eq!(state.sources.get("codex"), Some(&123));
+        assert!(state.amp.threads.is_empty());
+        Ok(())
+    }
 
     #[test]
     fn collector_inbox_drains_two_profiles_without_db_writes_from_collectors() -> Result<()> {
@@ -619,8 +653,11 @@ mod tests {
         let paths_a = test_source_paths(&profile_a_source);
         let paths_b = test_source_paths(&profile_b_source);
 
-        let report_a = collect_to_inbox(Some(workspace_dir.clone()), &paths_a, &profile_a)?;
-        let report_b = collect_to_inbox(Some(workspace_dir.clone()), &paths_b, &profile_b)?;
+        let settings = SourceSettings::from_values(vec!["amp".into()], None);
+        let report_a =
+            collect_to_inbox(Some(workspace_dir.clone()), &paths_a, &settings, &profile_a)?;
+        let report_b =
+            collect_to_inbox(Some(workspace_dir.clone()), &paths_b, &settings, &profile_b)?;
         assert!(report_a.events_collected > 0);
         assert!(report_b.events_collected > 0);
 
@@ -777,7 +814,8 @@ mod tests {
         let identity = test_identity("missing_profile");
         let paths = test_source_paths(&root.join("missing-codex"));
 
-        let report = collect_to_inbox(Some(workspace_dir.clone()), &paths, &identity)?;
+        let settings = SourceSettings::from_values(vec!["amp".into()], None);
+        let report = collect_to_inbox(Some(workspace_dir.clone()), &paths, &settings, &identity)?;
 
         assert_eq!(report.events_collected, 0);
         assert!(report.inbox_file.is_none());

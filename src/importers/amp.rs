@@ -14,7 +14,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 
@@ -32,6 +32,21 @@ const SOURCE_KIND: &str = "amp_local_thread_json";
 const MAX_THREAD_JSON_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_LIST_BYTES: usize = 8 * 1024 * 1024;
 const RECENT_NS: i64 = 15 * 60 * 1_000_000_000;
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub(crate) struct AmpCollectorState {
+    #[serde(default)]
+    pub threads: HashMap<String, AmpCollectorThreadState>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub(crate) struct AmpCollectorThreadState {
+    pub message_count: usize,
+    pub updated_at_ns: i64,
+    pub fingerprint: Option<String>,
+    pub event_count: usize,
+    pub status: String,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CliThread {
@@ -369,18 +384,19 @@ fn sync_cli_or_local_with_runner(
     identity: &ImportIdentity,
 ) -> Result<ImportReport> {
     let Some(runner) = runner else {
-        return import_local_recent_with_identity(db, fallback_roots, modified_since_ns, identity);
+        let mut report =
+            import_local_recent_with_identity(db, fallback_roots, modified_since_ns, identity)?;
+        report.mode = Some("local_fallback");
+        return Ok(report);
     };
     let started = Instant::now();
     let threads = match discover_cli_threads(runner) {
         Ok(threads) => threads,
         Err(_) => {
-            return import_local_recent_with_identity(
-                db,
-                fallback_roots,
-                modified_since_ns,
-                identity,
-            );
+            let mut report =
+                import_local_recent_with_identity(db, fallback_roots, modified_since_ns, identity)?;
+            report.mode = Some("local_fallback");
+            return Ok(report);
         }
     };
     sync_discovered_threads(db, runner, identity, threads, started)
@@ -512,14 +528,22 @@ fn sync_discovered_threads(
         stats.warnings += warnings;
     }
     let written = fs::metadata(db.path()).map(|m| m.len()).unwrap_or_default();
-    Ok(report(
+    let threads_enumerated = stats.files_seen;
+    let threads_exported = stats.files_imported;
+    let unchanged_threads_skipped = stats.files_skipped;
+    let mut report = report(
         PathBuf::from("<amp-cli>"),
         source_id,
         stats,
         written,
         started.elapsed().as_millis(),
         started,
-    ))
+    );
+    report.mode = Some("cli");
+    report.threads_enumerated = Some(threads_enumerated);
+    report.threads_exported = Some(threads_exported);
+    report.unchanged_threads_skipped = Some(unchanged_threads_skipped);
+    Ok(report)
 }
 
 #[derive(Debug)]
@@ -630,14 +654,112 @@ pub fn collect_local_recent(
         }
     }
     let scan_elapsed_ms = scan_started.elapsed().as_millis();
-    Ok(report(
+    let mut report = report(
         root_path,
         format!("{}:amp:collector", identity.profile_id),
         stats,
         0,
         scan_elapsed_ms,
         total_started,
-    ))
+    );
+    report.mode = Some("local_fallback");
+    Ok(report)
+}
+
+pub(crate) fn collect_cli_first_recent(
+    fallback_roots: &[PathBuf],
+    state: &mut AmpCollectorState,
+    identity: &ImportIdentity,
+    writer: &mut dyn Write,
+) -> Result<ImportReport> {
+    let runner = resolve_amp_cli().map(|executable| ProcessAmpRunner {
+        executable,
+        deadline: Duration::from_secs(30),
+        list_cap: MAX_LIST_BYTES,
+        export_cap: MAX_THREAD_JSON_BYTES as usize,
+    });
+    collect_cli_first_recent_with_runner(
+        runner.as_ref().map(|value| value as &dyn AmpCommandRunner),
+        fallback_roots,
+        state,
+        identity,
+        writer,
+    )
+}
+
+fn collect_cli_first_recent_with_runner(
+    runner: Option<&dyn AmpCommandRunner>,
+    fallback_roots: &[PathBuf],
+    state: &mut AmpCollectorState,
+    identity: &ImportIdentity,
+    writer: &mut dyn Write,
+) -> Result<ImportReport> {
+    let Some(runner) = runner else {
+        return collect_local_recent(fallback_roots, identity, writer, 0);
+    };
+    let started = Instant::now();
+    let threads = match discover_cli_threads(runner) {
+        Ok(value) => value,
+        Err(_) => return collect_local_recent(fallback_roots, identity, writer, 0),
+    };
+    let enumerated = threads.len();
+    let mut stats = ScanStats::default();
+    for thread in threads {
+        stats.files_seen += 1;
+        let should_export = state.threads.get(&thread.id).is_none_or(|prior| {
+            prior.message_count != thread.message_count
+                || !matches!(prior.status.as_str(), "imported" | "partial")
+                || prior.updated_at_ns >= now_ns().saturating_sub(RECENT_NS)
+        });
+        if !should_export {
+            stats.files_skipped += 1;
+            continue;
+        }
+        match runner.export(&thread.id, identity) {
+            Ok(exported) => {
+                let warnings = parsed_warning_count(&exported.parsed);
+                let event_count = exported.parsed.events.len();
+                for event in &exported.parsed.events {
+                    write_collected_event(writer, event)?;
+                }
+                stats.files_imported += 1;
+                stats.events += event_count;
+                stats.bytes = stats.bytes.saturating_add(exported.byte_count);
+                stats.warnings += warnings;
+                state.threads.insert(
+                    thread.id,
+                    AmpCollectorThreadState {
+                        message_count: thread.message_count,
+                        updated_at_ns: exported.parsed.updated_at_ns,
+                        fingerprint: Some(exported.fingerprint),
+                        event_count,
+                        status: if warnings == 0 { "imported" } else { "partial" }.into(),
+                    },
+                );
+            }
+            Err(_) => {
+                stats.warnings += 1;
+                let failed = state.threads.entry(thread.id).or_default();
+                failed.message_count = thread.message_count;
+                failed.status = "failed".into();
+            }
+        }
+    }
+    let exported = stats.files_imported;
+    let skipped = stats.files_skipped;
+    let mut report = report(
+        PathBuf::from("<amp-cli>"),
+        format!("{}:amp:collector", identity.profile_id),
+        stats,
+        0,
+        started.elapsed().as_millis(),
+        started,
+    );
+    report.mode = Some("cli");
+    report.threads_enumerated = Some(enumerated);
+    report.threads_exported = Some(exported);
+    report.unchanged_threads_skipped = Some(skipped);
+    Ok(report)
 }
 
 #[derive(Default)]
@@ -966,6 +1088,10 @@ fn report(
         events_projected: stats.events,
         source_bytes_scanned: stats.bytes,
         shirabe_bytes_written: written,
+        mode: Some("local_explicit"),
+        threads_enumerated: None,
+        threads_exported: None,
+        unchanged_threads_skipped: None,
         timings: vec![
             ImportTiming {
                 stage: "scan_project",
@@ -1678,6 +1804,9 @@ mod tests {
         let identity = ImportIdentity::new("p", "d");
         let first = sync_with_runner(&db, &runner, &identity).unwrap();
         assert_eq!(first.files_imported, 101);
+        assert_eq!(first.mode, Some("cli"));
+        assert_eq!(first.threads_enumerated, Some(101));
+        assert_eq!(first.threads_exported, Some(101));
         assert_eq!(*runner.offsets.lock().unwrap(), vec![0, 100]);
         runner.offsets.lock().unwrap().clear();
         let second = sync_with_runner(&db, &runner, &identity).unwrap();
@@ -1685,6 +1814,36 @@ mod tests {
         assert_eq!(second.files_imported, 0);
         drop(db);
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn cli_first_collector_skips_stale_threads_incrementally() -> Result<()> {
+        let runner = FakeRunner {
+            offsets: Mutex::new(Vec::new()),
+            fail: None,
+        };
+        let identity = ImportIdentity::new("p", "d");
+        let mut state = AmpCollectorState::default();
+        let mut output = Vec::new();
+        let first = collect_cli_first_recent_with_runner(
+            Some(&runner),
+            &[],
+            &mut state,
+            &identity,
+            &mut output,
+        )?;
+        assert_eq!(first.mode, Some("cli"));
+        assert_eq!(first.threads_exported, Some(101));
+        let second = collect_cli_first_recent_with_runner(
+            Some(&runner),
+            &[],
+            &mut state,
+            &identity,
+            &mut output,
+        )?;
+        assert_eq!(second.unchanged_threads_skipped, Some(101));
+        assert_eq!(second.threads_exported, Some(0));
+        Ok(())
     }
 
     #[test]
@@ -2404,6 +2563,7 @@ mod tests {
         let identity = ImportIdentity::new("profile", "device");
 
         let report = import_local_recent_with_identity(&db, &[first, second], 0, &identity)?;
+        assert_eq!(report.mode, Some("local_explicit"));
         assert_eq!(
             (
                 report.files_seen,

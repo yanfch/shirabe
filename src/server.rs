@@ -26,7 +26,7 @@ use tokio::{net::TcpListener, time};
 use tower_http::{services::ServeDir, trace::TraceLayer};
 
 use crate::{
-    config::{Identity, SourcePaths, is_shared_workspace_dir},
+    config::{Identity, SourcePaths, SourceSettings, is_shared_workspace_dir},
     db::Database,
     importers::{self, ImportIdentity},
     pricing, rollup, workspace,
@@ -41,6 +41,7 @@ struct AppState {
     db_path: PathBuf,
     ui_dir: PathBuf,
     source_paths: SourcePaths,
+    source_settings: SourceSettings,
     identity: Identity,
     sync: Mutex<SyncStatus>,
 }
@@ -50,16 +51,21 @@ pub async fn serve(
     bind: String,
     ui_dir: PathBuf,
     source_paths: SourcePaths,
+    source_settings: SourceSettings,
     identity: Identity,
 ) -> Result<()> {
     let _server_lock = acquire_server_lock_if_shared(&db_path)?;
     let addr: SocketAddr = bind
         .parse()
         .with_context(|| format!("parse bind address {bind}"))?;
+    for source in source_settings.unknown_sources() {
+        tracing::warn!(source, "ignoring unknown disabled source");
+    }
     let state = Arc::new(AppState {
         db_path,
         ui_dir,
         source_paths,
+        source_settings,
         identity,
         sync: Mutex::new(SyncStatus::default()),
     });
@@ -460,6 +466,14 @@ struct SyncSourceReport {
     files_skipped: usize,
     events_projected: usize,
     source_bytes_scanned: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mode: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    threads_enumerated: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    threads_exported: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    unchanged_threads_skipped: Option<usize>,
     elapsed_ms: i64,
     error: Option<String>,
 }
@@ -1723,7 +1737,7 @@ fn run_sync_job_inner(state: &Arc<AppState>) -> Result<()> {
         }
     }
 
-    for source in ["codex", "pi", "claude", "kanade"] {
+    for source in enabled_sync_sources(&state.source_settings) {
         set_sync_phase(state, &format!("import {source}"));
         let report = import_sync_source(&db, source, &state.source_paths, &state.identity);
         imported_files = imported_files.saturating_add(report.files_imported);
@@ -1753,6 +1767,13 @@ fn run_sync_job_inner(state: &Arc<AppState>) -> Result<()> {
     });
 
     Ok(())
+}
+
+fn enabled_sync_sources(settings: &SourceSettings) -> Vec<&'static str> {
+    ["codex", "pi", "claude", "kanade", "amp"]
+        .into_iter()
+        .filter(|source| settings.is_enabled(source))
+        .collect()
 }
 
 fn shared_workspace_dir(db_path: &FsPath) -> Option<&FsPath> {
@@ -1802,6 +1823,12 @@ fn import_sync_source(
             modified_since_ns,
             &import_identity,
         ),
+        "amp" => importers::amp::sync_cli_first_recent_with_identity(
+            db,
+            &source_paths.amp,
+            modified_since_ns,
+            &import_identity,
+        ),
         _ => unreachable!("unsupported sync source"),
     };
 
@@ -1814,6 +1841,10 @@ fn import_sync_source(
             files_skipped: report.files_skipped,
             events_projected: report.events_projected,
             source_bytes_scanned: report.source_bytes_scanned,
+            mode: report.mode,
+            threads_enumerated: report.threads_enumerated,
+            threads_exported: report.threads_exported,
+            unchanged_threads_skipped: report.unchanged_threads_skipped,
             elapsed_ms: elapsed_ms(started),
             error: None,
         },
@@ -1825,6 +1856,10 @@ fn import_sync_source(
             files_skipped: 0,
             events_projected: 0,
             source_bytes_scanned: 0,
+            mode: None,
+            threads_enumerated: None,
+            threads_exported: None,
+            unchanged_threads_skipped: None,
             elapsed_ms: elapsed_ms(started),
             error: Some(format!("{error:#}")),
         },
@@ -5191,6 +5226,7 @@ mod tests {
             db_path: workspace_report.catalog_db.clone(),
             ui_dir: root.join("ui"),
             source_paths: test_source_paths(&root),
+            source_settings: crate::config::SourceSettings::from_values(Vec::new(), None),
             identity: identity.clone(),
             sync: Mutex::new(SyncStatus::default()),
         };
@@ -5485,4 +5521,17 @@ mod tests {
             })
             .collect()
     }
+}
+#[test]
+fn enabled_sync_sources_include_amp_by_default_and_skip_disabled_amp() {
+    let default = crate::config::SourceSettings::from_values(Vec::new(), None);
+    assert_eq!(
+        enabled_sync_sources(&default),
+        vec!["codex", "pi", "claude", "kanade", "amp"]
+    );
+    let disabled = crate::config::SourceSettings::from_values(vec!["amp".into()], None);
+    assert_eq!(
+        enabled_sync_sources(&disabled),
+        vec!["codex", "pi", "claude", "kanade"]
+    );
 }

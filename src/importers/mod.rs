@@ -22,6 +22,14 @@ pub struct ImportReport {
     pub events_projected: usize,
     pub source_bytes_scanned: u64,
     pub shirabe_bytes_written: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub threads_enumerated: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub threads_exported: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unchanged_threads_skipped: Option<usize>,
     pub timings: Vec<ImportTiming>,
     pub warnings: Vec<String>,
 }

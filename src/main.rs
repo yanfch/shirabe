@@ -59,6 +59,7 @@ async fn main() -> Result<()> {
                 bind,
                 ui_dir,
                 paths.source_paths,
+                paths.source_settings,
                 paths.identity,
             )
             .await?;
@@ -71,6 +72,18 @@ async fn main() -> Result<()> {
                 paths.identity.device_id.clone(),
             );
             let report = match source {
+                ImportSource::Amp => match path {
+                    Some(path) => importers::amp::import_local_with_identity(
+                        &database,
+                        path,
+                        &import_identity,
+                    )?,
+                    None => importers::amp::sync_cli_first_with_identity(
+                        &database,
+                        &paths.source_paths.amp,
+                        &import_identity,
+                    )?,
+                },
                 ImportSource::Codex => importers::codex::import_with_identity(
                     &database,
                     path.or_else(|| Some(paths.source_paths.codex.clone())),
@@ -102,8 +115,12 @@ async fn main() -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
         Commands::Collect { workspace } => {
-            let report =
-                workspace::collect_to_inbox(workspace, &paths.source_paths, &paths.identity)?;
+            let report = workspace::collect_to_inbox(
+                workspace,
+                &paths.source_paths,
+                &paths.source_settings,
+                &paths.identity,
+            )?;
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
         Commands::Pricing { command } => {
