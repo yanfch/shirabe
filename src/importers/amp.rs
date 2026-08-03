@@ -371,12 +371,19 @@ fn sync_cli_or_local_with_runner(
     let Some(runner) = runner else {
         return import_local_recent_with_identity(db, fallback_roots, modified_since_ns, identity);
     };
-    match sync_with_runner(db, runner, identity) {
-        Ok(report) => Ok(report),
+    let started = Instant::now();
+    let threads = match discover_cli_threads(runner) {
+        Ok(threads) => threads,
         Err(_) => {
-            import_local_recent_with_identity(db, fallback_roots, modified_since_ns, identity)
+            return import_local_recent_with_identity(
+                db,
+                fallback_roots,
+                modified_since_ns,
+                identity,
+            );
         }
-    }
+    };
+    sync_discovered_threads(db, runner, identity, threads, started)
 }
 
 fn resolve_amp_cli() -> Option<PathBuf> {
@@ -405,6 +412,11 @@ fn sync_with_runner(
     identity: &ImportIdentity,
 ) -> Result<ImportReport> {
     let started = Instant::now();
+    let threads = discover_cli_threads(runner)?;
+    sync_discovered_threads(db, runner, identity, threads, started)
+}
+
+fn discover_cli_threads(runner: &dyn AmpCommandRunner) -> Result<Vec<CliThread>> {
     let mut offset = 0usize;
     let mut seen_pages = HashSet::new();
     let mut threads = Vec::new();
@@ -433,8 +445,16 @@ fn sync_with_runner(
             break;
         }
     }
-    // Listing is an all-or-nothing discovery step. Do not create catalog state or
-    // export anything until every page has passed structural validation.
+    Ok(threads)
+}
+
+fn sync_discovered_threads(
+    db: &Database,
+    runner: &dyn AmpCommandRunner,
+    identity: &ImportIdentity,
+    threads: Vec<CliThread>,
+    started: Instant,
+) -> Result<ImportReport> {
     let source_id = db.record_import_source_for_profile(
         "amp",
         "amp_cli_thread_export",
@@ -1906,6 +1926,42 @@ mod tests {
             |row| row.get(0),
         )?;
         assert_eq!(cli_sources, 0);
+        drop(db);
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn post_discovery_db_failure_does_not_start_local_fallback() -> Result<()> {
+        let root = temp_dir("amp-cli-db-failure");
+        let fallback = root.join("fallback");
+        fs::create_dir_all(&fallback)?;
+        fs::write(
+            fallback.join("thread.json"),
+            message_thread("T-local", "m-local", 9, 0, 0, 0),
+        )?;
+        let db = test_db(&root)?;
+        db.connection().execute("DROP TABLE import_files", [])?;
+        let runner = FakeRunner {
+            offsets: Mutex::new(Vec::new()),
+            fail: None,
+        };
+
+        let result = sync_cli_or_local_with_runner(
+            &db,
+            Some(&runner),
+            &[fallback],
+            i64::MIN,
+            &ImportIdentity::new("p", "d"),
+        );
+
+        assert!(result.is_err());
+        let local_sources: i64 = db.connection().query_row(
+            "SELECT count(*) FROM import_sources WHERE source_kind=?1",
+            [SOURCE_KIND],
+            |row| row.get(0),
+        )?;
+        assert_eq!(local_sources, 0, "local fallback must not be attempted");
         drop(db);
         let _ = fs::remove_dir_all(root);
         Ok(())
