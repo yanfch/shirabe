@@ -1,8 +1,8 @@
 #[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::{
     collections::{HashMap, HashSet},
-    fs::{self, OpenOptions},
+    fs::{self, File, OpenOptions},
     io::{BufRead, BufReader, BufWriter, Write},
     path::{Path, PathBuf},
 };
@@ -100,8 +100,8 @@ pub fn prepare(path: Option<PathBuf>) -> Result<WorkspaceReport> {
     fs::create_dir_all(&logs_dir).with_context(|| format!("create {}", logs_dir.display()))?;
 
     chmod_best_effort(&workspace_dir, 0o1777)?;
-    chmod_best_effort(&inbox_dir, 0o777)?;
-    chmod_best_effort(&profiles_dir, 0o777)?;
+    chmod_best_effort(&inbox_dir, 0o1777)?;
+    chmod_best_effort(&profiles_dir, 0o1777)?;
     chmod_best_effort(&collector_state_dir, 0o777)?;
     chmod_best_effort(&logs_dir, 0o777)?;
 
@@ -324,7 +324,7 @@ pub fn collect_to_inbox(
                     inbox_file.display()
                 )
             })?;
-            chmod_best_effort(inbox_file, 0o666)
+            chmod_best_effort(inbox_file, 0o644)
         },
     )
 }
@@ -558,7 +558,7 @@ pub fn drain_inbox(db: &Database, workspace_dir: &Path) -> Result<DrainReport> {
 
     for path in files {
         let file = fs::File::open(&path).with_context(|| format!("open {}", path.display()))?;
-        let reader = BufReader::new(file);
+        let reader = BufReader::new(&file);
         let projector = Projector::new(db);
         let tx = db.begin_batch()?;
         let mut projection_cache = ProjectionCache::default();
@@ -588,6 +588,7 @@ pub fn drain_inbox(db: &Database, workspace_dir: &Path) -> Result<DrainReport> {
             }
         }
         for supersession in supersessions {
+            validate_supersession_provenance(&file, workspace_dir, &supersession.profile_id)?;
             validate_supersession(&supersession, &events)?;
             for (run_id, session_id) in db.retire_source_events(
                 &supersession.profile_id,
@@ -668,6 +669,62 @@ fn validate_supersession(
         "collected supersession does not match an Amp ledger replacement"
     );
     Ok(())
+}
+
+#[cfg(unix)]
+fn validate_supersession_provenance(
+    inbox_file: &File,
+    workspace_dir: &Path,
+    profile_id: &str,
+) -> Result<()> {
+    let inbox_metadata = inbox_file
+        .metadata()
+        .context("read opened inbox metadata")?;
+    anyhow::ensure!(
+        inbox_metadata.file_type().is_file() && inbox_metadata.mode() & 0o022 == 0,
+        "supersession inbox file does not have safe ownership permissions"
+    );
+    let owner_uid = inbox_metadata.uid();
+
+    let profile_path = workspace_dir
+        .join("profiles")
+        .join(format!("{}.json", workspace_file_stem(profile_id)));
+    let profile_file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&profile_path)
+        .with_context(|| format!("open trusted profile {}", profile_path.display()))?;
+    let profile_metadata = profile_file
+        .metadata()
+        .with_context(|| format!("read opened profile metadata {}", profile_path.display()))?;
+    anyhow::ensure!(
+        profile_metadata.file_type().is_file()
+            && profile_metadata.mode() & 0o022 == 0
+            && profile_metadata.uid() == owner_uid,
+        "supersession profile manifest does not have matching safe ownership"
+    );
+    let profile: WorkspaceProfile = serde_json::from_reader(BufReader::new(profile_file))
+        .with_context(|| format!("parse trusted profile {}", profile_path.display()))?;
+    let declared_uid = profile
+        .macos_uid
+        .as_deref()
+        .context("supersession profile manifest has no macos_uid")?
+        .parse::<u32>()
+        .context("supersession profile manifest has invalid macos_uid")?;
+    anyhow::ensure!(
+        profile.profile_id == profile_id && declared_uid == owner_uid,
+        "supersession profile identity does not match file ownership"
+    );
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_supersession_provenance(
+    _inbox_file: &File,
+    _workspace_dir: &Path,
+    _profile_id: &str,
+) -> Result<()> {
+    anyhow::bail!("destructive supersession requires OS-proven file ownership")
 }
 
 fn publication_receipt(inbox_file: &Path) -> PathBuf {
@@ -768,8 +825,28 @@ fn write_workspace_profile(workspace_dir: &Path, identity: &Identity) -> Result<
         updated_at_ns: now_ns(),
     };
     let raw = serde_json::to_string_pretty(&profile)?;
-    fs::write(&path, format!("{raw}\n")).with_context(|| format!("write {}", path.display()))?;
-    chmod_best_effort(&path, 0o666)
+    write_profile_manifest(&path, format!("{raw}\n").as_bytes())
+}
+
+#[cfg(unix)]
+fn write_profile_manifest(path: &Path, raw: &[u8]) -> Result<()> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o644)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .with_context(|| format!("open profile manifest {}", path.display()))?;
+    file.write_all(raw)
+        .with_context(|| format!("write {}", path.display()))?;
+    file.set_permissions(fs::Permissions::from_mode(0o644))
+        .with_context(|| format!("chmod {}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn write_profile_manifest(path: &Path, raw: &[u8]) -> Result<()> {
+    fs::write(path, raw).with_context(|| format!("write {}", path.display()))
 }
 
 fn register_workspace_profiles(db: &Database, workspace_dir: &Path) -> Result<()> {
@@ -1297,7 +1374,13 @@ mod tests {
                 .join("collector-state/bad.pending.json"),
             b"{broken",
         )?;
-        std::fs::write(workspace.inbox_dir.join("unrelated.jsonl"), b"")?;
+        let legacy_inbox = workspace.inbox_dir.join("unrelated.jsonl");
+        std::fs::write(&legacy_inbox, b"")?;
+        #[cfg(unix)]
+        std::fs::set_permissions(
+            &legacy_inbox,
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o666),
+        )?;
         let db = Database::open(&workspace.catalog_db)?;
         db.migrate()?;
 
@@ -1360,6 +1443,41 @@ mod tests {
             collect_to_inbox(Some(workspace_dir.clone()), &paths_b, &settings, &profile_b)?;
         assert!(report_a.events_collected > 0);
         assert!(report_b.events_collected > 0);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            assert_eq!(
+                std::fs::metadata(&workspace.inbox_dir)?
+                    .permissions()
+                    .mode()
+                    & 0o7777,
+                0o1777
+            );
+            assert_eq!(
+                std::fs::metadata(&workspace.profiles_dir)?
+                    .permissions()
+                    .mode()
+                    & 0o7777,
+                0o1777
+            );
+            for inbox_file in [
+                report_a.inbox_file.as_ref().expect("profile A inbox"),
+                report_b.inbox_file.as_ref().expect("profile B inbox"),
+            ] {
+                assert_eq!(
+                    std::fs::metadata(inbox_file)?.permissions().mode() & 0o777,
+                    0o644
+                );
+            }
+            for profile_id in ["profile_a", "profile_b"] {
+                let manifest = workspace.profiles_dir.join(format!("{profile_id}.json"));
+                assert_eq!(
+                    std::fs::metadata(manifest)?.permissions().mode() & 0o777,
+                    0o644
+                );
+            }
+        }
 
         let pre_drain_conn = Connection::open(&workspace.catalog_db)?;
         let pre_drain_runs: i64 =
@@ -1472,12 +1590,101 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn world_writable_forged_supersession_cannot_delete_profile_usage() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "shirabe-forged-amp-supersession-{}",
+            super::now_ns()
+        ));
+        let workspace = prepare(Some(root.clone()))?;
+        let source = root.join("amp-thread.json");
+        let identity = test_identity("victim");
+        let settings = SourceSettings::from_values(Vec::new(), None);
+        let paths = test_source_paths(&root.join("missing"));
+        let db = Database::open(&workspace.catalog_db)?;
+        db.migrate()?;
+        std::fs::write(
+            &source,
+            r#"{"id":"T-one","messages":[{"role":"assistant","messageId":"m1","model":"message-model","timestamp":1,"usage":{"inputTokens":10}}]}"#,
+        )?;
+        collect_to_inbox_with(
+            Some(root.clone()),
+            &paths,
+            &settings,
+            &identity,
+            |_, _, import_identity, writer| {
+                crate::importers::amp::collect_local_recent(
+                    std::slice::from_ref(&source),
+                    import_identity,
+                    writer,
+                    i64::MIN,
+                )
+            },
+            |from, to| {
+                std::fs::rename(from, to)?;
+                Ok(())
+            },
+        )?;
+        drain_inbox(&db, &workspace.workspace_dir)?;
+
+        std::fs::write(
+            &source,
+            r#"{"id":"T-one","messages":[{"role":"assistant","messageId":"m1","usage":{}}],"usageLedger":{"events":[{"id":"l1","timestamp":2,"model":"ledger-model","tokens":{"input":30}}]}}"#,
+        )?;
+        let forged = collect_to_inbox_with(
+            Some(root.clone()),
+            &paths,
+            &settings,
+            &identity,
+            |_, _, import_identity, writer| {
+                crate::importers::amp::collect_local_recent(
+                    std::slice::from_ref(&source),
+                    import_identity,
+                    writer,
+                    i64::MIN,
+                )
+            },
+            |from, to| {
+                std::fs::rename(from, to)?;
+                Ok(())
+            },
+        )?
+        .inbox_file
+        .expect("replacement inbox file");
+        std::fs::set_permissions(&forged, std::fs::Permissions::from_mode(0o666))?;
+
+        assert!(drain_inbox(&db, &workspace.workspace_dir).is_err());
+        let unchanged: (i64, i64, String) = db.connection().query_row(
+            "SELECT COUNT(*), COALESCE(SUM(input_tokens), 0), MIN(model) FROM llm_calls",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        assert_eq!(unchanged, (1, 10, "message-model".into()));
+
+        std::fs::set_permissions(&forged, std::fs::Permissions::from_mode(0o644))?;
+        drain_inbox(&db, &workspace.workspace_dir)?;
+        let replaced: (i64, i64, String) = db.connection().query_row(
+            "SELECT COUNT(*), COALESCE(SUM(input_tokens), 0), MIN(model) FROM llm_calls",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        assert_eq!(replaced, (1, 30, "ledger-model".into()));
+        let _ = std::fs::remove_dir_all(root);
+        Ok(())
+    }
+
     fn test_identity(profile_id: &str) -> Identity {
         Identity {
             device_id: "device_1".to_string(),
             device_label: "Test Mac".to_string(),
             profile_id: profile_id.to_string(),
             profile_label: profile_id.to_string(),
+            #[cfg(unix)]
+            macos_uid: Some(unsafe { libc::geteuid() }.to_string()),
+            #[cfg(not(unix))]
             macos_uid: None,
             macos_username: profile_id.to_string(),
         }
