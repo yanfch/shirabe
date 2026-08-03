@@ -1723,7 +1723,7 @@ fn run_sync_job_inner(state: &Arc<AppState>) -> Result<()> {
         }
     }
 
-    for source in ["codex", "pi", "claude", "kanade", "amp"] {
+    for source in ["codex", "pi", "claude", "kanade"] {
         set_sync_phase(state, &format!("import {source}"));
         let report = import_sync_source(&db, source, &state.source_paths, &state.identity);
         imported_files = imported_files.saturating_add(report.files_imported);
@@ -1799,12 +1799,6 @@ fn import_sync_source(
         "kanade" => importers::kanade::import_recent_with_identity(
             db,
             Some(source_paths.kanade.clone()),
-            modified_since_ns,
-            &import_identity,
-        ),
-        "amp" => importers::amp::sync_cli_first_recent_with_identity(
-            db,
-            &source_paths.amp,
             modified_since_ns,
             &import_identity,
         ),

@@ -41,29 +41,75 @@ struct CliPage {
 
 fn parse_cli_thread_page(bytes: &[u8]) -> Result<CliPage> {
     let text = std::str::from_utf8(bytes).context("Amp list output is not UTF-8")?;
-    let mut threads = Vec::new();
-    let mut candidates = 0;
-    for line in text.lines() {
-        let words: Vec<_> = line.split_whitespace().collect();
-        let id = words
+    let lines: Vec<_> = text.lines().collect();
+    let header = lines.iter().position(|line| {
+        line.split_whitespace().collect::<Vec<_>>()
+            == [
+                "Title",
+                "Last",
+                "Updated",
+                "Visibility",
+                "Messages",
+                "Thread",
+                "ID",
+            ]
+    });
+    let Some(header) = header else {
+        if lines
             .iter()
-            .find(|word| word.starts_with("T-") && word.len() > 2);
-        if let Some(id) = id {
-            candidates += 1;
-            let count = words
-                .last()
-                .and_then(|word| word.parse::<usize>().ok())
-                .context("malformed Amp thread listing row")?;
-            threads.push(CliThread {
-                id: (*id).to_string(),
-                message_count: count,
+            .all(|line| line.trim().is_empty() || is_terminal_control_line(line))
+        {
+            return Ok(CliPage {
+                threads: Vec::new(),
+                candidate_rows: 0,
             });
         }
+        bail!("unrecognized Amp thread listing")
+    };
+    let separator = lines
+        .get(header + 1)
+        .filter(|line| is_table_separator(line));
+    if separator.is_none() {
+        bail!("unrecognized Amp thread listing")
+    }
+    let mut threads = Vec::new();
+    for line in &lines[header + 2..] {
+        if line.trim().is_empty() || is_terminal_control_line(line) {
+            continue;
+        }
+        let words: Vec<_> = line.split_whitespace().collect();
+        let id = words.last().filter(|id| valid_thread_id(id));
+        let count = words.iter().rev().nth(1).and_then(|word| word.parse().ok());
+        let (Some(id), Some(message_count)) = (id, count) else {
+            bail!("malformed Amp thread listing row")
+        };
+        threads.push(CliThread {
+            id: (*id).into(),
+            message_count,
+        });
     }
     Ok(CliPage {
+        candidate_rows: threads.len(),
         threads,
-        candidate_rows: candidates,
     })
+}
+
+fn is_table_separator(line: &str) -> bool {
+    let words: Vec<_> = line.split_whitespace().collect();
+    words.len() >= 5
+        && words
+            .iter()
+            .all(|word| word.chars().all(|c| matches!(c, '-' | '─')))
+}
+
+fn is_terminal_control_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    !trimmed.is_empty()
+        && trimmed.chars().all(|c| {
+            c.is_control()
+                || matches!(c, '\u{1b}' | '[' | ']' | '?' | ';' | '0'..='9' | 'A'..='Z' | 'a'..='z')
+        })
+        && (trimmed.contains('\u{1b}') || trimmed == "[K")
 }
 
 pub(crate) trait AmpCommandRunner {
@@ -207,23 +253,34 @@ pub fn sync_cli_first_recent_with_identity(
     modified_since_ns: i64,
     identity: &ImportIdentity,
 ) -> Result<ImportReport> {
-    let runner = match resolve_amp_cli() {
-        Some(executable) => ProcessAmpRunner {
-            executable,
-            deadline: Duration::from_secs(30),
-            list_cap: MAX_LIST_BYTES,
-            export_cap: MAX_THREAD_JSON_BYTES as usize,
-        },
-        None => {
-            return import_local_recent_with_identity(
-                db,
-                fallback_roots,
-                modified_since_ns,
-                identity,
-            );
-        }
+    let runner = resolve_amp_cli().map(|executable| ProcessAmpRunner {
+        executable,
+        deadline: Duration::from_secs(30),
+        list_cap: MAX_LIST_BYTES,
+        export_cap: MAX_THREAD_JSON_BYTES as usize,
+    });
+    sync_cli_or_local_with_runner(
+        db,
+        runner
+            .as_ref()
+            .map(|runner| runner as &dyn AmpCommandRunner),
+        fallback_roots,
+        modified_since_ns,
+        identity,
+    )
+}
+
+fn sync_cli_or_local_with_runner(
+    db: &Database,
+    runner: Option<&dyn AmpCommandRunner>,
+    fallback_roots: &[PathBuf],
+    modified_since_ns: i64,
+    identity: &ImportIdentity,
+) -> Result<ImportReport> {
+    let Some(runner) = runner else {
+        return import_local_recent_with_identity(db, fallback_roots, modified_since_ns, identity);
     };
-    match sync_with_runner(db, &runner, identity) {
+    match sync_with_runner(db, runner, identity) {
         Ok(report) => Ok(report),
         Err(_) => {
             import_local_recent_with_identity(db, fallback_roots, modified_since_ns, identity)
@@ -257,13 +314,6 @@ fn sync_with_runner(
     identity: &ImportIdentity,
 ) -> Result<ImportReport> {
     let started = Instant::now();
-    let source_id = db.record_import_source_for_profile(
-        "amp",
-        "amp_cli_thread_export",
-        Path::new("<amp-cli>"),
-        &identity.profile_id,
-        &identity.device_id,
-    )?;
     let mut offset = 0usize;
     let mut seen_pages = HashSet::new();
     let mut threads = Vec::new();
@@ -292,6 +342,15 @@ fn sync_with_runner(
             break;
         }
     }
+    // Listing is an all-or-nothing discovery step. Do not create catalog state or
+    // export anything until every page has passed structural validation.
+    let source_id = db.record_import_source_for_profile(
+        "amp",
+        "amp_cli_thread_export",
+        Path::new("<amp-cli>"),
+        &identity.profile_id,
+        &identity.device_id,
+    )?;
     let mut stats = ScanStats::default();
     for thread in threads {
         stats.files_seen += 1;
@@ -1437,6 +1496,8 @@ fn parse_rfc3339_ns(value: &str) -> Option<i64> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use std::{fs, io::Cursor, path::PathBuf, sync::Mutex, time::SystemTime};
 
     use crate::db::Database;
@@ -1445,7 +1506,7 @@ mod tests {
 
     #[test]
     fn cli_table_parser_accepts_unicode_spaces_and_archived_rows() {
-        let table = "ID  Title  Updated  Messages\n--  -----  -------  --------\nT-one  日本語 title with spaces  2 days ago  7\nT-two  archived café  1 year ago  0\n";
+        let table = "Title  Last Updated  Visibility  Messages  Thread ID\n-----  ---- -------  ----------  --------  ------ --\n日本語 title with spaces  2 days ago  private  7 T-one\narchived café  1 year ago archived 0 T-two\n\u{1b}[0m\n";
         let page = parse_cli_thread_page(table.as_bytes()).unwrap();
         assert_eq!(page.candidate_rows, 2);
         assert_eq!(
@@ -1460,9 +1521,27 @@ mod tests {
 
     #[test]
     fn cli_table_parser_rejects_a_malformed_candidate() {
-        let table =
-            b"ID Title Updated Messages\nT-good title yesterday 2\nT-bad title yesterday nope\n";
+        let table = b"Title Last Updated Visibility Messages Thread ID\n----- ---- ------- ---------- -------- ------ --\ngood yesterday private 2 T-good\nbad yesterday private nope T-bad\n";
         assert!(parse_cli_thread_page(table).is_err());
+    }
+
+    #[test]
+    fn cli_table_parser_rejects_nonempty_output_without_the_table() {
+        assert!(parse_cli_thread_page(b"login required\n").is_err());
+        assert!(
+            parse_cli_thread_page(b"\x1b[0m\n")
+                .unwrap()
+                .threads
+                .is_empty()
+        );
+    }
+
+    fn list_table(rows: impl Iterator<Item = String>) -> Vec<u8> {
+        let mut output = String::from(
+            "Title Last Updated Visibility Messages Thread ID\n----- ---- ------- ---------- -------- ------ --\n",
+        );
+        output.extend(rows);
+        output.into_bytes()
     }
 
     struct FakeRunner {
@@ -1473,10 +1552,9 @@ mod tests {
         fn list(&self, offset: usize) -> Result<Vec<u8>> {
             self.offsets.lock().unwrap().push(offset);
             let range = if offset == 0 { 0..100 } else { 100..101 };
-            Ok(range
-                .map(|i| format!("T-{i} title archived 1 day ago 0\n"))
-                .collect::<String>()
-                .into_bytes())
+            Ok(list_table(range.map(|i| {
+                format!("title {i} 1 day ago archived 0 T-{i}\n")
+            })))
         }
         fn export(&self, id: &str) -> Result<Vec<u8>> {
             if self.fail.as_deref() == Some(id) {
@@ -1533,6 +1611,237 @@ mod tests {
         assert!(!errors.contains("private"));
         drop(db);
         let _ = fs::remove_file(path);
+    }
+
+    struct MutableRunner {
+        message_count: Mutex<usize>,
+        payload: Vec<u8>,
+        exports: Mutex<usize>,
+        fail: Mutex<bool>,
+    }
+    impl AmpCommandRunner for MutableRunner {
+        fn list(&self, _: usize) -> Result<Vec<u8>> {
+            let count = *self.message_count.lock().unwrap();
+            Ok(list_table(std::iter::once(format!(
+                "title now private {count} T-state\n"
+            ))))
+        }
+        fn export(&self, _: &str) -> Result<Vec<u8>> {
+            *self.exports.lock().unwrap() += 1;
+            if *self.fail.lock().unwrap() {
+                bail!("PRIVATE_SENTINEL")
+            }
+            Ok(self.payload.clone())
+        }
+    }
+
+    #[test]
+    fn cli_refreshes_recent_unchanged_changed_count_and_manually_pending_threads() -> Result<()> {
+        let root = temp_dir("amp-cli-refresh");
+        fs::create_dir_all(&root)?;
+        let db = test_db(&root)?;
+        let runner = MutableRunner {
+            message_count: Mutex::new(1),
+            payload: br#"{"id":"T-state","updatedAt":"2099-01-01T00:00:00Z","messages":[]}"#
+                .to_vec(),
+            exports: Mutex::new(0),
+            fail: Mutex::new(false),
+        };
+        let identity = ImportIdentity::new("p", "d");
+        sync_with_runner(&db, &runner, &identity)?;
+        sync_with_runner(&db, &runner, &identity)?;
+        assert_eq!(
+            *runner.exports.lock().unwrap(),
+            2,
+            "recent updatedAt refreshes even when unchanged"
+        );
+
+        *runner.message_count.lock().unwrap() = 2;
+        sync_with_runner(&db, &runner, &identity)?;
+        assert_eq!(
+            *runner.exports.lock().unwrap(),
+            3,
+            "message count change refreshes"
+        );
+
+        db.connection()
+            .execute("UPDATE import_files SET status='pending'", [])?;
+        sync_with_runner(&db, &runner, &identity)?;
+        assert_eq!(
+            *runner.exports.lock().unwrap(),
+            4,
+            "manually pending records retry"
+        );
+        drop(db);
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn failed_cli_retry_preserves_successful_fingerprint_updated_at_and_event_count() -> Result<()>
+    {
+        let root = temp_dir("amp-cli-preserve");
+        fs::create_dir_all(&root)?;
+        let db = test_db(&root)?;
+        let runner = MutableRunner {
+            message_count: Mutex::new(1),
+            payload: message_thread("T-state", "m1", 3, 0, 0, 0).into_bytes(),
+            exports: Mutex::new(0),
+            fail: Mutex::new(false),
+        };
+        let identity = ImportIdentity::new("p", "d");
+        sync_with_runner(&db, &runner, &identity)?;
+        let before: (String, i64, String, i64) = db.connection().query_row(
+            "SELECT fingerprint, event_count, metadata_json, modified_ns FROM import_files",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+        *runner.message_count.lock().unwrap() = 2;
+        *runner.fail.lock().unwrap() = true;
+        let report = sync_with_runner(&db, &runner, &identity)?;
+        assert_eq!(report.warnings.len(), 1);
+        let after: (String, i64, String, i64, String) = db.connection().query_row(
+            "SELECT fingerprint, event_count, metadata_json, modified_ns, error_message FROM import_files",
+            [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        )?;
+        assert_eq!(
+            (&after.0, after.1, after.3),
+            (&before.0, before.1, before.3)
+        );
+        let before_state: AmpVirtualImportState = serde_json::from_str(&before.2)?;
+        let after_state: AmpVirtualImportState = serde_json::from_str(&after.2)?;
+        assert_eq!(
+            (
+                after_state.payload_fingerprint,
+                after_state.updated_at_ns,
+                after_state.event_count
+            ),
+            (
+                before_state.payload_fingerprint,
+                before_state.updated_at_ns,
+                before_state.event_count
+            )
+        );
+        assert!(!after.4.contains("PRIVATE_SENTINEL"));
+        drop(db);
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    struct MalformedSecondPageRunner {
+        exports: Mutex<usize>,
+    }
+    impl AmpCommandRunner for MalformedSecondPageRunner {
+        fn list(&self, offset: usize) -> Result<Vec<u8>> {
+            if offset == 0 {
+                Ok(list_table(
+                    (0..100).map(|i| format!("title private 0 T-{i}\n")),
+                ))
+            } else {
+                Ok(list_table(std::iter::once("malformed candidate\n".into())))
+            }
+        }
+        fn export(&self, _: &str) -> Result<Vec<u8>> {
+            *self.exports.lock().unwrap() += 1;
+            bail!("must not export")
+        }
+    }
+
+    #[test]
+    fn malformed_later_page_falls_back_across_all_roots_without_partial_cli_state() -> Result<()> {
+        let root = temp_dir("amp-cli-fallback");
+        let roots = [root.join("one"), root.join("two")];
+        fs::create_dir_all(&roots[0])?;
+        fs::create_dir_all(&roots[1])?;
+        fs::write(
+            roots[0].join("one.json"),
+            message_thread("T-local-one", "m1", 1, 0, 0, 0),
+        )?;
+        fs::write(
+            roots[1].join("two.json"),
+            message_thread("T-local-two", "m2", 2, 0, 0, 0),
+        )?;
+        let db = test_db(&root)?;
+        let runner = MalformedSecondPageRunner {
+            exports: Mutex::new(0),
+        };
+        let report = sync_cli_or_local_with_runner(
+            &db,
+            Some(&runner),
+            &roots,
+            i64::MIN,
+            &ImportIdentity::new("p", "d"),
+        )?;
+        assert_eq!((report.files_imported, report.events_projected), (2, 2));
+        assert_eq!(*runner.exports.lock().unwrap(), 0);
+        let cli_sources: i64 = db.connection().query_row(
+            "SELECT count(*) FROM import_sources WHERE source_kind='amp_cli_thread_export'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(cli_sources, 0);
+        drop(db);
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn executable_script(name: &str, body: &str) -> Result<PathBuf> {
+        let path = std::env::temp_dir().join(format!("shirabe-{name}-{}", now_ns()));
+        fs::write(&path, format!("#!/bin/sh\n{body}\n"))?;
+        let mut permissions = fs::metadata(&path)?.permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&path, permissions)?;
+        Ok(path)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_runner_times_out_promptly_and_reaps_child() -> Result<()> {
+        let script = executable_script("amp-timeout", "exec sleep 5")?;
+        let runner = ProcessAmpRunner {
+            executable: script.clone(),
+            deadline: Duration::from_millis(50),
+            list_cap: 128,
+            export_cap: 128,
+        };
+        let started = Instant::now();
+        let error = runner.list(0).unwrap_err().to_string();
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(error.contains("list") && error.contains("timed out"));
+        assert!(!error.contains("PRIVATE_SENTINEL"));
+        fs::remove_file(script)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_runner_caps_stdout_and_drains_large_stderr_privately() -> Result<()> {
+        let overflow = executable_script("amp-overflow", "printf 'PRIVATE_SENTINEL_OVERFLOW'")?;
+        let runner = ProcessAmpRunner {
+            executable: overflow.clone(),
+            deadline: Duration::from_secs(1),
+            list_cap: 4,
+            export_cap: 4,
+        };
+        let error = runner.export("T-safe").unwrap_err().to_string();
+        assert!(error.contains("export") && error.contains("T-safe") && error.contains("limit"));
+        assert!(!error.contains("PRIVATE_SENTINEL"));
+        fs::remove_file(overflow)?;
+
+        let flood = executable_script(
+            "amp-stderr",
+            "i=0; while [ $i -lt 20000 ]; do echo PRIVATE_SENTINEL >&2; i=$((i+1)); done; printf ok",
+        )?;
+        let runner = ProcessAmpRunner {
+            executable: flood.clone(),
+            deadline: Duration::from_secs(3),
+            list_cap: 8,
+            export_cap: 8,
+        };
+        assert_eq!(runner.export("T-safe")?, b"ok");
+        fs::remove_file(flood)?;
+        Ok(())
     }
     fn parse(json: &str) -> Result<ParsedThread> {
         parse_thread(json, "amp_thread_json", &ImportIdentity::new("p", "d"))
