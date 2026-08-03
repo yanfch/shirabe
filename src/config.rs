@@ -311,12 +311,24 @@ fn default_data_dir() -> PathBuf {
 }
 
 fn config_dir_for_data_dir(data_dir: &Path) -> Result<PathBuf> {
-    if let Some(config_dir) = env::var_os("SHIRABE_CONFIG_DIR") {
-        return expand_tilde(PathBuf::from(config_dir));
+    config_dir_for_data_dir_with_home(
+        data_dir,
+        env::var_os("SHIRABE_CONFIG_DIR").map(PathBuf::from),
+        home_dir(),
+    )
+}
+
+fn config_dir_for_data_dir_with_home(
+    data_dir: &Path,
+    configured_override: Option<PathBuf>,
+    home: Option<PathBuf>,
+) -> Result<PathBuf> {
+    if let Some(config_dir) = configured_override {
+        return expand_tilde_with_home(config_dir, home);
     }
 
     if is_shared_workspace_dir(data_dir) {
-        let home = home_dir().context("home directory is not set")?;
+        let home = home.context("home directory is not set")?;
         return Ok(home.join(".shirabe"));
     }
 
@@ -340,13 +352,17 @@ pub fn default_shared_workspace_dir() -> PathBuf {
 }
 
 fn expand_tilde(path: PathBuf) -> Result<PathBuf> {
+    expand_tilde_with_home(path, home_dir())
+}
+
+fn expand_tilde_with_home(path: PathBuf, home: Option<PathBuf>) -> Result<PathBuf> {
     let raw = path.to_string_lossy();
     if raw == "~" {
-        return home_dir().context("home directory is not set");
+        return home.context("home directory is not set");
     }
 
     if let Some(rest) = raw.strip_prefix("~/") {
-        let home = home_dir().context("home directory is not set")?;
+        let home = home.context("home directory is not set")?;
         return Ok(home.join(rest));
     }
 
@@ -388,7 +404,10 @@ pub(crate) fn resolve_amp_paths_from_values(
     data_environment: Option<String>,
     home: Option<PathBuf>,
 ) -> Result<Vec<PathBuf>> {
-    let candidates = if let Some(path) = configured {
+    let configured = configured.filter(|path| !path.to_string_lossy().trim().is_empty());
+    let threads_environment =
+        threads_environment.filter(|path| !path.to_string_lossy().trim().is_empty());
+    let mut candidates = if let Some(path) = configured {
         vec![path]
     } else if let Some(path) = threads_environment {
         vec![path]
@@ -400,11 +419,15 @@ pub(crate) fn resolve_amp_paths_from_values(
             .map(|value| PathBuf::from(value).join("threads"))
             .collect()
     } else {
-        vec![
+        Vec::new()
+    };
+
+    if candidates.is_empty() {
+        candidates.push(
             home.unwrap_or_else(|| PathBuf::from("."))
                 .join(".local/share/amp/threads"),
-        ]
-    };
+        );
+    }
 
     let mut seen = HashSet::new();
     let mut paths = Vec::new();
@@ -532,8 +555,8 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        SourceSettings, default_shared_workspace_dir, is_shared_workspace_dir, parse_platform_uuid,
-        resolve_amp_paths_from_values,
+        SourceSettings, config_dir_for_data_dir_with_home, default_shared_workspace_dir,
+        is_shared_workspace_dir, parse_platform_uuid, resolve_amp_paths_from_values,
     };
 
     #[test]
@@ -596,6 +619,62 @@ mod tests {
     }
 
     #[test]
+    fn configured_amp_source_has_highest_precedence() {
+        let paths = resolve_amp_paths_from_values(
+            Some(PathBuf::from("/configured/threads")),
+            Some(PathBuf::from("/environment/threads")),
+            Some("/amp-data".into()),
+            Some(PathBuf::from("/home/test")),
+        )
+        .unwrap();
+
+        assert_eq!(paths, vec![PathBuf::from("/configured/threads")]);
+    }
+
+    #[test]
+    fn shirabe_amp_threads_dir_precedes_amp_data_dir_and_default() {
+        let paths = resolve_amp_paths_from_values(
+            None,
+            Some(PathBuf::from("/environment/threads")),
+            Some("/amp-data".into()),
+            Some(PathBuf::from("/home/test")),
+        )
+        .unwrap();
+
+        assert_eq!(paths, vec![PathBuf::from("/environment/threads")]);
+    }
+
+    #[test]
+    fn amp_source_defaults_to_home_local_share() {
+        let paths =
+            resolve_amp_paths_from_values(None, None, None, Some(PathBuf::from("/home/test")))
+                .unwrap();
+
+        assert_eq!(
+            paths,
+            vec![PathBuf::from("/home/test/.local/share/amp/threads")]
+        );
+    }
+
+    #[test]
+    fn empty_amp_environment_values_fall_through_to_default() {
+        for threads in ["", "  \t"] {
+            let paths = resolve_amp_paths_from_values(
+                None,
+                Some(PathBuf::from(threads)),
+                Some(" , \t,  ".into()),
+                Some(PathBuf::from("/home/test")),
+            )
+            .unwrap();
+
+            assert_eq!(
+                paths,
+                vec![PathBuf::from("/home/test/.local/share/amp/threads")]
+            );
+        }
+    }
+
+    #[test]
     fn parses_ioreg_platform_uuid() {
         let output = r#"    "IOPlatformUUID" = "ABCDEF12-3456-7890-ABCD-EF1234567890""#;
         assert_eq!(
@@ -607,5 +686,16 @@ mod tests {
     #[test]
     fn recognizes_default_shared_workspace() {
         assert!(is_shared_workspace_dir(&default_shared_workspace_dir()));
+    }
+
+    #[test]
+    fn shared_workspace_uses_home_config_directory() {
+        let workspace = default_shared_workspace_dir().join("team");
+        let config_dir =
+            config_dir_for_data_dir_with_home(&workspace, None, Some(PathBuf::from("/home/test")))
+                .unwrap();
+
+        assert_eq!(config_dir, PathBuf::from("/home/test/.shirabe"));
+        assert_ne!(config_dir, workspace);
     }
 }
