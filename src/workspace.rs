@@ -62,7 +62,7 @@ struct CollectorState {
 
 #[derive(Debug, Deserialize, Serialize)]
 struct PendingCollection {
-    inbox_file: PathBuf,
+    inbox_file: String,
     state: CollectorState,
 }
 
@@ -389,27 +389,28 @@ where
         ));
     let pending_path = state_path.with_extension("pending.json");
     if pending_path.exists() {
-        let pending: PendingCollection = serde_json::from_slice(&fs::read(&pending_path)?)
-            .with_context(|| format!("parse {}", pending_path.display()))?;
-        let receipt = publication_receipt(&pending.inbox_file);
-        if pending.inbox_file.exists() || receipt.exists() {
-            persist_state(&state_path, &pending.state)?;
-            fs::remove_file(&pending_path)
-                .with_context(|| format!("remove {}", pending_path.display()))?;
-            if receipt.exists() {
-                fs::remove_file(&receipt)
-                    .with_context(|| format!("remove {}", receipt.display()))?;
+        if let Some((pending, inbox_file)) =
+            read_pending_collection(&pending_path, &workspace.inbox_dir)
+        {
+            let receipt = publication_receipt(&inbox_file);
+            if is_regular_file(&inbox_file) || is_regular_file(&receipt) {
+                persist_state(&state_path, &pending.state)?;
+                fs::remove_file(&pending_path)
+                    .with_context(|| format!("remove {}", pending_path.display()))?;
+                if is_regular_file(&receipt) {
+                    fs::remove_file(&receipt)
+                        .with_context(|| format!("remove {}", receipt.display()))?;
+                }
+                return Ok(CollectReport {
+                    status: "ok",
+                    workspace_dir: workspace.workspace_dir,
+                    inbox_file: Some(inbox_file),
+                    events_collected: 0,
+                    sources: Vec::new(),
+                });
             }
-            return Ok(CollectReport {
-                status: "ok",
-                workspace_dir: workspace.workspace_dir,
-                inbox_file: Some(pending.inbox_file),
-                events_collected: 0,
-                sources: Vec::new(),
-            });
+            discard_pending_collection(&pending_path, "stale");
         }
-        fs::remove_file(&pending_path)
-            .with_context(|| format!("remove {}", pending_path.display()))?;
     }
     let state = read_collector_state(&state_path)?;
     let mut staged_state = state.clone();
@@ -498,7 +499,11 @@ where
         write_atomic_json(
             &pending_path,
             &PendingCollection {
-                inbox_file: inbox_file.clone(),
+                inbox_file: inbox_file
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .context("generated inbox path has no UTF-8 basename")?
+                    .to_owned(),
                 state: staged_state.clone(),
             },
         )?;
@@ -540,7 +545,10 @@ pub fn drain_inbox(db: &Database, workspace_dir: &Path) -> Result<DrainReport> {
 
     let mut files = fs::read_dir(&inbox_dir)
         .with_context(|| format!("read {}", inbox_dir.display()))?
-        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            entry.file_type().ok()?.is_file().then(|| entry.path())
+        })
         .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("jsonl"))
         .collect::<Vec<_>>();
     files.sort();
@@ -608,6 +616,49 @@ fn publication_receipt(inbox_file: &Path) -> PathBuf {
     inbox_file.with_extension("receipt")
 }
 
+fn is_regular_file(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_file())
+}
+
+fn read_pending_collection(
+    pending_path: &Path,
+    inbox_dir: &Path,
+) -> Option<(PendingCollection, PathBuf)> {
+    if !is_regular_file(pending_path) {
+        discard_pending_collection(pending_path, "not a regular file");
+        return None;
+    }
+    let raw = match fs::read(pending_path) {
+        Ok(raw) => raw,
+        Err(_) => {
+            discard_pending_collection(pending_path, "unreadable");
+            return None;
+        }
+    };
+    let pending: PendingCollection = match serde_json::from_slice(&raw) {
+        Ok(pending) => pending,
+        Err(_) => {
+            discard_pending_collection(pending_path, "malformed");
+            return None;
+        }
+    };
+    let basename = Path::new(&pending.inbox_file);
+    let valid_basename = basename.components().count() == 1
+        && basename.file_name().is_some()
+        && basename.extension().and_then(|value| value.to_str()) == Some("jsonl");
+    if !valid_basename {
+        discard_pending_collection(pending_path, "invalid inbox basename");
+        return None;
+    }
+    let inbox_file = inbox_dir.join(basename);
+    Some((pending, inbox_file))
+}
+
+fn discard_pending_collection(path: &Path, reason: &'static str) {
+    tracing::warn!(pending_file = %path.display(), reason, "discarding unusable pending collection");
+    let _ = fs::remove_file(path);
+}
+
 fn has_pending_collection_for(workspace_dir: &Path, inbox_file: &Path) -> Result<bool> {
     let state_dir = workspace_dir.join("collector-state");
     if !state_dir.exists() {
@@ -625,10 +676,17 @@ fn has_pending_collection_for(workspace_dir: &Path, inbox_file: &Path) -> Result
         {
             continue;
         }
-        let pending: PendingCollection = serde_json::from_slice(&fs::read(&path)?)
-            .with_context(|| format!("parse {}", path.display()))?;
-        if pending.inbox_file == inbox_file {
+        let Some((_, pending_inbox_file)) =
+            read_pending_collection(&path, &workspace_dir.join("inbox"))
+        else {
+            continue;
+        };
+        let receipt = publication_receipt(&pending_inbox_file);
+        if pending_inbox_file == inbox_file {
             return Ok(true);
+        }
+        if !is_regular_file(&pending_inbox_file) && !is_regular_file(&receipt) {
+            discard_pending_collection(&path, "stale");
         }
     }
     Ok(false)
@@ -844,6 +902,26 @@ mod tests {
         })
     }
 
+    fn empty_amp_report() -> crate::importers::ImportReport {
+        crate::importers::ImportReport {
+            source: "amp".into(),
+            source_id: "test:amp".into(),
+            root_path: PathBuf::from("<test>"),
+            files_seen: 0,
+            files_imported: 0,
+            files_skipped: 0,
+            events_projected: 0,
+            source_bytes_scanned: 0,
+            shirabe_bytes_written: 0,
+            mode: Some("cli"),
+            threads_enumerated: Some(0),
+            threads_exported: Some(0),
+            unchanged_threads_skipped: Some(0),
+            timings: Vec::new(),
+            warnings: Vec::new(),
+        }
+    }
+
     #[test]
     fn collector_state_without_amp_field_remains_compatible() -> Result<()> {
         let state: super::CollectorState = serde_json::from_str(r#"{"sources":{"codex":123}}"#)?;
@@ -1034,6 +1112,141 @@ mod tests {
                 .join("collector-state/state_recovery.json"),
         )?)?;
         assert!(state.amp.threads.contains_key("T-once"));
+        let _ = std::fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn malicious_pending_path_cannot_inject_state_or_remove_external_file() -> Result<()> {
+        let root =
+            std::env::temp_dir().join(format!("shirabe-malicious-pending-{}", super::now_ns()));
+        let workspace = prepare(Some(root.clone()))?;
+        let identity = test_identity("malicious");
+        let external = root.with_extension("jsonl");
+        std::fs::write(&external, b"do not touch")?;
+        let pending_path = workspace
+            .workspace_dir
+            .join("collector-state/malicious.pending.json");
+        std::fs::write(
+            &pending_path,
+            serde_json::to_vec(&serde_json::json!({
+                "inbox_file": external,
+                "state": {"sources": {"injected": 42}}
+            }))?,
+        )?;
+
+        let report = collect_to_inbox_with(
+            Some(root.clone()),
+            &test_source_paths(&root.join("missing")),
+            &SourceSettings::from_values(Vec::new(), None),
+            &identity,
+            |_, _, _, _| Ok(empty_amp_report()),
+            |_, _| unreachable!(),
+        )?;
+
+        assert_eq!(report.events_collected, 0);
+        assert_eq!(std::fs::read(&external)?, b"do not touch");
+        assert!(!pending_path.exists());
+        let state: super::CollectorState = serde_json::from_slice(&std::fs::read(
+            workspace
+                .workspace_dir
+                .join("collector-state/malicious.json"),
+        )?)?;
+        assert!(!state.sources.contains_key("injected"));
+        let _ = std::fs::remove_file(external);
+        let _ = std::fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_pending_state_cannot_be_used_for_recovery() -> Result<()> {
+        let root =
+            std::env::temp_dir().join(format!("shirabe-pending-symlink-{}", super::now_ns()));
+        let workspace = prepare(Some(root.clone()))?;
+        let inbox_file = workspace.inbox_dir.join("published.jsonl");
+        std::fs::write(&inbox_file, b"published")?;
+        let external_pending = root.join("external-pending.json");
+        let external_contents =
+            br#"{"inbox_file":"published.jsonl","state":{"sources":{"injected":42}}}"#;
+        std::fs::write(&external_pending, external_contents)?;
+        let pending_path = workspace
+            .workspace_dir
+            .join("collector-state/symlink.pending.json");
+        std::os::unix::fs::symlink(&external_pending, &pending_path)?;
+
+        collect_to_inbox_with(
+            Some(root.clone()),
+            &test_source_paths(&root.join("missing")),
+            &SourceSettings::from_values(Vec::new(), None),
+            &test_identity("symlink"),
+            |_, _, _, _| Ok(empty_amp_report()),
+            |_, _| unreachable!(),
+        )?;
+
+        let state: super::CollectorState = serde_json::from_slice(&std::fs::read(
+            workspace.workspace_dir.join("collector-state/symlink.json"),
+        )?)?;
+        assert!(!state.sources.contains_key("injected"));
+        assert_eq!(std::fs::read(&external_pending)?, external_contents);
+        let _ = std::fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_and_stale_pending_files_do_not_block_future_collection() -> Result<()> {
+        for (profile, pending) in [
+            ("malformed", b"not json".as_slice()),
+            (
+                "stale",
+                br#"{"inbox_file":"missing.jsonl","state":{"sources":{"stale":1}}}"#.as_slice(),
+            ),
+        ] {
+            let root =
+                std::env::temp_dir().join(format!("shirabe-{profile}-pending-{}", super::now_ns()));
+            let workspace = prepare(Some(root.clone()))?;
+            let pending_path = workspace
+                .workspace_dir
+                .join(format!("collector-state/{profile}.pending.json"));
+            std::fs::write(&pending_path, pending)?;
+            let mut collected = false;
+            collect_to_inbox_with(
+                Some(root.clone()),
+                &test_source_paths(&root.join("missing")),
+                &SourceSettings::from_values(Vec::new(), None),
+                &test_identity(profile),
+                |_, _, _, _| {
+                    collected = true;
+                    Ok(empty_amp_report())
+                },
+                |_, _| unreachable!(),
+            )?;
+            assert!(collected);
+            assert!(!pending_path.exists());
+            let _ = std::fs::remove_dir_all(root);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_pending_does_not_block_unrelated_inbox_drain() -> Result<()> {
+        let root =
+            std::env::temp_dir().join(format!("shirabe-drain-malformed-{}", super::now_ns()));
+        let workspace = prepare(Some(root.clone()))?;
+        std::fs::write(
+            workspace
+                .workspace_dir
+                .join("collector-state/bad.pending.json"),
+            b"{broken",
+        )?;
+        std::fs::write(workspace.inbox_dir.join("unrelated.jsonl"), b"")?;
+        let db = Database::open(&workspace.catalog_db)?;
+        db.migrate()?;
+
+        let report = drain_inbox(&db, &workspace.workspace_dir)?;
+
+        assert_eq!(report.files_drained, 1);
+        assert!(!workspace.inbox_dir.join("unrelated.jsonl").exists());
         let _ = std::fs::remove_dir_all(root);
         Ok(())
     }
