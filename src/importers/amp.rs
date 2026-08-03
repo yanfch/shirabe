@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
-    fs::{self, File},
+    fs::{self, File, Metadata, OpenOptions},
     io::{BufReader, Cursor, Read, Write},
     path::{Path, PathBuf},
     time::Instant,
@@ -21,6 +21,18 @@ use crate::{
 use super::{ImportIdentity, ImportReport, ImportTiming, write_collected_event};
 
 const SOURCE_KIND: &str = "amp_local_thread_json";
+const MAX_THREAD_JSON_BYTES: u64 = 64 * 1024 * 1024;
+
+#[derive(Debug)]
+struct ScannedFile {
+    path: PathBuf,
+    size: u64,
+    modified_ns: i64,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
 
 pub fn import_local_with_identity(
     db: &Database,
@@ -51,16 +63,17 @@ pub fn import_local_recent_with_identity(
     let tx = db.begin_batch()?;
     let files = recent_json_files(roots, modified_since_ns)?;
     let mut stats = ScanStats::default();
-    for (path, size, modified_ns) in files {
+    for scanned in files {
         stats.files_seen += 1;
-        stats.bytes = stats.bytes.saturating_add(size);
-        let prepared = db.prepare_import_file(&source_id, &path, size, modified_ns)?;
+        stats.bytes = stats.bytes.saturating_add(scanned.size);
+        let prepared =
+            db.prepare_import_file(&source_id, &scanned.path, scanned.size, scanned.modified_ns)?;
         if !prepared.should_import {
             stats.files_skipped += 1;
             continue;
         }
         stats.files_imported += 1;
-        import_file(db, &prepared.file_id, &path, identity, &mut stats)?;
+        import_file(db, &prepared.file_id, &scanned, identity, &mut stats)?;
     }
     tx.commit()?;
     let scan_elapsed_ms = scan_started.elapsed().as_millis();
@@ -85,18 +98,20 @@ pub fn collect_local_recent(
     let root_path = report_root(roots);
     let scan_started = Instant::now();
     let mut stats = ScanStats::default();
-    for (path, size, _) in recent_json_files(roots, modified_since_ns)? {
+    for scanned in recent_json_files(roots, modified_since_ns)? {
         stats.files_seen += 1;
         stats.files_imported += 1;
-        stats.bytes = stats.bytes.saturating_add(size);
-        let reader = match File::open(&path).map(BufReader::new) {
-            Ok(reader) => reader,
+        stats.bytes = stats.bytes.saturating_add(scanned.size);
+        let bytes = match open_scanned_file(&scanned)
+            .and_then(|file| read_bounded(file, MAX_THREAD_JSON_BYTES))
+        {
+            Ok(bytes) => bytes,
             Err(_) => {
                 stats.warnings += 1;
                 continue;
             }
         };
-        match parse_thread_reader(reader, SOURCE_KIND, identity) {
+        match parse_thread_reader(Cursor::new(bytes), SOURCE_KIND, identity) {
             Ok(parsed) => {
                 stats.add_diagnostics(&parsed);
                 for event in parsed.events {
@@ -142,35 +157,51 @@ impl ScanStats {
 fn import_file(
     db: &Database,
     file_id: &str,
-    path: &Path,
+    scanned: &ScannedFile,
     identity: &ImportIdentity,
     stats: &mut ScanStats,
 ) -> Result<()> {
-    let file_size = fs::metadata(path).map(|metadata| metadata.len()).ok();
-    let reader = match File::open(path).map(BufReader::new) {
-        Ok(reader) => reader,
+    import_file_with_limit(db, file_id, scanned, identity, stats, MAX_THREAD_JSON_BYTES)
+}
+
+fn import_file_with_limit(
+    db: &Database,
+    file_id: &str,
+    scanned: &ScannedFile,
+    identity: &ImportIdentity,
+    stats: &mut ScanStats,
+    limit: u64,
+) -> Result<()> {
+    let file_size = Some(scanned.size);
+    let bytes = match open_scanned_file(scanned).and_then(|file| read_bounded(file, limit)) {
+        Ok(bytes) => bytes,
         Err(_) => {
             stats.warnings += 1;
+            let oversized = scanned.size > limit;
             db.finish_import_file(
                 file_id,
-                "partial",
+                "failed",
                 0,
                 1,
                 None,
                 None,
                 None,
-                Some("Amp JSON file could not be read"),
+                Some(if oversized {
+                    "Amp JSON file exceeds size limit"
+                } else {
+                    "Amp JSON file could not be read"
+                }),
             )?;
             return Ok(());
         }
     };
-    let parsed = match parse_thread_reader(reader, SOURCE_KIND, identity) {
+    let parsed = match parse_thread_reader(Cursor::new(bytes), SOURCE_KIND, identity) {
         Ok(parsed) => parsed,
         Err(_) => {
             stats.warnings += 1;
             db.finish_import_file(
                 file_id,
-                "partial",
+                "failed",
                 0,
                 1,
                 file_size,
@@ -241,10 +272,7 @@ fn import_file(
     Ok(())
 }
 
-fn recent_json_files(
-    roots: &[PathBuf],
-    modified_since_ns: i64,
-) -> Result<Vec<(PathBuf, u64, i64)>> {
+fn recent_json_files(roots: &[PathBuf], modified_since_ns: i64) -> Result<Vec<ScannedFile>> {
     let mut paths = Vec::new();
     for root in roots {
         let root_metadata = match fs::symlink_metadata(root) {
@@ -291,10 +319,86 @@ fn recent_json_files(
         }
         let modified_ns = metadata.modified().map(system_time_ns).unwrap_or_default();
         if modified_ns >= modified_since_ns {
-            files.push((path, metadata.len(), modified_ns));
+            files.push(scanned_file_from_metadata(path, metadata, modified_ns));
         }
     }
     Ok(files)
+}
+
+fn scanned_file(path: &Path) -> Result<ScannedFile> {
+    let metadata =
+        fs::symlink_metadata(path).with_context(|| format!("stat {}", path.display()))?;
+    if !metadata.file_type().is_file() {
+        bail!("Amp JSON path is not a regular file")
+    }
+    let modified_ns = metadata.modified().map(system_time_ns).unwrap_or_default();
+    Ok(scanned_file_from_metadata(
+        path.to_path_buf(),
+        metadata,
+        modified_ns,
+    ))
+}
+
+fn scanned_file_from_metadata(path: PathBuf, metadata: Metadata, modified_ns: i64) -> ScannedFile {
+    #[cfg(unix)]
+    use std::os::unix::fs::MetadataExt;
+
+    ScannedFile {
+        path,
+        size: metadata.len(),
+        modified_ns,
+        #[cfg(unix)]
+        device: metadata.dev(),
+        #[cfg(unix)]
+        inode: metadata.ino(),
+    }
+}
+
+fn open_scanned_file(scanned: &ScannedFile) -> Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = options
+        .open(&scanned.path)
+        .with_context(|| format!("open {}", scanned.path.display()))?;
+    let opened = file.metadata()?;
+    if !opened.is_file() {
+        bail!("opened Amp JSON is not a regular file")
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if opened.dev() != scanned.device || opened.ino() != scanned.inode {
+            bail!("Amp JSON changed identity after scan")
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let current = fs::symlink_metadata(&scanned.path)?;
+        if !current.file_type().is_file()
+            || current.len() != opened.len()
+            || current.modified().ok() != opened.modified().ok()
+        {
+            bail!("Amp JSON changed after scan")
+        }
+    }
+    Ok(file)
+}
+
+fn read_bounded(file: File, limit: u64) -> Result<Vec<u8>> {
+    if file.metadata()?.len() > limit {
+        bail!("Amp JSON exceeds size limit")
+    }
+    let mut bytes = Vec::new();
+    file.take(limit.saturating_add(1)).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > limit {
+        bail!("Amp JSON grew beyond size limit")
+    }
+    Ok(bytes)
 }
 
 fn report_root(roots: &[PathBuf]) -> PathBuf {
@@ -643,7 +747,7 @@ pub(crate) fn parse_thread_reader<R: Read>(
             ));
         }
     }
-    let used_ledger = !ledger_events.is_empty();
+    let used_ledger = malformed_ledger_count == 0 && !ledger_events.is_empty();
     let superseded_source_event_ids = if used_ledger {
         message_events
             .iter()
@@ -1169,15 +1273,15 @@ mod tests {
         assert_eq!(p.ledger_total_mismatch_count, 0);
     }
     #[test]
-    fn malformed_ledger_element_does_not_hide_usable_events() {
+    fn malformed_ledger_element_makes_entire_ledger_unusable() {
         let private = "PRIVATE_ELEMENT_SENTINEL";
-        let p = parse(&wrap(&format!(r#", "usageLedger":{{"events":[{{"timestamp":{{"private":"{private}"}},"tokens":{{"input":"bad"}}}}, {{"id":"usable","timestamp":1,"model":"x","tokens":{{"input":2}}}}]}}"#), "[]")).unwrap();
-        assert!(p.used_ledger);
+        let p = parse(&wrap(&format!(r#", "usageLedger":{{"events":[{{"timestamp":{{"private":"{private}"}},"tokens":{{"input":"bad"}}}}, {{"id":"usable","timestamp":1,"model":"x","tokens":{{"input":2}}}}]}}"#), r#"[{"role":"assistant","messageId":"current","model":"x","timestamp":1,"usage":{"inputTokens":7}}]"#)).unwrap();
+        assert!(!p.used_ledger);
         assert_eq!(p.malformed_ledger_count, 1);
         assert_eq!(p.events.len(), 1);
         assert_eq!(
             p.events[0].source_event_id.as_deref(),
-            Some("amp:T-test-1:ledger:usable")
+            Some("amp:T-test-1:message:current")
         );
         assert!(!format!("{p:?}").contains(private));
     }
@@ -1342,7 +1446,7 @@ mod tests {
         let files = recent_json_files(std::slice::from_ref(&path), i64::MIN)?;
 
         assert_eq!(files.len(), 1);
-        assert_eq!(files[0].0, path);
+        assert_eq!(files[0].path, path);
         Ok(())
     }
 
@@ -1379,6 +1483,43 @@ mod tests {
         let files = recent_json_files(std::slice::from_ref(&root), i64::MIN)?;
 
         assert!(files.is_empty());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn secure_open_rejects_a_symlink_even_after_scan() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_dir("amp-local-secure-open");
+        fs::create_dir_all(&root)?;
+        let original = root.join("original.json");
+        let replacement = root.join("replacement.json");
+        fs::write(&original, "{}")?;
+        fs::write(&replacement, "{}")?;
+        let scanned = scanned_file(&original)?;
+        fs::remove_file(&original)?;
+        symlink(&replacement, &original)?;
+
+        assert!(open_scanned_file(&scanned).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn bounded_read_rejects_metadata_oversize_and_growth() -> Result<()> {
+        let root = temp_dir("amp-local-size-limit");
+        fs::create_dir_all(&root)?;
+        let path = root.join("thread.json");
+        fs::write(&path, "12345")?;
+        let scanned = scanned_file(&path)?;
+        let file = open_scanned_file(&scanned)?;
+        assert!(read_bounded(file, 4).is_err());
+
+        fs::write(&path, "1234")?;
+        let scanned = scanned_file(&path)?;
+        let file = open_scanned_file(&scanned)?;
+        fs::write(&path, "12345")?;
+        assert!(read_bounded(file, 4).is_err());
         Ok(())
     }
 
@@ -1464,6 +1605,114 @@ mod tests {
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
         )?;
         assert_eq!(values, ("claude-new".into(), 40, 9, 3, 2));
+        Ok(())
+    }
+
+    #[test]
+    fn mixed_ledger_falls_back_to_current_message_without_duplicate_transition() -> Result<()> {
+        let root = temp_dir("amp-local-mixed-ledger");
+        fs::create_dir_all(&root)?;
+        let path = root.join("thread.json");
+        fs::write(&path, message_thread("T-one", "m1", 10, 5, 3, 2))?;
+        let db = test_db(&root)?;
+        let identity = ImportIdentity::new("profile", "device");
+        import_local_with_identity(&db, path.clone(), &identity)?;
+
+        fs::write(
+            &path,
+            r#"{"id":"T-one","messages":[{"role":"assistant","messageId":"m1","model":"claude-current","timestamp":1767225600000,"usage":{"inputTokens":20,"outputTokens":6}}],"usageLedger":{"events":[{"id":"ledger","timestamp":1767225600000,"model":"claude-ledger","tokens":{"input":99}}, {"tokens":"PRIVATE_SENTINEL"}]}}"#,
+        )?;
+        import_local_with_identity(&db, path.clone(), &identity)?;
+        assert_eq!(count(&db, "llm_calls")?, 1);
+        let current: (String, i64) =
+            db.connection()
+                .query_row("SELECT model, input_tokens FROM llm_calls", [], |row| {
+                    Ok((row.get(0)?, row.get(1)?))
+                })?;
+        assert_eq!(current, ("claude-current".into(), 20));
+
+        fs::write(
+            &path,
+            r#"{"id":"T-one","messages":[],"usageLedger":{"events":[{"id":"ledger","timestamp":1767225600000,"model":"claude-ledger","tokens":{"input":99}}, {"tokens":"PRIVATE_SENTINEL"}]}}"#,
+        )?;
+        import_local_with_identity(&db, path, &identity)?;
+        assert_eq!(count(&db, "llm_calls")?, 1);
+        let unchanged: (String, i64) =
+            db.connection()
+                .query_row("SELECT model, input_tokens FROM llm_calls", [], |row| {
+                    Ok((row.get(0)?, row.get(1)?))
+                })?;
+        assert_eq!(unchanged, current);
+        Ok(())
+    }
+
+    #[test]
+    fn failed_amp_record_retries_with_unchanged_fingerprint() -> Result<()> {
+        let root = temp_dir("amp-local-failed-retry");
+        fs::create_dir_all(&root)?;
+        let path = root.join("thread.json");
+        fs::write(&path, message_thread("T-retry", "m1", 10, 5, 3, 2))?;
+        let db = test_db(&root)?;
+        let identity = ImportIdentity::new("profile", "device");
+        let source_id = db.record_import_source_for_profile(
+            "amp",
+            SOURCE_KIND,
+            Path::new("<amp-local>"),
+            "profile",
+            "device",
+        )?;
+        let scanned = scanned_file(&path)?;
+        let prepared =
+            db.prepare_import_file(&source_id, &path, scanned.size, scanned.modified_ns)?;
+        db.finish_import_file(
+            &prepared.file_id,
+            "failed",
+            0,
+            1,
+            None,
+            None,
+            None,
+            Some("safe failure"),
+        )?;
+
+        let report = import_local_with_identity(&db, path, &identity)?;
+        assert_eq!((report.files_imported, report.events_projected), (1, 1));
+        assert_eq!(count(&db, "llm_calls")?, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn oversized_import_is_failed_content_free_and_retryable() -> Result<()> {
+        let root = temp_dir("amp-local-oversized");
+        fs::create_dir_all(&root)?;
+        let path = root.join("thread.json");
+        fs::write(&path, message_thread("T-large", "m1", 10, 5, 3, 2))?;
+        let db = test_db(&root)?;
+        let identity = ImportIdentity::new("profile", "device");
+        let scanned = scanned_file(&path)?;
+        let source_id = db.record_import_source_for_profile(
+            "amp",
+            SOURCE_KIND,
+            Path::new("<amp-local>"),
+            "profile",
+            "device",
+        )?;
+        let prepared =
+            db.prepare_import_file(&source_id, &path, scanned.size, scanned.modified_ns)?;
+        let mut stats = ScanStats::default();
+        import_file_with_limit(&db, &prepared.file_id, &scanned, &identity, &mut stats, 8)?;
+        let (status, error): (String, Option<String>) = db.connection().query_row(
+            "SELECT status, error_message FROM import_files WHERE file_id = ?1",
+            [&prepared.file_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(status, "failed");
+        assert_eq!(error.as_deref(), Some("Amp JSON file exceeds size limit"));
+        assert_eq!(count(&db, "llm_calls")?, 0);
+        assert!(
+            db.prepare_import_file(&source_id, &path, scanned.size, scanned.modified_ns)?
+                .should_import
+        );
         Ok(())
     }
 
