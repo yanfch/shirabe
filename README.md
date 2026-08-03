@@ -50,6 +50,7 @@ Supported local sources:
 - pi: sessions, runs, token usage, tools, failures, and skills from `~/.pi/agent/sessions`.
 - Claude Code: local usage, sessions, tools, and cost estimates from `~/.claude/projects`.
 - Kanade: workflow/task traces, spans, token usage, models, and tools from `~/.kanade/traces`.
+- Amp: token usage from personal threads discovered through the Amp CLI, with `~/.local/share/amp/threads` as a best-effort local fallback.
 
 Override source paths with `~/.shirabe/config.json`. See
 [configuration](docs/beta-configuration.md#configuration).
