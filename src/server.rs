@@ -5472,6 +5472,7 @@ mod tests {
             pi: root.join("pi"),
             claude: root.join("claude"),
             kanade: root.join("kanade"),
+            amp: vec![root.join("amp")],
         }
     }
 

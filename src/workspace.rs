@@ -684,6 +684,7 @@ mod tests {
             pi: PathBuf::from("/tmp/shirabe-missing-pi"),
             claude: PathBuf::from("/tmp/shirabe-missing-claude"),
             kanade: PathBuf::from("/tmp/shirabe-missing-kanade"),
+            amp: vec![PathBuf::from("/tmp/shirabe-missing-amp")],
         }
     }
 
