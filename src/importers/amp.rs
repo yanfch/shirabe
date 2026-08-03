@@ -274,6 +274,7 @@ pub(crate) fn parse_thread(
                     cache_read,
                     context: None,
                     confidence: 0.9,
+                    aggregate_fallback: false,
                 },
                 index,
                 identity_fallback,
@@ -317,6 +318,7 @@ struct Mapped {
     cache_read: i64,
     context: Option<i64>,
     confidence: f64,
+    aggregate_fallback: bool,
 }
 
 fn map_current(value: &CurrentUsage, diagnostics: &mut Diagnostics) -> Option<Mapped> {
@@ -335,7 +337,7 @@ fn map_current(value: &CurrentUsage, diagnostics: &mut Diagnostics) -> Option<Ma
     let split_present = value.input_tokens.is_some()
         || value.cache_creation_input_tokens.is_some()
         || value.cache_read_input_tokens.is_some();
-    let (input, cache_write, cache_read, confidence) = if split_present {
+    let (input, cache_write, cache_read, confidence, aggregate_fallback) = if split_present {
         let values = (
             value.input_tokens.unwrap_or(0),
             value.cache_creation_input_tokens.unwrap_or(0),
@@ -347,13 +349,13 @@ fn map_current(value: &CurrentUsage, diagnostics: &mut Diagnostics) -> Option<Ma
         {
             diagnostics.mismatches += 1;
         }
-        (values.0, values.1, values.2, 0.9)
+        (values.0, values.1, values.2, 0.9, false)
     } else {
         let aggregate = value.total_input_tokens.or(value.total_tokens).unwrap_or(0);
         if aggregate > 0 {
             diagnostics.aggregates += 1;
         }
-        (aggregate, 0, 0, 0.6)
+        (aggregate, 0, 0, 0.6, aggregate > 0)
     };
     let output = value.output_tokens.unwrap_or(0);
     (input != 0 || output != 0 || cache_write != 0 || cache_read != 0).then_some(Mapped {
@@ -363,6 +365,7 @@ fn map_current(value: &CurrentUsage, diagnostics: &mut Diagnostics) -> Option<Ma
         cache_read,
         context: value.max_input_tokens,
         confidence,
+        aggregate_fallback,
     })
 }
 
@@ -411,7 +414,15 @@ fn make_event(
             ended_at_ns: Some(occurred),
             duration_ns: None,
             order_index: Some(index as i64),
-            metadata: identity_fallback.then(|| serde_json::json!({ "identity_fallback": true })),
+            metadata: match (identity_fallback, mapped.aggregate_fallback) {
+                (false, false) => None,
+                (true, false) => Some(serde_json::json!({ "identity_fallback": true })),
+                (false, true) => Some(serde_json::json!({ "aggregate_fallback": true })),
+                (true, true) => Some(serde_json::json!({
+                    "identity_fallback": true,
+                    "aggregate_fallback": true
+                })),
+            },
         },
         usage: Usage {
             provider: provider(model).map(str::to_string),
@@ -593,7 +604,31 @@ mod tests {
         assert_eq!(p.split_total_mismatch_count, 1);
         assert_eq!(p.aggregate_only_count, 1);
         assert_eq!(p.events[0].usage.input_tokens, 2);
+        assert_eq!(
+            p.events[0].operation.metadata,
+            Some(serde_json::json!({"identity_fallback": true}))
+        );
+        assert_eq!(
+            p.events[1].operation.metadata,
+            Some(serde_json::json!({
+                "aggregate_fallback": true,
+                "identity_fallback": true
+            }))
+        );
         assert!(p.events[1].confidence < p.events[0].confidence);
+    }
+    #[test]
+    fn aggregate_fallback_with_explicit_identity_is_bounded_metadata() {
+        let p = parse(&wrap(
+            "",
+            r#"[{"role":"assistant","messageId":"m","model":"x","timestamp":1,"usage":{"totalInputTokens":8}}]"#,
+        ))
+        .unwrap();
+        assert_eq!(
+            p.events[0].operation.metadata,
+            Some(serde_json::json!({"aggregate_fallback": true}))
+        );
+        assert_eq!(p.events[0].confidence, 0.6);
     }
     #[test]
     fn skips_zero_negative_and_non_assistant() {
