@@ -5,6 +5,7 @@ use crate::projection::event::NormalizedEvent;
 use anyhow::Result;
 use serde::Serialize;
 
+pub mod amp;
 pub mod claude;
 pub mod codex;
 pub mod kanade;
