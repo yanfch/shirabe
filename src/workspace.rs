@@ -304,6 +304,42 @@ pub fn collect_to_inbox(
     source_settings: &SourceSettings,
     identity: &Identity,
 ) -> Result<CollectReport> {
+    collect_to_inbox_with(
+        workspace_path,
+        source_paths,
+        source_settings,
+        identity,
+        importers::amp::collect_cli_first_recent,
+        |temp_file, inbox_file| {
+            fs::rename(temp_file, inbox_file).with_context(|| {
+                format!(
+                    "move collected events {} -> {}",
+                    temp_file.display(),
+                    inbox_file.display()
+                )
+            })?;
+            chmod_best_effort(inbox_file, 0o666)
+        },
+    )
+}
+
+fn collect_to_inbox_with<A, P>(
+    workspace_path: Option<PathBuf>,
+    source_paths: &SourcePaths,
+    source_settings: &SourceSettings,
+    identity: &Identity,
+    mut amp_collector: A,
+    mut publish: P,
+) -> Result<CollectReport>
+where
+    A: FnMut(
+        &[PathBuf],
+        &mut importers::amp::AmpCollectorState,
+        &ImportIdentity,
+        &mut dyn Write,
+    ) -> Result<ImportReport>,
+    P: FnMut(&Path, &Path) -> Result<()>,
+{
     let workspace = prepare(workspace_path)?;
     write_workspace_profile(&workspace.workspace_dir, identity)?;
     let import_identity =
@@ -363,7 +399,7 @@ pub fn collect_to_inbox(
         )?);
     }
     if source_settings.is_enabled("amp") {
-        sources.push(importers::amp::collect_cli_first_recent(
+        sources.push(amp_collector(
             &source_paths.amp,
             &mut staged_state.amp,
             &import_identity,
@@ -399,14 +435,11 @@ pub fn collect_to_inbox(
         });
     }
 
-    fs::rename(&temp_file, &inbox_file).with_context(|| {
-        format!(
-            "move collected events {} -> {}",
-            temp_file.display(),
-            inbox_file.display()
-        )
-    })?;
-    chmod_best_effort(&inbox_file, 0o666)?;
+    if let Err(error) = publish(&temp_file, &inbox_file) {
+        let _ = fs::remove_file(&temp_file);
+        let _ = fs::remove_file(&inbox_file);
+        return Err(error);
+    }
     write_collector_state(&state_path, &staged_state)?;
 
     Ok(CollectReport {
@@ -611,7 +644,7 @@ fn chmod_best_effort(path: &Path, _mode: u32) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::{io::Write, path::PathBuf};
 
     use anyhow::Result;
     use rusqlite::Connection;
@@ -621,13 +654,146 @@ mod tests {
         db::Database,
     };
 
-    use super::{collect_to_inbox, drain_inbox, prepare, seed_pricing_cache};
+    use super::{
+        collect_to_inbox, collect_to_inbox_with, drain_inbox, prepare, seed_pricing_cache,
+    };
+
+    fn injected_amp_report(writer: &mut dyn Write) -> Result<crate::importers::ImportReport> {
+        writer.write_all(b"{}\n")?;
+        Ok(crate::importers::ImportReport {
+            source: "amp".into(),
+            source_id: "test:amp".into(),
+            root_path: PathBuf::from("<test>"),
+            files_seen: 1,
+            files_imported: 1,
+            files_skipped: 0,
+            events_projected: 1,
+            source_bytes_scanned: 3,
+            shirabe_bytes_written: 0,
+            mode: Some("cli"),
+            threads_enumerated: Some(1),
+            threads_exported: Some(1),
+            unchanged_threads_skipped: Some(0),
+            timings: Vec::new(),
+            warnings: Vec::new(),
+        })
+    }
 
     #[test]
     fn collector_state_without_amp_field_remains_compatible() -> Result<()> {
         let state: super::CollectorState = serde_json::from_str(r#"{"sources":{"codex":123}}"#)?;
         assert_eq!(state.sources.get("codex"), Some(&123));
         assert!(state.amp.threads.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn disabled_amp_does_not_invoke_collector_or_change_amp_state_or_watermark() -> Result<()> {
+        let root = std::env::temp_dir().join(format!("shirabe-disabled-amp-{}", super::now_ns()));
+        let workspace = prepare(Some(root.clone()))?;
+        let identity = test_identity("disabled_amp");
+        let state_path = workspace
+            .workspace_dir
+            .join("collector-state/disabled_amp.json");
+        let initial = r#"{"sources":{"codex":11},"amp":{"threads":{"T-old":{"message_count":1,"updated_at_ns":2,"fingerprint":"old","event_count":3,"status":"imported"}}}}"#;
+        std::fs::write(&state_path, initial)?;
+        let settings = SourceSettings::from_values(vec!["amp".into(), "codex".into()], None);
+        let paths = test_source_paths(&root.join("missing"));
+        let report = collect_to_inbox_with(
+            Some(root.clone()),
+            &paths,
+            &settings,
+            &identity,
+            |_, _, _, _| panic!("disabled Amp collector was invoked"),
+            |from, to| {
+                std::fs::rename(from, to)?;
+                Ok(())
+            },
+        )?;
+        assert!(report.sources.iter().all(|source| source.source != "amp"));
+        let state: super::CollectorState = serde_json::from_slice(&std::fs::read(&state_path)?)?;
+        assert_eq!(state.sources.len(), 1);
+        assert!(!state.sources.contains_key("amp"));
+        assert_eq!(state.amp.threads.len(), 1);
+        assert_eq!(
+            state.amp.threads["T-old"].fingerprint.as_deref(),
+            Some("old")
+        );
+        let _ = std::fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn publish_failure_does_not_advance_amp_state_and_next_collection_retries() -> Result<()> {
+        let root =
+            std::env::temp_dir().join(format!("shirabe-publish-failure-{}", super::now_ns()));
+        let workspace = prepare(Some(root.clone()))?;
+        let identity = test_identity("publish_failure");
+        let state_path = workspace
+            .workspace_dir
+            .join("collector-state/publish_failure.json");
+        let initial = super::CollectorState::default();
+        super::write_collector_state(&state_path, &initial)?;
+        let before = std::fs::read(&state_path)?;
+        let settings = SourceSettings::from_values(Vec::new(), None);
+        let paths = test_source_paths(&root.join("missing"));
+        let mut invocations = 0;
+        let failed = collect_to_inbox_with(
+            Some(root.clone()),
+            &paths,
+            &settings,
+            &identity,
+            |_, state, _, writer| {
+                invocations += 1;
+                state.threads.insert(
+                    "T-retry".into(),
+                    crate::importers::amp::AmpCollectorThreadState {
+                        message_count: 1,
+                        updated_at_ns: 2,
+                        fingerprint: Some("new".into()),
+                        event_count: 1,
+                        status: "imported".into(),
+                    },
+                );
+                injected_amp_report(writer)
+            },
+            |_, _| anyhow::bail!("forced publish failure"),
+        );
+        assert!(failed.is_err());
+        assert_eq!(invocations, 1);
+        assert_eq!(std::fs::read(&state_path)?, before);
+        assert!(std::fs::read_dir(&workspace.inbox_dir)?.next().is_none());
+
+        let succeeded = collect_to_inbox_with(
+            Some(root.clone()),
+            &paths,
+            &settings,
+            &identity,
+            |_, state, _, writer| {
+                invocations += 1;
+                assert!(!state.threads.contains_key("T-retry"));
+                state.threads.insert(
+                    "T-retry".into(),
+                    crate::importers::amp::AmpCollectorThreadState {
+                        message_count: 1,
+                        updated_at_ns: 2,
+                        fingerprint: Some("new".into()),
+                        event_count: 1,
+                        status: "imported".into(),
+                    },
+                );
+                injected_amp_report(writer)
+            },
+            |from, to| {
+                std::fs::rename(from, to)?;
+                Ok(())
+            },
+        )?;
+        assert_eq!(invocations, 2);
+        assert_eq!(succeeded.events_collected, 1);
+        let state: super::CollectorState = serde_json::from_slice(&std::fs::read(&state_path)?)?;
+        assert_eq!(state.amp.threads["T-retry"].status, "imported");
+        let _ = std::fs::remove_dir_all(root);
         Ok(())
     }
 

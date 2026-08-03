@@ -5529,9 +5529,10 @@ fn enabled_sync_sources_include_amp_by_default_and_skip_disabled_amp() {
         enabled_sync_sources(&default),
         vec!["codex", "pi", "claude", "kanade", "amp"]
     );
-    let disabled = crate::config::SourceSettings::from_values(vec!["amp".into()], None);
+    let disabled =
+        crate::config::SourceSettings::from_values(vec!["amp".into(), "pi".into()], None);
     assert_eq!(
         enabled_sync_sources(&disabled),
-        vec!["codex", "pi", "claude", "kanade"]
+        vec!["codex", "claude", "kanade"]
     );
 }

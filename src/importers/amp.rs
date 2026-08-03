@@ -1847,6 +1847,104 @@ mod tests {
     }
 
     #[test]
+    fn collector_failed_export_preserves_state_and_retries_without_duplicate_thread_state()
+    -> Result<()> {
+        let runner = MutableRunner {
+            message_count: Mutex::new(2),
+            payload: message_thread("T-state", "m-new", 7, 0, 0, 0).into_bytes(),
+            exports: Mutex::new(0),
+            fail: Mutex::new(true),
+        };
+        let identity = ImportIdentity::new("p", "d");
+        let mut state = AmpCollectorState::default();
+        state.threads.insert(
+            "T-state".into(),
+            AmpCollectorThreadState {
+                message_count: 1,
+                updated_at_ns: 123,
+                fingerprint: Some("old-fingerprint".into()),
+                event_count: 4,
+                status: "imported".into(),
+            },
+        );
+        let mut output = Vec::new();
+
+        let failed = collect_cli_first_recent_with_runner(
+            Some(&runner),
+            &[],
+            &mut state,
+            &identity,
+            &mut output,
+        )?;
+        assert_eq!(failed.warnings.len(), 1);
+        let preserved = state.threads.get("T-state").unwrap();
+        assert_eq!(preserved.status, "failed");
+        assert_eq!(preserved.fingerprint.as_deref(), Some("old-fingerprint"));
+        assert_eq!((preserved.updated_at_ns, preserved.event_count), (123, 4));
+
+        *runner.fail.lock().unwrap() = false;
+        let recovered = collect_cli_first_recent_with_runner(
+            Some(&runner),
+            &[],
+            &mut state,
+            &identity,
+            &mut output,
+        )?;
+        assert_eq!(recovered.threads_exported, Some(1));
+        assert_eq!(*runner.exports.lock().unwrap(), 2);
+        assert!(!output.is_empty());
+        assert_eq!(state.threads.len(), 1);
+        let imported = state.threads.get("T-state").unwrap();
+        assert_eq!(imported.status, "imported");
+        assert_eq!(imported.event_count, 1);
+        assert_ne!(imported.fingerprint.as_deref(), Some("old-fingerprint"));
+        Ok(())
+    }
+
+    #[test]
+    fn collector_discovery_failure_and_missing_runner_fall_back_without_cli_state_mutation()
+    -> Result<()> {
+        let root = temp_dir("amp-collector-fallback");
+        fs::create_dir_all(&root)?;
+        fs::write(
+            root.join("thread.json"),
+            message_thread("T-local", "m-local", 5, 0, 0, 0),
+        )?;
+        let identity = ImportIdentity::new("p", "d");
+        let mut state = AmpCollectorState::default();
+        state.threads.insert(
+            "T-existing".into(),
+            AmpCollectorThreadState {
+                status: "imported".into(),
+                fingerprint: Some("keep".into()),
+                ..Default::default()
+            },
+        );
+        let before = serde_json::to_string(&state)?;
+        let malformed = MalformedSecondPageRunner {
+            exports: Mutex::new(0),
+        };
+
+        for runner in [Some(&malformed as &dyn AmpCommandRunner), None] {
+            let mut output = Vec::new();
+            let report = collect_cli_first_recent_with_runner(
+                runner,
+                std::slice::from_ref(&root),
+                &mut state,
+                &identity,
+                &mut output,
+            )?;
+            assert_eq!(report.mode, Some("local_fallback"));
+            assert_eq!(report.events_projected, 1);
+            assert!(!output.is_empty());
+            assert_eq!(serde_json::to_string(&state)?, before);
+        }
+        assert_eq!(*malformed.exports.lock().unwrap(), 0);
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
     fn one_export_failure_does_not_block_other_threads() {
         let path = std::env::temp_dir().join(format!("shirabe-amp-failure-{}.db", now_ns()));
         let db = Database::open(&path).unwrap();
