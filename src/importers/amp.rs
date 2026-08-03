@@ -238,10 +238,15 @@ fn recent_json_files(
 ) -> Result<Vec<(PathBuf, u64, i64)>> {
     let mut paths = Vec::new();
     for root in roots {
-        if !root.exists() {
+        let root_metadata = match fs::symlink_metadata(root) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error).with_context(|| format!("stat {}", root.display())),
+        };
+        if root_metadata.file_type().is_symlink() {
             continue;
         }
-        if root.is_file() {
+        if root_metadata.is_file() {
             if root
                 .extension()
                 .and_then(|v| v.to_str())
@@ -253,7 +258,9 @@ fn recent_json_files(
         }
         for entry in WalkDir::new(root).follow_links(false) {
             let entry = entry.with_context(|| format!("scan {}", root.display()))?;
-            if entry.file_type().is_file()
+            let metadata = fs::symlink_metadata(entry.path())
+                .with_context(|| format!("stat {}", entry.path().display()))?;
+            if metadata.file_type().is_file()
                 && entry
                     .path()
                     .extension()
@@ -268,7 +275,11 @@ fn recent_json_files(
     paths.dedup();
     let mut files = Vec::new();
     for path in paths {
-        let metadata = fs::metadata(&path).with_context(|| format!("stat {}", path.display()))?;
+        let metadata =
+            fs::symlink_metadata(&path).with_context(|| format!("stat {}", path.display()))?;
+        if !metadata.file_type().is_file() {
+            continue;
+        }
         let modified_ns = metadata.modified().map(system_time_ns).unwrap_or_default();
         if modified_ns >= modified_since_ns {
             files.push((path, metadata.len(), modified_ns));
@@ -1285,6 +1296,56 @@ mod tests {
             (0, 2, 0)
         );
         assert_eq!(count(&db, "llm_calls")?, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn local_scan_includes_an_ordinary_json_file_root() -> Result<()> {
+        let root = temp_dir("amp-local-ordinary-file");
+        fs::create_dir_all(&root)?;
+        let path = root.join("thread.json");
+        fs::write(&path, "{}")?;
+
+        let files = recent_json_files(std::slice::from_ref(&path), i64::MIN)?;
+
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].0, path);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_scan_excludes_a_direct_json_file_symlink_root() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_dir("amp-local-file-symlink");
+        fs::create_dir_all(&root)?;
+        let target = root.join("target.json");
+        let link = root.join("thread.json");
+        fs::write(&target, "{}")?;
+        symlink(&target, &link)?;
+
+        let files = recent_json_files(&[link], i64::MIN)?;
+
+        assert!(files.is_empty());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_scan_excludes_json_file_symlinks_inside_a_directory() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_dir("amp-local-contained-symlink");
+        fs::create_dir_all(&root)?;
+        let target = root.join("target.txt");
+        let link = root.join("thread.json");
+        fs::write(&target, "{}")?;
+        symlink(&target, &link)?;
+
+        let files = recent_json_files(std::slice::from_ref(&root), i64::MIN)?;
+
+        assert!(files.is_empty());
         Ok(())
     }
 
