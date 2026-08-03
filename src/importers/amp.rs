@@ -23,6 +23,7 @@ pub(crate) struct ParsedThread {
     pub(crate) used_ledger: bool,
     pub(crate) aggregate_only_count: usize,
     pub(crate) malformed_ledger_count: usize,
+    pub(crate) ledger_total_mismatch_count: usize,
 }
 
 #[derive(Deserialize)]
@@ -221,6 +222,7 @@ pub(crate) fn parse_thread(
     }
 
     let mut ledger_events = Vec::new();
+    let mut ledger_total_mismatch_count = 0_usize;
     let mut malformed_ledger_count =
         usize::from(matches!(thread.usage_ledger, LedgerInput::Malformed(_)));
     if let LedgerInput::Ledger(ledger) = thread.usage_ledger {
@@ -246,15 +248,25 @@ pub(crate) fn parse_thread(
             let Some(occurred) = item.timestamp.as_deref().and_then(timestamp_ns) else {
                 continue;
             };
-            let input = tokens
-                .input
-                .or_else(|| {
-                    tokens
-                        .total
-                        .map(|t| t.saturating_sub(tokens.output.unwrap_or(0)))
-                })
-                .unwrap_or(0);
             let output = tokens.output.unwrap_or(0);
+            let input = if let Some(input) = tokens.input {
+                if let Some(total) = tokens.total {
+                    let Some(split_total) = input.checked_add(output) else {
+                        continue;
+                    };
+                    if split_total != total {
+                        ledger_total_mismatch_count = ledger_total_mismatch_count.saturating_add(1);
+                    }
+                }
+                input
+            } else if let Some(total) = tokens.total {
+                let Some(input) = total.checked_sub(output).filter(|input| *input >= 0) else {
+                    continue;
+                };
+                input
+            } else {
+                0
+            };
             let (cache_write, cache_read) = item
                 .to_message_id
                 .as_ref()
@@ -315,6 +327,7 @@ pub(crate) fn parse_thread(
         split_total_mismatch_count: diagnostics.mismatches,
         aggregate_only_count: diagnostics.aggregates,
         malformed_ledger_count,
+        ledger_total_mismatch_count,
         used_ledger,
     })
 }
@@ -755,6 +768,48 @@ mod tests {
             p.events[0].source_event_id.as_deref(),
             Some("amp:T-test-1:ledger:usable")
         );
+    }
+    #[test]
+    fn ledger_rejects_total_less_than_output() {
+        let p = parse(&wrap(
+            r#", "usageLedger":{"events":[{"id":"bad","timestamp":1,"model":"x","tokens":{"output":5,"total":4}}]}"#,
+            "[]",
+        ))
+        .unwrap();
+        assert!(p.events.is_empty());
+        assert!(!p.used_ledger);
+    }
+    #[test]
+    fn ledger_trusts_explicit_split_and_diagnoses_mismatched_total() {
+        let p = parse(&wrap(
+            r#", "usageLedger":{"events":[{"id":"split","timestamp":1,"model":"x","tokens":{"input":2,"output":3,"total":99}}]}"#,
+            "[]",
+        ))
+        .unwrap();
+        assert_eq!(p.events[0].usage.input_tokens, 2);
+        assert_eq!(p.events[0].usage.output_tokens, 3);
+        assert_eq!(p.ledger_total_mismatch_count, 1);
+    }
+    #[test]
+    fn ledger_consistent_total_has_no_mismatch() {
+        let p = parse(&wrap(
+            r#", "usageLedger":{"events":[{"id":"split","timestamp":1,"model":"x","tokens":{"input":2,"output":3,"total":5}}]}"#,
+            "[]",
+        ))
+        .unwrap();
+        assert_eq!(p.events.len(), 1);
+        assert_eq!(p.ledger_total_mismatch_count, 0);
+    }
+    #[test]
+    fn ledger_split_addition_overflow_rejects_without_panicking() {
+        let ledger = format!(
+            r#", "usageLedger":{{"events":[{{"id":"overflow","timestamp":1,"model":"x","tokens":{{"input":{},"output":1,"total":{}}}}}]}}"#,
+            i64::MAX,
+            i64::MAX
+        );
+        let p = parse(&wrap(&ledger, "[]")).unwrap();
+        assert!(p.events.is_empty());
+        assert_eq!(p.ledger_total_mismatch_count, 0);
     }
     #[test]
     fn malformed_ledger_element_does_not_hide_usable_events() {
