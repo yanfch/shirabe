@@ -7,6 +7,7 @@ Add Amp as a Shirabe usage source while preserving Shirabe's local-first privacy
 The importer must:
 
 - synchronize personal Amp threads, including archived threads;
+- allow Amp synchronization to be disabled independently on each device;
 - prefer the signed-in Amp CLI so threads not present in the local cache can be included;
 - fall back to local Amp thread files when CLI synchronization is unavailable;
 - store only usage metadata, never conversation or tool content;
@@ -156,6 +157,38 @@ No new Amp-specific dashboard is required. Amp appears in the existing source fi
 
 ## Configuration and Documentation
 
+### Device-local source enablement
+
+Source enablement is device-local and must not be stored in or inherited from a shared workspace. Shirabe already resolves configuration for a shared workspace to the current user's `~/.shirabe/config.json`; retain that boundary.
+
+Add a general source exclusion list:
+
+```json
+{
+  "disabled_sources": ["amp"]
+}
+```
+
+All sources remain enabled by default for backward compatibility. A device that should collect Amp data leaves `amp` enabled; another device using the same shared workspace adds `amp` to its own exclusion list. Multiple sources may be disabled in the same list.
+
+Support a process-level override:
+
+```text
+SHIRABE_DISABLED_SOURCES=amp,claude
+```
+
+When present, the environment variable replaces the configured list, including when it is explicitly empty. Normalize names case-insensitively, trim whitespace, deduplicate entries, and warn about unknown source names without failing startup.
+
+Disabled sources are skipped by:
+
+- automatic five-minute synchronization;
+- the manual global `/api/sync` action;
+- shared-workspace collection.
+
+An explicit `shirabe import amp` remains allowed because it is a direct one-time user request. Disabling a source does not delete usage already imported into the local catalog or shared workspace.
+
+### Amp source configuration
+
 Add Amp to:
 
 - source-path configuration and environment overrides;
@@ -193,7 +226,10 @@ Add focused tests for:
 12. CLI-to-local fallback without cross-mode duplication;
 13. absence of conversation, thinking, tool, environment, title, and creator data in normalized events and persistence;
 14. automatic sync and shared-workspace collector registration;
-15. Amp source/model/daily rollups and LiteLLM cost estimation.
+15. per-device `disabled_sources` behavior in local and shared-workspace modes;
+16. `SHIRABE_DISABLED_SOURCES` replacement, normalization, empty override, and unknown-source warning behavior;
+17. explicit one-time imports remaining available for disabled sources;
+18. Amp source/model/daily rollups and LiteLLM cost estimation.
 
 Use a fake Amp executable in integration tests. It should emit deterministic list and export fixtures so tests do not require an Amp login, network access, or real user thread content.
 
