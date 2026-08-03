@@ -26,7 +26,10 @@ use crate::{
     projection::projector::{ProjectionCache, Projector},
 };
 
-use super::{ImportIdentity, ImportReport, ImportTiming, write_collected_event};
+use super::{
+    ImportIdentity, ImportReport, ImportTiming, write_collected_event,
+    write_supersede_collected_events,
+};
 
 const SOURCE_KIND: &str = "amp_local_thread_json";
 const MAX_THREAD_JSON_BYTES: u64 = 64 * 1024 * 1024;
@@ -511,7 +514,6 @@ fn sync_discovered_threads(
         let event_count = parsed.events.len();
         let updated = parsed.updated_at_ns;
         let warnings = parsed_warning_count(&parsed);
-        let tx = db.begin_batch()?;
         project_parsed_thread(db, &parsed, identity)?;
         let status = if warnings == 0 { "imported" } else { "partial" };
         let state = AmpVirtualImportState {
@@ -522,7 +524,6 @@ fn sync_discovered_threads(
             event_count,
         };
         db.finish_amp_virtual(&file_id, status, &state)?;
-        tx.commit()?;
         stats.files_imported += 1;
         stats.events += event_count;
         stats.warnings += warnings;
@@ -593,7 +594,6 @@ pub fn import_local_recent_with_identity(
         &identity.device_id,
     )?;
     let scan_started = Instant::now();
-    let tx = db.begin_batch()?;
     let files = recent_json_files(roots, modified_since_ns)?;
     let mut stats = ScanStats::default();
     for scanned in files {
@@ -608,7 +608,6 @@ pub fn import_local_recent_with_identity(
         stats.files_imported += 1;
         import_file(db, &prepared.file_id, &scanned, identity, &mut stats)?;
     }
-    tx.commit()?;
     let scan_elapsed_ms = scan_started.elapsed().as_millis();
     let written = fs::metadata(db.path()).map(|m| m.len()).unwrap_or_default();
     Ok(report(
@@ -645,6 +644,11 @@ pub fn collect_local_recent(
         match parse_thread_reader(Cursor::new(bytes), SOURCE_KIND, identity) {
             Ok(parsed) => {
                 stats.add_diagnostics(&parsed);
+                write_supersede_collected_events(
+                    writer,
+                    &identity.profile_id,
+                    &parsed.superseded_source_event_ids,
+                )?;
                 for event in parsed.events {
                     write_collected_event(writer, &event)?;
                     stats.events += 1;
@@ -719,6 +723,11 @@ fn collect_cli_first_recent_with_runner(
             Ok(exported) => {
                 let warnings = parsed_warning_count(&exported.parsed);
                 let event_count = exported.parsed.events.len();
+                write_supersede_collected_events(
+                    writer,
+                    &identity.profile_id,
+                    &exported.parsed.superseded_source_event_ids,
+                )?;
                 for event in &exported.parsed.events {
                     write_collected_event(writer, event)?;
                 }
@@ -877,6 +886,7 @@ fn project_parsed_thread(
     parsed: &ParsedThread,
     identity: &ImportIdentity,
 ) -> Result<()> {
+    let tx = db.begin_batch()?;
     let projector = Projector::new(db);
     let mut cache = ProjectionCache::default();
     let mut run_ids = HashSet::new();
@@ -911,6 +921,7 @@ fn project_parsed_thread(
     projector.refresh_run_summaries(run_ids.iter().map(String::as_str))?;
     db.refresh_observed_llm_latency_for_runs(run_ids.iter().map(String::as_str))?;
     projector.refresh_session_summaries(session_ids.iter().map(String::as_str))?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -1172,8 +1183,6 @@ struct CurrentUsage {
     cache_read_input_tokens: Option<i64>,
     #[serde(default)]
     total_input_tokens: Option<i64>,
-    #[serde(default)]
-    total_tokens: Option<i64>,
     #[serde(default)]
     max_input_tokens: Option<i64>,
 }
@@ -1489,7 +1498,6 @@ fn map_current(value: &CurrentUsage, diagnostics: &mut Diagnostics) -> Option<Ma
         value.cache_creation_input_tokens,
         value.cache_read_input_tokens,
         value.total_input_tokens,
-        value.total_tokens,
         value.max_input_tokens,
     ];
     if supplied.iter().flatten().any(|v| *v < 0) {
@@ -1513,7 +1521,7 @@ fn map_current(value: &CurrentUsage, diagnostics: &mut Diagnostics) -> Option<Ma
         }
         (values.0, values.1, values.2, 0.9, false)
     } else {
-        let aggregate = value.total_input_tokens.or(value.total_tokens).unwrap_or(0);
+        let aggregate = value.total_input_tokens.unwrap_or(0);
         if aggregate > 0 {
             diagnostics.aggregates += 1;
         }
@@ -2390,7 +2398,7 @@ mod tests {
     }
     #[test]
     fn mismatch_and_aggregate_confidence() {
-        let p=parse(&wrap("",r#"[{"role":"assistant","model":"x","timestamp":1,"usage":{"inputTokens":2,"cacheReadInputTokens":3,"totalInputTokens":99}},{"role":"assistant","model":"x","timestamp":2,"usage":{"totalTokens":8}}]"#)).unwrap();
+        let p=parse(&wrap("",r#"[{"role":"assistant","model":"x","timestamp":1,"usage":{"inputTokens":2,"cacheReadInputTokens":3,"totalInputTokens":99}},{"role":"assistant","model":"x","timestamp":2,"usage":{"totalInputTokens":8}}]"#)).unwrap();
         assert_eq!(p.split_total_mismatch_count, 1);
         assert_eq!(p.aggregate_only_count, 1);
         assert_eq!(p.events[0].usage.input_tokens, 2);
@@ -2406,6 +2414,16 @@ mod tests {
             }))
         );
         assert!(p.events[1].confidence < p.events[0].confidence);
+    }
+    #[test]
+    fn total_tokens_is_not_used_as_aggregate_input() {
+        let p = parse(&wrap(
+            "",
+            r#"[{"role":"assistant","model":"x","timestamp":1,"usage":{"totalTokens":8}}]"#,
+        ))
+        .unwrap();
+        assert!(p.events.is_empty());
+        assert_eq!(p.aggregate_only_count, 0);
     }
     #[test]
     fn aggregate_fallback_with_explicit_identity_is_bounded_metadata() {
@@ -2890,6 +2908,35 @@ mod tests {
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
         )?;
         assert_eq!(values, ("claude-new".into(), 40, 9, 3, 2));
+        Ok(())
+    }
+
+    #[test]
+    fn replacement_projection_failure_keeps_superseded_amp_usage() -> Result<()> {
+        let root = temp_dir("amp-reconcile-rollback");
+        let db = test_db(&root)?;
+        let identity = ImportIdentity::new("profile", "device");
+        let message = parse(&message_thread("T-one", "m1", 10, 5, 3, 2))?;
+        project_parsed_thread(&db, &message, &identity)?;
+        db.connection().execute_batch(
+            "CREATE TRIGGER fail_ledger_projection BEFORE INSERT ON llm_calls
+             WHEN NEW.model = 'claude-ledger'
+             BEGIN SELECT RAISE(ABORT, 'injected projection failure'); END;",
+        )?;
+        let ledger = parse(
+            r#"{"id":"T-one","messages":[{"role":"assistant","messageId":"m1","usage":{}}],"usageLedger":{"events":[{"id":"ledger-1","timestamp":3,"model":"claude-ledger","tokens":{"input":30}}]}}"#,
+        )?;
+
+        assert!(project_parsed_thread(&db, &ledger, &identity).is_err());
+
+        let retained: (String, i64) =
+            db.connection()
+                .query_row("SELECT model, input_tokens FROM llm_calls", [], |row| {
+                    Ok((row.get(0)?, row.get(1)?))
+                })?;
+        assert_eq!(retained, ("claude-test".into(), 10));
+        assert_eq!(count(&db, "llm_calls")?, 1);
+        assert_eq!(count(&db, "run_steps")?, 1);
         Ok(())
     }
 

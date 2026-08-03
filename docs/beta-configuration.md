@@ -127,9 +127,20 @@ parser retains only usage metadata such as model, timestamp, token counts, and
 stable event identity. It does not persist thread titles, message content,
 thinking, tool payloads, environment details, or Amp user identity.
 
+This integration depends on an unstable Amp CLI contract. Amp may change its
+thread-list or export commands and schemas without notice, temporarily forcing
+Shirabe onto its local fallback until compatibility is restored. CLI results
+cover the personal account currently signed in to Amp; they are not enterprise,
+organization-wide, or administrator analytics.
+
 If the CLI cannot be discovered, authenticated, or parsed, Shirabe falls back
 to configured local thread paths. This is best-effort usage reporting rather
-than billing-grade auditing: the local cache may omit threads or usage fields.
+than billing-grade auditing. The local cache can omit web and orb activity,
+threads created on other devices, other remote-only activity, and any thread or
+usage details that Amp has not materialized locally. Deleted or inaccessible
+threads cannot be recovered by either path unless Shirabe imported their usage
+before they became unavailable.
+
 Shirabe uses Amp-reported token counts and applies the same LiteLLM price
 estimates as other sources. Amp credits and provider-specific BYOK charges are
 not imported.

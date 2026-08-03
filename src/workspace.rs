@@ -15,7 +15,7 @@ use serde_json::json;
 use crate::{
     config::{Identity, SourcePaths, SourceSettings, home_dir},
     db::{Database, now_ns, stable_hash},
-    importers::{self, ImportIdentity, ImportReport},
+    importers::{self, ImportIdentity, ImportReport, SupersedeCollectedEvents},
     projection::{
         event::NormalizedEvent,
         projector::{ProjectionCache, Projector},
@@ -564,13 +564,43 @@ pub fn drain_inbox(db: &Database, workspace_dir: &Path) -> Result<DrainReport> {
         let mut projection_cache = ProjectionCache::default();
         let mut touched_session_ids = HashSet::<String>::new();
         let mut touched_run_ids = HashSet::<String>::new();
+        let mut events = Vec::<NormalizedEvent>::new();
+        let mut supersessions = Vec::<SupersedeCollectedEvents>::new();
         for line in reader.lines() {
             let line = line.with_context(|| format!("read {}", path.display()))?;
             if line.trim().is_empty() {
                 continue;
             }
-            let event: NormalizedEvent = serde_json::from_str(&line)
-                .with_context(|| format!("parse collected event from {}", path.display()))?;
+            let value: serde_json::Value = serde_json::from_str(&line)
+                .with_context(|| format!("parse collected record from {}", path.display()))?;
+            if value.get("record_type").and_then(|value| value.as_str())
+                == Some("supersede_source_events_v1")
+            {
+                supersessions.push(serde_json::from_value(value).with_context(|| {
+                    format!("parse collected supersession from {}", path.display())
+                })?);
+            } else {
+                events.push(
+                    serde_json::from_value(value).with_context(|| {
+                        format!("parse collected event from {}", path.display())
+                    })?,
+                );
+            }
+        }
+        for supersession in supersessions {
+            validate_supersession(&supersession, &events)?;
+            for (run_id, session_id) in db.retire_source_events(
+                &supersession.profile_id,
+                &supersession.source,
+                &supersession.source_event_ids,
+            )? {
+                touched_run_ids.insert(run_id);
+                if let Some(session_id) = session_id {
+                    touched_session_ids.insert(session_id);
+                }
+            }
+        }
+        for event in events {
             let projection = projector.project_with_cache(&event, &mut projection_cache)?;
             if let Some(session_id) = projection.session_id {
                 touched_session_ids.insert(session_id);
@@ -610,6 +640,34 @@ pub fn drain_inbox(db: &Database, workspace_dir: &Path) -> Result<DrainReport> {
         files_drained,
         events_projected,
     })
+}
+
+fn validate_supersession(
+    supersession: &SupersedeCollectedEvents,
+    events: &[NormalizedEvent],
+) -> Result<()> {
+    anyhow::ensure!(
+        supersession.record_type == "supersede_source_events_v1"
+            && supersession.source == "amp"
+            && !supersession.profile_id.trim().is_empty()
+            && !supersession.source_event_ids.is_empty(),
+        "invalid collected supersession scope"
+    );
+    let ledger_thread_prefixes = events
+        .iter()
+        .filter(|event| event.profile_id == supersession.profile_id && event.source == "amp")
+        .filter_map(|event| event.source_event_id.as_deref())
+        .filter_map(|id| id.split_once(":ledger:").map(|(prefix, _)| prefix))
+        .collect::<HashSet<_>>();
+    anyhow::ensure!(
+        supersession.source_event_ids.iter().all(|id| {
+            id.split_once(":message:").is_some_and(|(prefix, suffix)| {
+                !suffix.is_empty() && ledger_thread_prefixes.contains(prefix)
+            })
+        }),
+        "collected supersession does not match an Amp ledger replacement"
+    );
+    Ok(())
 }
 
 fn publication_receipt(inbox_file: &Path) -> PathBuf {
@@ -1342,6 +1400,74 @@ mod tests {
             ("device_1".to_string(), "profile_b".to_string())
         );
 
+        let _ = std::fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn shared_workspace_ledger_replaces_previously_drained_amp_message_usage() -> Result<()> {
+        let root = std::env::temp_dir().join(format!("shirabe-amp-replace-{}", super::now_ns()));
+        let workspace = prepare(Some(root.clone()))?;
+        let source = root.join("amp-thread.json");
+        let identity = test_identity("amp_replace");
+        let settings = SourceSettings::from_values(Vec::new(), None);
+        let paths = test_source_paths(&root.join("missing"));
+        let db = Database::open(&workspace.catalog_db)?;
+        db.migrate()?;
+        std::fs::write(
+            &source,
+            r#"{"id":"T-one","messages":[{"role":"assistant","messageId":"m1","model":"message-model","timestamp":1,"usage":{"inputTokens":10}}]}"#,
+        )?;
+        collect_to_inbox_with(
+            Some(root.clone()),
+            &paths,
+            &settings,
+            &identity,
+            |_, _, import_identity, writer| {
+                crate::importers::amp::collect_local_recent(
+                    std::slice::from_ref(&source),
+                    import_identity,
+                    writer,
+                    i64::MIN,
+                )
+            },
+            |from, to| {
+                std::fs::rename(from, to)?;
+                Ok(())
+            },
+        )?;
+        drain_inbox(&db, &workspace.workspace_dir)?;
+
+        std::fs::write(
+            &source,
+            r#"{"id":"T-one","messages":[{"role":"assistant","messageId":"m1","usage":{}}],"usageLedger":{"events":[{"id":"l1","timestamp":2,"model":"ledger-model","tokens":{"input":30}}]}}"#,
+        )?;
+        collect_to_inbox_with(
+            Some(root.clone()),
+            &paths,
+            &settings,
+            &identity,
+            |_, _, import_identity, writer| {
+                crate::importers::amp::collect_local_recent(
+                    std::slice::from_ref(&source),
+                    import_identity,
+                    writer,
+                    i64::MIN,
+                )
+            },
+            |from, to| {
+                std::fs::rename(from, to)?;
+                Ok(())
+            },
+        )?;
+        drain_inbox(&db, &workspace.workspace_dir)?;
+
+        let values: (i64, i64, String) = db.connection().query_row(
+            "SELECT COUNT(*), COALESCE(SUM(input_tokens), 0), MIN(model) FROM llm_calls",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        assert_eq!(values, (1, 30, "ledger-model".into()));
         let _ = std::fs::remove_dir_all(root);
         Ok(())
     }
