@@ -165,11 +165,15 @@ pub(crate) fn parse_thread(
         else {
             continue;
         };
-        if let Some(id) = message.message_id.as_ref() {
+        if let Some(id) = message
+            .message_id
+            .as_deref()
+            .filter(|id| !id.trim().is_empty())
+        {
             let cache_write = usage.cache_creation_input_tokens.unwrap_or(0);
             let cache_read = usage.cache_read_input_tokens.unwrap_or(0);
             if cache_write >= 0 && cache_read >= 0 {
-                cache.insert(id.clone(), (cache_write, cache_read));
+                cache.insert(id.to_string(), (cache_write, cache_read));
             }
         }
         let Some(model) = usage
@@ -191,10 +195,16 @@ pub(crate) fn parse_thread(
         let Some(mapped) = map_current(usage, &mut diagnostics) else {
             continue;
         };
-        let identity_fallback = message.message_id.is_none();
+        let explicit_id = message
+            .message_id
+            .as_deref()
+            .filter(|id| !id.trim().is_empty());
+        let identity_fallback = explicit_id.is_none();
         let id = message
             .message_id
-            .clone()
+            .as_deref()
+            .filter(|id| !id.trim().is_empty())
+            .map(str::to_string)
             .unwrap_or_else(|| stable_hash(&format!("{thread_id}:{occurred}:{index}:{model}")));
         message_events.push(make_event(
             identity,
@@ -254,10 +264,13 @@ pub(crate) fn parse_thread(
             if input == 0 && output == 0 && cache_write == 0 && cache_read == 0 {
                 continue;
             }
-            let identity_fallback = item.id.is_none();
+            let explicit_id = item.id.as_deref().filter(|id| !id.trim().is_empty());
+            let identity_fallback = explicit_id.is_none();
             let id = item
                 .id
-                .clone()
+                .as_deref()
+                .filter(|id| !id.trim().is_empty())
+                .map(str::to_string)
                 .unwrap_or_else(|| stable_hash(&format!("{thread_id}:{occurred}:{index}:{model}")));
             ledger_events.push(make_event(
                 identity,
@@ -343,9 +356,10 @@ fn map_current(value: &CurrentUsage, diagnostics: &mut Diagnostics) -> Option<Ma
             value.cache_creation_input_tokens.unwrap_or(0),
             value.cache_read_input_tokens.unwrap_or(0),
         );
+        let split_total = values.0.checked_add(values.1)?.checked_add(values.2)?;
         if value
             .total_input_tokens
-            .is_some_and(|total| total != values.0 + values.1 + values.2)
+            .is_some_and(|total| total != split_total)
         {
             diagnostics.mismatches += 1;
         }
@@ -463,35 +477,84 @@ fn provider(model: &str) -> Option<&'static str> {
     }
 }
 fn valid_thread_id(id: &str) -> bool {
-    id.starts_with("T-") && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+    id.strip_prefix("T-").is_some_and(|suffix| {
+        !suffix.is_empty()
+            && suffix
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-')
+    })
 }
 fn timestamp_ns(value: &str) -> Option<i64> {
     value
         .parse::<u64>()
         .ok()
         .and_then(|v| i64::try_from(v).ok())
-        .map(|v| v.saturating_mul(1_000_000))
+        .and_then(|v| v.checked_mul(1_000_000))
         .or_else(|| parse_rfc3339_ns(value))
 }
 fn parse_rfc3339_ns(value: &str) -> Option<i64> {
-    let date_time = value.strip_suffix('Z')?;
-    let (date, time) = date_time.split_once('T')?;
-    let mut d = date.split('-');
-    let year = d.next()?.parse::<i64>().ok()?;
-    let month = d.next()?.parse::<i64>().ok()?;
-    let day = d.next()?.parse::<i64>().ok()?;
-    let (clock, fraction) = time.split_once('.').unwrap_or((time, ""));
-    let mut t = clock.split(':');
-    let hour = t.next()?.parse::<i64>().ok()?;
-    let minute = t.next()?.parse::<i64>().ok()?;
-    let second = t.next()?.parse::<i64>().ok()?;
-    let nanos = fraction
-        .chars()
-        .take(9)
-        .collect::<String>()
-        .parse::<i64>()
-        .unwrap_or_default()
-        * 10_i64.pow(9_u32.saturating_sub(fraction.len().min(9) as u32));
+    let bytes = value.as_bytes();
+    if bytes.len() < 20
+        || bytes.len() > 30
+        || bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || bytes[10] != b'T'
+        || bytes[13] != b':'
+        || bytes[16] != b':'
+        || *bytes.last()? != b'Z'
+    {
+        return None;
+    }
+    let parse_digits = |range: std::ops::Range<usize>| -> Option<i64> {
+        let digits = bytes.get(range)?;
+        digits.iter().all(u8::is_ascii_digit).then(|| {
+            digits
+                .iter()
+                .fold(0_i64, |value, digit| value * 10 + i64::from(digit - b'0'))
+        })
+    };
+    let year = parse_digits(0..4)?;
+    let month = parse_digits(5..7)?;
+    let day = parse_digits(8..10)?;
+    let hour = parse_digits(11..13)?;
+    let minute = parse_digits(14..16)?;
+    let second = parse_digits(17..19)?;
+    if year == 0 || !(1..=12).contains(&month) || hour > 23 || minute > 59 || second > 59 {
+        return None;
+    }
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let month_days = [
+        31,
+        if leap { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
+    if day == 0 || day > month_days[(month - 1) as usize] {
+        return None;
+    }
+    let nanos = if bytes.len() == 20 {
+        0
+    } else {
+        if bytes[19] != b'.' {
+            return None;
+        }
+        let fraction = &bytes[20..bytes.len() - 1];
+        if fraction.is_empty() || fraction.len() > 9 || !fraction.iter().all(u8::is_ascii_digit) {
+            return None;
+        }
+        fraction
+            .iter()
+            .fold(0_i64, |value, digit| value * 10 + i64::from(digit - b'0'))
+            .checked_mul(10_i64.pow((9 - fraction.len()) as u32))?
+    };
     let year = year - i64::from(month <= 2);
     let era = if year >= 0 { year } else { year - 399 } / 400;
     let yoe = year - era * 400;
@@ -501,13 +564,11 @@ fn parse_rfc3339_ns(value: &str) -> Option<i64> {
     let mp = month + if month > 2 { -3 } else { 9 };
     let doy = (153 * mp + 2) / 5 + day - 1;
     let days = era * 146097 + (yoe * 365 + yoe / 4 - yoe / 100 + doy) - 719468;
-    Some(
-        days * 86_400_000_000_000
-            + hour * 3_600_000_000_000
-            + minute * 60_000_000_000
-            + second * 1_000_000_000
-            + nanos,
-    )
+    days.checked_mul(86_400_000_000_000)?
+        .checked_add(hour.checked_mul(3_600_000_000_000)?)?
+        .checked_add(minute.checked_mul(60_000_000_000)?)?
+        .checked_add(second.checked_mul(1_000_000_000)?)?
+        .checked_add(nanos)
 }
 
 #[cfg(test)]
@@ -711,6 +772,7 @@ mod tests {
     #[test]
     fn rejects_invalid_thread_id_without_leaking_nested_private_values() {
         assert!(parse(r#"{"id":"bad/private","messages":[]}"#).is_err());
+        assert!(parse(r#"{"id":"T-","messages":[]}"#).is_err());
         let private = "PRIVATE_SENTINEL";
         let json = format!(
             r#"{{"id":"T-safe","updatedAt":{{"x":"{private}"}},"messages":[{{"role":"assistant","messageId":{{"x":"{private}"}},"model":"x","timestamp":1,"usage":{{"inputTokens":1}}}}],"usageLedger":{{"events":[{{"id":1,"timestamp":2,"model":"x","tokens":{{"input":1}},"toMessageId":{{"x":"{private}"}}}}]}}}}"#
@@ -718,5 +780,94 @@ mod tests {
         let result = parse(&json);
         assert!(!format!("{result:?}").contains(private));
         assert_eq!(result.unwrap().events.len(), 1);
+    }
+
+    #[test]
+    fn numeric_timestamp_milliseconds_are_checked() {
+        let max_millis = i64::MAX / 1_000_000;
+        assert_eq!(
+            timestamp_ns(&max_millis.to_string()),
+            max_millis.checked_mul(1_000_000)
+        );
+        assert_eq!(timestamp_ns(&(max_millis + 1).to_string()), None);
+        assert_eq!(timestamp_ns("18446744073709551615"), None);
+    }
+
+    #[test]
+    fn rfc3339_timestamp_accepts_exact_valid_values() {
+        assert_eq!(timestamp_ns("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(
+            timestamp_ns("2000-02-29T23:59:59.1Z"),
+            Some(951_868_799_100_000_000)
+        );
+        assert_eq!(
+            timestamp_ns("1970-01-01T00:00:00.123456789Z"),
+            Some(123_456_789)
+        );
+    }
+
+    #[test]
+    fn rfc3339_timestamp_rejects_invalid_values() {
+        for value in [
+            "2023-02-29T00:00:00Z",
+            "2024-02-30T00:00:00Z",
+            "2024-04-31T00:00:00Z",
+            "2024-00-01T00:00:00Z",
+            "2024-01-01T24:00:00Z",
+            "2024-01-01T00:60:00Z",
+            "2024-01-01T00:00:60Z",
+            "2024-01-01T00:00:00.Z",
+            "2024-01-01T00:00:00.1234567890Z",
+            "2024-01-01T00:00:00.aZ",
+            "2024-01-01T00:00:00Zextra",
+            "2024-01-01T00:00:00:00Z",
+            "10000-01-01T00:00:00Z",
+            "0000-01-01T00:00:00Z",
+        ] {
+            assert_eq!(timestamp_ns(value), None, "accepted {value}");
+        }
+    }
+
+    #[test]
+    fn split_token_sum_overflow_rejects_record_without_panicking() {
+        let messages = format!(
+            r#"[{{"role":"assistant","model":"x","timestamp":1,"usage":{{"inputTokens":{},"cacheReadInputTokens":1,"totalInputTokens":{}}}}}]"#,
+            i64::MAX,
+            i64::MAX
+        );
+        let p = parse(&wrap("", &messages)).unwrap();
+        assert!(p.events.is_empty());
+    }
+
+    #[test]
+    fn blank_explicit_ids_use_distinct_deterministic_fallbacks() {
+        let messages = r#"[{"role":"assistant","messageId":"","model":"x","timestamp":1,"usage":{"inputTokens":1}},{"role":"assistant","messageId":"  ","model":"x","timestamp":1,"usage":{"inputTokens":1}}]"#;
+        let first = parse(&wrap("", messages)).unwrap();
+        let second = parse(&wrap("", messages)).unwrap();
+        assert_eq!(
+            first.events[0].source_event_id,
+            second.events[0].source_event_id
+        );
+        assert_ne!(
+            first.events[0].source_event_id,
+            first.events[1].source_event_id
+        );
+        assert!(first.events.iter().all(|event| event.operation.metadata
+            == Some(serde_json::json!({"identity_fallback": true}))));
+        assert!(
+            first
+                .events
+                .iter()
+                .all(|event| (event.confidence - 0.72).abs() < f64::EPSILON)
+        );
+
+        let ledger = r#", "usageLedger":{"events":[{"id":" ","timestamp":1,"model":"x","tokens":{"input":1}},{"id":"","timestamp":1,"model":"x","tokens":{"input":1}}]}"#;
+        let parsed = parse(&wrap(ledger, "[]")).unwrap();
+        assert_ne!(
+            parsed.events[0].source_event_id,
+            parsed.events[1].source_event_id
+        );
+        assert!(parsed.events.iter().all(|event| event.operation.metadata
+            == Some(serde_json::json!({"identity_fallback": true}))));
     }
 }
