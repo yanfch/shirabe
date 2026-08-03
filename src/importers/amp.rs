@@ -4,7 +4,11 @@ use std::{
     io::{BufReader, Cursor, Read, Write},
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::mpsc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -114,7 +118,68 @@ fn is_terminal_control_line(line: &str) -> bool {
 
 pub(crate) trait AmpCommandRunner {
     fn list(&self, offset: usize) -> Result<Vec<u8>>;
-    fn export(&self, thread_id: &str) -> Result<Vec<u8>>;
+    fn export(&self, thread_id: &str, identity: &ImportIdentity) -> Result<ParsedExport>;
+}
+
+#[derive(Debug)]
+pub(crate) struct ParsedExport {
+    parsed: ParsedThread,
+    fingerprint: String,
+    byte_count: u64,
+}
+
+struct CappedHashingReader<R> {
+    inner: R,
+    cap: u64,
+    count: u64,
+    hasher: Sha256,
+    exceeded: Arc<AtomicBool>,
+}
+
+impl<R: Read> Read for CappedHashingReader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        if self.count == self.cap {
+            let mut probe = [0];
+            if self.inner.read(&mut probe)? != 0 {
+                self.exceeded.store(true, Ordering::Relaxed);
+                return Err(std::io::Error::other("Amp export output limit exceeded"));
+            }
+            return Ok(0);
+        }
+        let remaining = (self.cap - self.count).min(buffer.len() as u64) as usize;
+        let read = self.inner.read(&mut buffer[..remaining])?;
+        self.hasher.update(&buffer[..read]);
+        self.count += read as u64;
+        Ok(read)
+    }
+}
+
+fn parse_export_reader<R: Read>(
+    reader: R,
+    cap: u64,
+    identity: &ImportIdentity,
+) -> Result<ParsedExport> {
+    let exceeded = Arc::new(AtomicBool::new(false));
+    let mut reader = CappedHashingReader {
+        inner: reader,
+        cap,
+        count: 0,
+        hasher: Sha256::new(),
+        exceeded: exceeded.clone(),
+    };
+    let parsed = parse_thread_reader(&mut reader, "amp_cli_thread_export", identity);
+    // A schema error may stop serde before the cap. Continue consuming without
+    // retaining bytes so cap+1 always wins over malformed-content reporting.
+    let _ = std::io::copy(&mut reader, &mut std::io::sink());
+    if exceeded.load(Ordering::Relaxed) {
+        bail!("Amp export output limit exceeded")
+    }
+    let parsed = parsed.context("invalid Amp export")?;
+    Ok(ParsedExport {
+        parsed,
+        fingerprint: hex::encode(reader.hasher.finalize()),
+        byte_count: reader.count,
+    })
 }
 
 struct ProcessAmpRunner {
@@ -124,19 +189,17 @@ struct ProcessAmpRunner {
     export_cap: usize,
 }
 impl ProcessAmpRunner {
-    fn run(
-        &self,
-        kind: &'static str,
-        args: &[&str],
-        cap: usize,
-        thread_id: Option<&str>,
-    ) -> Result<Vec<u8>> {
-        let mut child = Command::new(&self.executable)
+    fn spawn(&self, kind: &'static str, args: &[&str]) -> Result<std::process::Child> {
+        Command::new(&self.executable)
             .args(args)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .with_context(|| format!("start Amp {kind} command"))?;
+            .with_context(|| format!("start Amp {kind} command"))
+    }
+
+    fn run_list(&self, kind: &'static str, args: &[&str], cap: usize) -> Result<Vec<u8>> {
+        let mut child = self.spawn(kind, args)?;
         let stdout = child.stdout.take().unwrap();
         let stderr = child.stderr.take().unwrap();
         let (tx, rx) = mpsc::channel();
@@ -164,10 +227,7 @@ impl ProcessAmpRunner {
                     if output.len() > cap {
                         let _ = child.kill();
                         let _ = child.wait();
-                        bail!(
-                            "Amp {kind} output limit exceeded{}",
-                            thread_id.map(|id| format!(" for {id}")).unwrap_or_default()
-                        )
+                        bail!("Amp {kind} output limit exceeded")
                     }
                     captured = Some(output);
                 }
@@ -175,10 +235,7 @@ impl ProcessAmpRunner {
             if started.elapsed() >= self.deadline {
                 let _ = child.kill();
                 let _ = child.wait();
-                bail!(
-                    "Amp {kind} command timed out{}",
-                    thread_id.map(|id| format!(" for {id}")).unwrap_or_default()
-                )
+                bail!("Amp {kind} command timed out")
             }
             if let Some(status) = child.try_wait()? {
                 let output = match captured {
@@ -188,19 +245,15 @@ impl ProcessAmpRunner {
                         .map_err(|_| anyhow::anyhow!("Amp {kind} output unavailable"))??,
                 };
                 if output.len() > cap {
-                    bail!(
-                        "Amp {kind} output limit exceeded{}",
-                        thread_id.map(|id| format!(" for {id}")).unwrap_or_default()
-                    )
+                    bail!("Amp {kind} output limit exceeded")
                 }
                 if !status.success() {
                     bail!(
-                        "Amp {kind} command exited with status {}{}",
+                        "Amp {kind} command exited with status {}",
                         status
                             .code()
                             .map(|v| v.to_string())
-                            .unwrap_or_else(|| "signal".into()),
-                        thread_id.map(|id| format!(" for {id}")).unwrap_or_default()
+                            .unwrap_or_else(|| "signal".into())
                     )
                 }
                 return Ok(output);
@@ -211,7 +264,7 @@ impl ProcessAmpRunner {
 }
 impl AmpCommandRunner for ProcessAmpRunner {
     fn list(&self, offset: usize) -> Result<Vec<u8>> {
-        self.run(
+        self.run_list(
             "list",
             &[
                 "threads",
@@ -223,19 +276,57 @@ impl AmpCommandRunner for ProcessAmpRunner {
                 &offset.to_string(),
             ],
             self.list_cap,
-            None,
         )
     }
-    fn export(&self, id: &str) -> Result<Vec<u8>> {
+    fn export(&self, id: &str, identity: &ImportIdentity) -> Result<ParsedExport> {
         if !valid_thread_id(id) {
             bail!("invalid Amp thread id")
         }
-        self.run(
-            "export",
-            &["threads", "export", id],
-            self.export_cap,
-            Some(id),
-        )
+        let mut child = self.spawn("export", &["threads", "export", id])?;
+        let stdout = child.stdout.take().unwrap();
+        let mut stderr = child.stderr.take().unwrap();
+        thread::spawn(move || {
+            let _ = std::io::copy(&mut stderr, &mut std::io::sink());
+        });
+        let (tx, rx) = mpsc::channel();
+        let cap = self.export_cap as u64;
+        let identity = identity.clone();
+        thread::spawn(move || {
+            let _ = tx.send(parse_export_reader(stdout, cap, &identity));
+        });
+        let started = Instant::now();
+        let mut parsed = None;
+        loop {
+            if parsed.is_none()
+                && let Ok(result) = rx.try_recv()
+            {
+                parsed = Some(result);
+            }
+            if started.elapsed() >= self.deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                bail!("Amp export command timed out for {id}")
+            }
+            if let Some(status) = child.try_wait()? {
+                let result = match parsed {
+                    Some(result) => result,
+                    None => rx
+                        .recv_timeout(Duration::from_secs(1))
+                        .map_err(|_| anyhow::anyhow!("Amp export output unavailable for {id}"))?,
+                };
+                if !status.success() {
+                    bail!("Amp export command failed for {id}")
+                }
+                return result.map_err(|error| {
+                    if error.to_string().contains("limit exceeded") {
+                        anyhow::anyhow!("Amp export output limit exceeded for {id}")
+                    } else {
+                        anyhow::anyhow!("invalid Amp export for {id}")
+                    }
+                });
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
     }
 }
 
@@ -366,8 +457,8 @@ fn sync_with_runner(
         }
         let preserved = prior.unwrap_or_default();
         let file_id = db.prepare_amp_virtual(&source_id, &thread.id, thread.message_count)?;
-        let bytes = match runner.export(&thread.id) {
-            Ok(bytes) => bytes,
+        let exported = match runner.export(&thread.id, identity) {
+            Ok(exported) => exported,
             Err(_) => {
                 db.fail_amp_virtual(
                     &file_id,
@@ -378,21 +469,9 @@ fn sync_with_runner(
                 continue;
             }
         };
-        stats.bytes = stats.bytes.saturating_add(bytes.len() as u64);
-        let digest = hex::encode(Sha256::digest(&bytes));
-        let parsed =
-            match parse_thread_reader(Cursor::new(bytes), "amp_cli_thread_export", identity) {
-                Ok(parsed) => parsed,
-                Err(_) => {
-                    db.fail_amp_virtual(
-                        &file_id,
-                        &preserved,
-                        &format!("Amp export schema failed for {}", thread.id),
-                    )?;
-                    stats.warnings += 1;
-                    continue;
-                }
-            };
+        stats.bytes = stats.bytes.saturating_add(exported.byte_count);
+        let digest = exported.fingerprint;
+        let parsed = exported.parsed;
         let event_count = parsed.events.len();
         let updated = parsed.updated_at_ns;
         let warnings = parsed_warning_count(&parsed);
@@ -1556,14 +1635,14 @@ mod tests {
                 format!("title {i} 1 day ago archived 0 T-{i}\n")
             })))
         }
-        fn export(&self, id: &str) -> Result<Vec<u8>> {
+        fn export(&self, id: &str, identity: &ImportIdentity) -> Result<ParsedExport> {
             if self.fail.as_deref() == Some(id) {
                 bail!("private failure")
             }
-            Ok(
+            let bytes =
                 format!(r#"{{"id":"{id}","updatedAt":"2020-01-01T00:00:00Z","messages":[]}}"#)
-                    .into_bytes(),
-            )
+                    .into_bytes();
+            parse_export_reader(Cursor::new(bytes), MAX_THREAD_JSON_BYTES, identity)
         }
     }
 
@@ -1626,12 +1705,16 @@ mod tests {
                 "title now private {count} T-state\n"
             ))))
         }
-        fn export(&self, _: &str) -> Result<Vec<u8>> {
+        fn export(&self, _: &str, identity: &ImportIdentity) -> Result<ParsedExport> {
             *self.exports.lock().unwrap() += 1;
             if *self.fail.lock().unwrap() {
                 bail!("PRIVATE_SENTINEL")
             }
-            Ok(self.payload.clone())
+            parse_export_reader(
+                Cursor::new(self.payload.clone()),
+                MAX_THREAD_JSON_BYTES,
+                identity,
+            )
         }
     }
 
@@ -1664,13 +1747,29 @@ mod tests {
             "message count change refreshes"
         );
 
-        db.connection()
-            .execute("UPDATE import_files SET status='pending'", [])?;
+        let source_id: String = db.connection().query_row(
+            "SELECT source_id FROM import_sources WHERE source_kind='amp_cli_thread_export'",
+            [],
+            |row| row.get(0),
+        )?;
+        let successful = db.amp_virtual_state(&source_id, "T-state")?.unwrap();
+        db.prepare_amp_virtual(&source_id, "T-state", 2)?;
+        let pending = db.amp_virtual_state(&source_id, "T-state")?.unwrap();
+        assert_eq!(pending.status, "pending");
+        assert_eq!(pending.payload_fingerprint, successful.payload_fingerprint);
+        assert_eq!(pending.updated_at_ns, successful.updated_at_ns);
+        assert_eq!(pending.event_count, successful.event_count);
         sync_with_runner(&db, &runner, &identity)?;
         assert_eq!(
             *runner.exports.lock().unwrap(),
             4,
-            "manually pending records retry"
+            "crash-like pending records retry"
+        );
+        let recovered = db.amp_virtual_state(&source_id, "T-state")?.unwrap();
+        assert_eq!(recovered.status, "imported");
+        assert_eq!(
+            recovered.payload_fingerprint,
+            successful.payload_fingerprint
         );
         drop(db);
         let _ = fs::remove_dir_all(root);
@@ -1723,6 +1822,33 @@ mod tests {
             )
         );
         assert!(!after.4.contains("PRIVATE_SENTINEL"));
+
+        *runner.fail.lock().unwrap() = false;
+        *runner.message_count.lock().unwrap() = 3;
+        let new_payload = message_thread("T-state", "m2", 7, 0, 0, 0).into_bytes();
+        let new_fingerprint = hex::encode(Sha256::digest(&new_payload));
+        // MutableRunner owns the fixture for its lifetime, so replace it through
+        // the test's uniquely held value before the final retry.
+        let runner = MutableRunner {
+            message_count: Mutex::new(3),
+            payload: new_payload,
+            exports: Mutex::new(*runner.exports.lock().unwrap()),
+            fail: Mutex::new(false),
+        };
+        let exports_before = *runner.exports.lock().unwrap();
+        sync_with_runner(&db, &runner, &identity)?;
+        assert_eq!(*runner.exports.lock().unwrap(), exports_before + 1);
+        let recovered: (String, String, i64, String) = db.connection().query_row(
+            "SELECT status, fingerprint, event_count, metadata_json FROM import_files",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+        assert_eq!(recovered.0, "imported");
+        assert_eq!(recovered.1, new_fingerprint);
+        assert_eq!(recovered.2, 1);
+        let recovered_state: AmpVirtualImportState = serde_json::from_str(&recovered.3)?;
+        assert_eq!(recovered_state.payload_fingerprint, Some(new_fingerprint));
+        assert_eq!(recovered_state.event_count, 1);
         drop(db);
         let _ = fs::remove_dir_all(root);
         Ok(())
@@ -1741,7 +1867,7 @@ mod tests {
                 Ok(list_table(std::iter::once("malformed candidate\n".into())))
             }
         }
-        fn export(&self, _: &str) -> Result<Vec<u8>> {
+        fn export(&self, _: &str, _: &ImportIdentity) -> Result<ParsedExport> {
             *self.exports.lock().unwrap() += 1;
             bail!("must not export")
         }
@@ -1824,22 +1950,27 @@ mod tests {
             list_cap: 4,
             export_cap: 4,
         };
-        let error = runner.export("T-safe").unwrap_err().to_string();
+        let identity = ImportIdentity::new("p", "d");
+        let error = runner.export("T-safe", &identity).unwrap_err().to_string();
         assert!(error.contains("export") && error.contains("T-safe") && error.contains("limit"));
         assert!(!error.contains("PRIVATE_SENTINEL"));
         fs::remove_file(overflow)?;
 
         let flood = executable_script(
             "amp-stderr",
-            "i=0; while [ $i -lt 20000 ]; do echo PRIVATE_SENTINEL >&2; i=$((i+1)); done; printf ok",
+            "i=0; while [ $i -lt 20000 ]; do echo PRIVATE_SENTINEL >&2; i=$((i+1)); done; printf '{\"id\":\"T-safe\",\"updatedAt\":\"2020-01-01T00:00:00Z\",\"messages\":[]}'",
         )?;
         let runner = ProcessAmpRunner {
             executable: flood.clone(),
             deadline: Duration::from_secs(3),
             list_cap: 8,
-            export_cap: 8,
+            export_cap: 256,
         };
-        assert_eq!(runner.export("T-safe")?, b"ok");
+        let exported = runner.export("T-safe", &identity)?;
+        let fixture = br#"{"id":"T-safe","updatedAt":"2020-01-01T00:00:00Z","messages":[]}"#;
+        assert_eq!(exported.byte_count, fixture.len() as u64);
+        assert_eq!(exported.fingerprint, hex::encode(Sha256::digest(fixture)));
+        assert_eq!(exported.parsed.thread_id, "T-safe");
         fs::remove_file(flood)?;
         Ok(())
     }
