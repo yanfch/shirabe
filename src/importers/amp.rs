@@ -629,8 +629,34 @@ pub(crate) fn parse_thread_reader<R: Read>(
 
     let mut diagnostics = Diagnostics::default();
     let mut message_events = Vec::new();
+    let mut candidate_message_ids = HashSet::new();
     let mut cache = HashMap::new();
     for (index, message) in thread.messages.iter().enumerate() {
+        if message.role.as_deref() == Some("assistant") {
+            if let Some(id) = message
+                .message_id
+                .as_deref()
+                .filter(|id| !id.trim().is_empty())
+            {
+                candidate_message_ids.insert(format!("amp:{thread_id}:message:{id}"));
+            } else if let (Some(model), Some(occurred)) = (
+                message
+                    .usage
+                    .as_ref()
+                    .and_then(|usage| usage.model.as_deref())
+                    .or(message.model.as_deref())
+                    .filter(|model| !model.is_empty()),
+                message
+                    .usage
+                    .as_ref()
+                    .and_then(|usage| usage.timestamp.as_deref())
+                    .or(message.timestamp.as_deref())
+                    .and_then(timestamp_ns),
+            ) {
+                let id = stable_hash(&format!("{thread_id}:{occurred}:{index}:{model}"));
+                candidate_message_ids.insert(format!("amp:{thread_id}:message:{id}"));
+            }
+        }
         let Some(usage) = message
             .usage
             .as_ref()
@@ -780,10 +806,9 @@ pub(crate) fn parse_thread_reader<R: Read>(
     }
     let used_ledger = malformed_ledger_count == 0 && !ledger_events.is_empty();
     let superseded_source_event_ids = if used_ledger {
-        message_events
-            .iter()
-            .filter_map(|e| e.source_event_id.clone())
-            .collect()
+        let mut ids = candidate_message_ids.into_iter().collect::<Vec<_>>();
+        ids.sort();
+        ids
     } else {
         Vec::new()
     };
@@ -1161,7 +1186,7 @@ mod tests {
         );
         assert_eq!(
             p.superseded_source_event_ids,
-            vec!["amp:T-test-1:message:8"]
+            vec!["amp:T-test-1:message:7", "amp:T-test-1:message:8"]
         );
     }
     #[test]
@@ -1665,6 +1690,63 @@ mod tests {
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
         )?;
         assert_eq!(values, ("claude-new".into(), 40, 9, 3, 2));
+        Ok(())
+    }
+
+    #[test]
+    fn usable_ledger_retires_all_in_payload_message_identities() -> Result<()> {
+        let root = temp_dir("amp-local-reconcile-all-present");
+        fs::create_dir_all(&root)?;
+        let path = root.join("thread.json");
+        fs::write(
+            &path,
+            r#"{"id":"T-one","messages":[{"role":"assistant","messageId":"m1","model":"claude-test","timestamp":1,"usage":{"inputTokens":10}},{"role":"assistant","messageId":"m2","model":"claude-test","timestamp":2,"usage":{"inputTokens":20}}]}"#,
+        )?;
+        let db = test_db(&root)?;
+        let identity = ImportIdentity::new("profile", "device");
+        import_local_with_identity(&db, path.clone(), &identity)?;
+        assert_eq!(count(&db, "llm_calls")?, 2);
+
+        fs::write(
+            &path,
+            r#"{"id":"T-one","messages":[{"role":"assistant","messageId":"m1","model":"claude-test","timestamp":1,"usage":{"inputTokens":0}},{"role":"assistant","messageId":"m2","usage":{"inputTokens":20}}],"usageLedger":{"events":[{"id":"ledger-1","timestamp":3,"model":"claude-ledger","tokens":{"input":30}}]}}"#,
+        )?;
+        import_local_with_identity(&db, path, &identity)?;
+
+        assert_eq!(count(&db, "llm_calls")?, 1);
+        let model: String =
+            db.connection()
+                .query_row("SELECT model FROM llm_calls", [], |row| row.get(0))?;
+        assert_eq!(model, "claude-ledger");
+        Ok(())
+    }
+
+    #[test]
+    fn usable_ledger_does_not_retire_historical_message_absent_from_payload() -> Result<()> {
+        let root = temp_dir("amp-local-reconcile-absent");
+        fs::create_dir_all(&root)?;
+        let path = root.join("thread.json");
+        fs::write(
+            &path,
+            r#"{"id":"T-one","messages":[{"role":"assistant","messageId":"present","model":"claude-present","timestamp":1,"usage":{"inputTokens":10}},{"role":"assistant","messageId":"absent","model":"claude-absent","timestamp":2,"usage":{"inputTokens":20}}]}"#,
+        )?;
+        let db = test_db(&root)?;
+        let identity = ImportIdentity::new("profile", "device");
+        import_local_with_identity(&db, path.clone(), &identity)?;
+
+        fs::write(
+            &path,
+            r#"{"id":"T-one","messages":[{"role":"assistant","messageId":"present","usage":{}}],"usageLedger":{"events":[{"id":"ledger-1","timestamp":3,"model":"claude-ledger","tokens":{"input":30}}]}}"#,
+        )?;
+        import_local_with_identity(&db, path, &identity)?;
+
+        let mut models = db
+            .connection()
+            .prepare("SELECT model FROM llm_calls ORDER BY model")?;
+        let models = models
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        assert_eq!(models, vec!["claude-absent", "claude-ledger"]);
         Ok(())
     }
 
