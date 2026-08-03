@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
-    fs,
-    io::Write,
+    fs::{self, File},
+    io::{BufReader, Cursor, Read, Write},
     path::{Path, PathBuf},
     time::Instant,
 };
@@ -89,14 +89,14 @@ pub fn collect_local_recent(
         stats.files_seen += 1;
         stats.files_imported += 1;
         stats.bytes = stats.bytes.saturating_add(size);
-        let json = match fs::read_to_string(&path) {
-            Ok(json) => json,
+        let reader = match File::open(&path).map(BufReader::new) {
+            Ok(reader) => reader,
             Err(_) => {
                 stats.warnings += 1;
                 continue;
             }
         };
-        match parse_thread(&json, SOURCE_KIND, identity) {
+        match parse_thread_reader(reader, SOURCE_KIND, identity) {
             Ok(parsed) => {
                 stats.add_diagnostics(&parsed);
                 for event in parsed.events {
@@ -146,8 +146,9 @@ fn import_file(
     identity: &ImportIdentity,
     stats: &mut ScanStats,
 ) -> Result<()> {
-    let json = match fs::read_to_string(path) {
-        Ok(json) => json,
+    let file_size = fs::metadata(path).map(|metadata| metadata.len()).ok();
+    let reader = match File::open(path).map(BufReader::new) {
+        Ok(reader) => reader,
         Err(_) => {
             stats.warnings += 1;
             db.finish_import_file(
@@ -163,7 +164,7 @@ fn import_file(
             return Ok(());
         }
     };
-    let parsed = match parse_thread(&json, SOURCE_KIND, identity) {
+    let parsed = match parse_thread_reader(reader, SOURCE_KIND, identity) {
         Ok(parsed) => parsed,
         Err(_) => {
             stats.warnings += 1;
@@ -172,7 +173,7 @@ fn import_file(
                 "partial",
                 0,
                 1,
-                Some(json.len() as u64),
+                file_size,
                 None,
                 None,
                 Some("Amp JSON schema could not be parsed"),
@@ -185,11 +186,19 @@ fn import_file(
     let mut cache = ProjectionCache::default();
     let mut run_ids = HashSet::new();
     let mut session_ids = HashSet::new();
+    let mut retire_ids: HashSet<String> = parsed
+        .events
+        .iter()
+        .filter_map(|event| event.source_event_id.clone())
+        .collect();
     if parsed.used_ledger && parsed.malformed_ledger_count == 0 {
+        retire_ids.extend(parsed.superseded_source_event_ids.iter().cloned());
+    }
+    if !retire_ids.is_empty() {
         for (run_id, session_id) in db.retire_source_events(
             &identity.profile_id,
             "amp",
-            &parsed.superseded_source_event_ids,
+            &retire_ids.into_iter().collect::<Vec<_>>(),
         )? {
             run_ids.insert(run_id);
             if let Some(session_id) = session_id {
@@ -223,7 +232,7 @@ fn import_file(
         },
         event_count,
         file_warnings,
-        Some(json.len() as u64),
+        file_size,
         first,
         last,
         None,
@@ -464,7 +473,15 @@ pub(crate) fn parse_thread(
     source_kind: &str,
     identity: &ImportIdentity,
 ) -> Result<ParsedThread> {
-    let thread: Thread = serde_json::from_str(json)?;
+    parse_thread_reader(Cursor::new(json.as_bytes()), source_kind, identity)
+}
+
+pub(crate) fn parse_thread_reader<R: Read>(
+    reader: R,
+    source_kind: &str,
+    identity: &ImportIdentity,
+) -> Result<ParsedThread> {
+    let thread: Thread = serde_json::from_reader(BufReader::new(reader))?;
     let thread_id = thread.id.filter(|id| valid_thread_id(id));
     let Some(thread_id) = thread_id else {
         bail!("invalid Amp thread id")
@@ -906,7 +923,7 @@ fn parse_rfc3339_ns(value: &str) -> Option<i64> {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::PathBuf, time::SystemTime};
+    use std::{fs, io::Cursor, path::PathBuf, time::SystemTime};
 
     use crate::db::Database;
 
@@ -949,6 +966,22 @@ mod tests {
         );
         assert!(!serde_json::to_string(event).unwrap().contains(private));
         assert!(!format!("{parsed:?}").contains(private));
+    }
+
+    #[test]
+    fn thread_parser_accepts_a_reader_and_skips_unknown_content() {
+        let json = wrap(
+            "",
+            r#"[{"role":"assistant","messageId":"m","model":"x","timestamp":1,"unknown":{"private":"PRIVATE_SENTINEL"},"usage":{"inputTokens":2}}]"#,
+        );
+        let parsed = parse_thread_reader(
+            Cursor::new(json.into_bytes()),
+            "amp_thread_json",
+            &ImportIdentity::new("p", "d"),
+        )
+        .unwrap();
+        assert_eq!(parsed.events.len(), 1);
+        assert!(!format!("{parsed:?}").contains("PRIVATE_SENTINEL"));
     }
     #[test]
     fn empty_and_malformed_ledger_fall_back() {
@@ -1350,7 +1383,7 @@ mod tests {
     }
 
     #[test]
-    fn finalized_message_updates_all_mutable_usage_fields() -> Result<()> {
+    fn finalized_message_exactly_replaces_all_mutable_usage_fields() -> Result<()> {
         let root = temp_dir("amp-local-update");
         fs::create_dir_all(&root)?;
         let path = root.join("thread.json");
@@ -1361,11 +1394,11 @@ mod tests {
 
         fs::write(
             &path,
-            r#"{"id":"T-one","updatedAt":"2026-01-02T00:00:00Z","messages":[{"role":"assistant","messageId":"m1","model":"ignored-padding","usage":{"model":"gpt-5","timestamp":1767312000000,"inputTokens":100,"outputTokens":50,"cacheCreationInputTokens":30,"cacheReadInputTokens":20,"maxInputTokens":400000}}]}"#,
+            r#"{"id":"T-one","updatedAt":"2026-01-02T00:00:00Z","messages":[{"role":"assistant","messageId":"m1","model":"ignored-padding","usage":{"model":"gpt-5","timestamp":1767312000000,"inputTokens":100,"outputTokens":50,"cacheCreationInputTokens":30,"cacheReadInputTokens":20}}]}"#,
         )?;
         import_local_with_identity(&db, path, &identity)?;
 
-        let values: (i64, i64, i64, i64, String, i64, i64) = db.connection().query_row(
+        let values: (i64, i64, i64, i64, String, i64, Option<i64>) = db.connection().query_row(
             "SELECT input_tokens, output_tokens, cache_write_tokens, cache_read_tokens, model, started_at_ns, model_context_window FROM llm_calls",
             [],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?)),
@@ -1379,7 +1412,7 @@ mod tests {
                 20,
                 "gpt-5".into(),
                 1_767_312_000_000_000_000,
-                400000
+                None
             )
         );
         assert_eq!(count(&db, "llm_calls")?, 1);
@@ -1400,6 +1433,23 @@ mod tests {
         let failed = import_local_with_identity(&db, path.clone(), &identity)?;
         assert_eq!(failed.events_projected, 0);
         assert_eq!(count(&db, "llm_calls")?, 1);
+        let retained: (String, i64, i64, i64, i64, i64, Option<i64>) = db.connection().query_row(
+            "SELECT model, started_at_ns, input_tokens, output_tokens, cache_write_tokens, cache_read_tokens, model_context_window FROM llm_calls",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?)),
+        )?;
+        assert_eq!(
+            retained,
+            (
+                "claude-test".into(),
+                1_767_225_600_000_000_000,
+                10,
+                5,
+                3,
+                2,
+                Some(200000)
+            )
+        );
 
         fs::write(
             &path,
