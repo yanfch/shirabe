@@ -2,7 +2,7 @@
 use std::os::unix::fs::PermissionsExt;
 use std::{
     collections::{HashMap, HashSet},
-    fs,
+    fs::{self, OpenOptions},
     io::{BufRead, BufReader, BufWriter, Write},
     path::{Path, PathBuf},
 };
@@ -58,6 +58,12 @@ struct CollectorState {
     sources: HashMap<String, i64>,
     #[serde(default)]
     amp: importers::amp::AmpCollectorState,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct PendingCollection {
+    inbox_file: PathBuf,
+    state: CollectorState,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -328,8 +334,8 @@ fn collect_to_inbox_with<A, P>(
     source_paths: &SourcePaths,
     source_settings: &SourceSettings,
     identity: &Identity,
-    mut amp_collector: A,
-    mut publish: P,
+    amp_collector: A,
+    publish: P,
 ) -> Result<CollectReport>
 where
     A: FnMut(
@@ -339,6 +345,36 @@ where
         &mut dyn Write,
     ) -> Result<ImportReport>,
     P: FnMut(&Path, &Path) -> Result<()>,
+{
+    collect_to_inbox_with_state_writer(
+        workspace_path,
+        source_paths,
+        source_settings,
+        identity,
+        amp_collector,
+        publish,
+        write_collector_state,
+    )
+}
+
+fn collect_to_inbox_with_state_writer<A, P, S>(
+    workspace_path: Option<PathBuf>,
+    source_paths: &SourcePaths,
+    source_settings: &SourceSettings,
+    identity: &Identity,
+    mut amp_collector: A,
+    mut publish: P,
+    mut persist_state: S,
+) -> Result<CollectReport>
+where
+    A: FnMut(
+        &[PathBuf],
+        &mut importers::amp::AmpCollectorState,
+        &ImportIdentity,
+        &mut dyn Write,
+    ) -> Result<ImportReport>,
+    P: FnMut(&Path, &Path) -> Result<()>,
+    S: FnMut(&Path, &CollectorState) -> Result<()>,
 {
     let workspace = prepare(workspace_path)?;
     write_workspace_profile(&workspace.workspace_dir, identity)?;
@@ -351,6 +387,30 @@ where
             "{}.json",
             workspace_file_stem(&identity.profile_id)
         ));
+    let pending_path = state_path.with_extension("pending.json");
+    if pending_path.exists() {
+        let pending: PendingCollection = serde_json::from_slice(&fs::read(&pending_path)?)
+            .with_context(|| format!("parse {}", pending_path.display()))?;
+        let receipt = publication_receipt(&pending.inbox_file);
+        if pending.inbox_file.exists() || receipt.exists() {
+            persist_state(&state_path, &pending.state)?;
+            fs::remove_file(&pending_path)
+                .with_context(|| format!("remove {}", pending_path.display()))?;
+            if receipt.exists() {
+                fs::remove_file(&receipt)
+                    .with_context(|| format!("remove {}", receipt.display()))?;
+            }
+            return Ok(CollectReport {
+                status: "ok",
+                workspace_dir: workspace.workspace_dir,
+                inbox_file: Some(pending.inbox_file),
+                events_collected: 0,
+                sources: Vec::new(),
+            });
+        }
+        fs::remove_file(&pending_path)
+            .with_context(|| format!("remove {}", pending_path.display()))?;
+    }
     let state = read_collector_state(&state_path)?;
     let mut staged_state = state.clone();
     let profile_file_stem = workspace_file_stem(&identity.profile_id);
@@ -365,90 +425,105 @@ where
         fs::File::create(&temp_file).with_context(|| format!("create {}", temp_file.display()))?;
     let mut writer = BufWriter::new(file);
 
-    let mut sources = Vec::new();
-    if source_settings.is_enabled("codex") {
-        sources.push(importers::codex::collect_recent(
-            Some(source_paths.codex.clone()),
-            &import_identity,
-            &mut writer,
-            collector_since(&state, "codex"),
-        )?);
-    }
-    if source_settings.is_enabled("pi") {
-        sources.push(importers::pi::collect_recent(
-            Some(source_paths.pi.clone()),
-            &import_identity,
-            &mut writer,
-            collector_since(&state, "pi"),
-        )?);
-    }
-    if source_settings.is_enabled("claude") {
-        sources.push(importers::claude::collect_recent(
-            Some(source_paths.claude.clone()),
-            &import_identity,
-            &mut writer,
-            collector_since(&state, "claude"),
-        )?);
-    }
-    if source_settings.is_enabled("kanade") {
-        sources.push(importers::kanade::collect_recent(
-            Some(source_paths.kanade.clone()),
-            &import_identity,
-            &mut writer,
-            collector_since(&state, "kanade"),
-        )?);
-    }
-    if source_settings.is_enabled("amp") {
-        sources.push(amp_collector(
-            &source_paths.amp,
-            &mut staged_state.amp,
-            &import_identity,
-            &mut writer,
-        )?);
-    }
-    let events_collected = sources
-        .iter()
-        .map(|source| source.events_projected)
-        .sum::<usize>();
-
-    writer
-        .flush()
-        .with_context(|| format!("flush {}", temp_file.display()))?;
-    drop(writer);
-    let collected_at_ns = now_ns();
-    for source in &sources {
-        if source.files_seen > 0 {
-            staged_state
-                .sources
-                .insert(source.source.clone(), collected_at_ns);
+    let result = (|| -> Result<CollectReport> {
+        let mut sources = Vec::new();
+        if source_settings.is_enabled("codex") {
+            sources.push(importers::codex::collect_recent(
+                Some(source_paths.codex.clone()),
+                &import_identity,
+                &mut writer,
+                collector_since(&state, "codex"),
+            )?);
         }
-    }
-    if events_collected == 0 {
-        let _ = fs::remove_file(&temp_file);
-        write_collector_state(&state_path, &staged_state)?;
-        return Ok(CollectReport {
+        if source_settings.is_enabled("pi") {
+            sources.push(importers::pi::collect_recent(
+                Some(source_paths.pi.clone()),
+                &import_identity,
+                &mut writer,
+                collector_since(&state, "pi"),
+            )?);
+        }
+        if source_settings.is_enabled("claude") {
+            sources.push(importers::claude::collect_recent(
+                Some(source_paths.claude.clone()),
+                &import_identity,
+                &mut writer,
+                collector_since(&state, "claude"),
+            )?);
+        }
+        if source_settings.is_enabled("kanade") {
+            sources.push(importers::kanade::collect_recent(
+                Some(source_paths.kanade.clone()),
+                &import_identity,
+                &mut writer,
+                collector_since(&state, "kanade"),
+            )?);
+        }
+        if source_settings.is_enabled("amp") {
+            sources.push(amp_collector(
+                &source_paths.amp,
+                &mut staged_state.amp,
+                &import_identity,
+                &mut writer,
+            )?);
+        }
+        let events_collected = sources
+            .iter()
+            .map(|source| source.events_projected)
+            .sum::<usize>();
+
+        writer
+            .flush()
+            .with_context(|| format!("flush {}", temp_file.display()))?;
+        drop(writer);
+        let collected_at_ns = now_ns();
+        for source in &sources {
+            if source.files_seen > 0 {
+                staged_state
+                    .sources
+                    .insert(source.source.clone(), collected_at_ns);
+            }
+        }
+        if events_collected == 0 {
+            persist_state(&state_path, &staged_state)?;
+            return Ok(CollectReport {
+                status: "ok",
+                workspace_dir: workspace.workspace_dir,
+                inbox_file: None,
+                events_collected,
+                sources,
+            });
+        }
+
+        write_atomic_json(
+            &pending_path,
+            &PendingCollection {
+                inbox_file: inbox_file.clone(),
+                state: staged_state.clone(),
+            },
+        )?;
+        if let Err(error) = publish(&temp_file, &inbox_file) {
+            let _ = fs::remove_file(&temp_file);
+            let _ = fs::remove_file(&inbox_file);
+            let _ = fs::remove_file(&pending_path);
+            return Err(error);
+        }
+        persist_state(&state_path, &staged_state)?;
+        fs::remove_file(&pending_path)
+            .with_context(|| format!("remove {}", pending_path.display()))?;
+
+        Ok(CollectReport {
             status: "ok",
             workspace_dir: workspace.workspace_dir,
-            inbox_file: None,
+            inbox_file: Some(inbox_file),
             events_collected,
             sources,
-        });
-    }
-
-    if let Err(error) = publish(&temp_file, &inbox_file) {
+        })
+    })();
+    if result.is_err() || temp_file.exists() {
         let _ = fs::remove_file(&temp_file);
-        let _ = fs::remove_file(&inbox_file);
-        return Err(error);
     }
-    write_collector_state(&state_path, &staged_state)?;
-
-    Ok(CollectReport {
-        status: "ok",
-        workspace_dir: workspace.workspace_dir,
-        inbox_file: Some(inbox_file),
-        events_collected,
-        sources,
-    })
+    result
 }
 
 pub fn drain_inbox(db: &Database, workspace_dir: &Path) -> Result<DrainReport> {
@@ -499,6 +574,21 @@ pub fn drain_inbox(db: &Database, workspace_dir: &Path) -> Result<DrainReport> {
         db.refresh_observed_llm_latency_for_runs(touched_run_ids.iter().map(String::as_str))?;
         projector.refresh_session_summaries(touched_session_ids.iter().map(String::as_str))?;
         tx.commit()?;
+        if has_pending_collection_for(workspace_dir, &path)? {
+            let receipt = publication_receipt(&path);
+            let receipt_file = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&receipt)
+                .with_context(|| format!("create {}", receipt.display()))?;
+            receipt_file
+                .sync_all()
+                .with_context(|| format!("sync {}", receipt.display()))?;
+            fs::File::open(&inbox_dir)
+                .and_then(|directory| directory.sync_all())
+                .with_context(|| format!("sync {}", inbox_dir.display()))?;
+        }
         fs::remove_file(&path).with_context(|| format!("remove {}", path.display()))?;
         files_drained += 1;
     }
@@ -512,6 +602,36 @@ pub fn drain_inbox(db: &Database, workspace_dir: &Path) -> Result<DrainReport> {
         files_drained,
         events_projected,
     })
+}
+
+fn publication_receipt(inbox_file: &Path) -> PathBuf {
+    inbox_file.with_extension("receipt")
+}
+
+fn has_pending_collection_for(workspace_dir: &Path, inbox_file: &Path) -> Result<bool> {
+    let state_dir = workspace_dir.join("collector-state");
+    if !state_dir.exists() {
+        return Ok(false);
+    }
+    for entry in
+        fs::read_dir(&state_dir).with_context(|| format!("read {}", state_dir.display()))?
+    {
+        let path = entry?.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("json")
+            || !path
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .is_some_and(|value| value.ends_with(".pending"))
+        {
+            continue;
+        }
+        let pending: PendingCollection = serde_json::from_slice(&fs::read(&path)?)
+            .with_context(|| format!("parse {}", path.display()))?;
+        if pending.inbox_file == inbox_file {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn write_workspace_profile(workspace_dir: &Path, identity: &Identity) -> Result<()> {
@@ -583,12 +703,57 @@ fn read_collector_state(path: &Path) -> Result<CollectorState> {
 }
 
 fn write_collector_state(path: &Path, state: &CollectorState) -> Result<()> {
+    write_atomic_json(path, state)?;
+    chmod_best_effort(path, 0o666)
+}
+
+fn write_atomic_json(path: &Path, value: &impl Serialize) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
-    let raw = serde_json::to_string_pretty(state)?;
-    fs::write(path, format!("{raw}\n")).with_context(|| format!("write {}", path.display()))?;
-    chmod_best_effort(path, 0o666)
+    let raw = serde_json::to_string_pretty(value)?;
+    let parent = path
+        .parent()
+        .context("collector state path has no parent")?;
+    let stem = path.file_name().and_then(|v| v.to_str()).unwrap_or("state");
+    let mut attempt = 0u32;
+    let (temp_path, mut file) = loop {
+        let candidate = parent.join(format!(
+            ".{stem}.{}-{}-{attempt}.tmp",
+            std::process::id(),
+            now_ns()
+        ));
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(file) => break (candidate, file),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => attempt += 1,
+            Err(error) => {
+                return Err(error).with_context(|| format!("create {}", candidate.display()));
+            }
+        }
+    };
+    let result = (|| -> Result<()> {
+        file.write_all(format!("{raw}\n").as_bytes())
+            .with_context(|| format!("write {}", temp_path.display()))?;
+        file.flush()
+            .with_context(|| format!("flush {}", temp_path.display()))?;
+        file.sync_all()
+            .with_context(|| format!("sync {}", temp_path.display()))?;
+        drop(file);
+        fs::rename(&temp_path, path)
+            .with_context(|| format!("rename {} -> {}", temp_path.display(), path.display()))?;
+        fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .with_context(|| format!("sync {}", parent.display()))?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp_path);
+    }
+    result
 }
 
 fn workspace_file_stem(value: &str) -> String {
@@ -793,6 +958,104 @@ mod tests {
         assert_eq!(succeeded.events_collected, 1);
         let state: super::CollectorState = serde_json::from_slice(&std::fs::read(&state_path)?)?;
         assert_eq!(state.amp.threads["T-retry"].status, "imported");
+        let _ = std::fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn published_inbox_recovers_state_without_replaying_collection() -> Result<()> {
+        let root = std::env::temp_dir().join(format!("shirabe-state-recovery-{}", super::now_ns()));
+        let workspace = prepare(Some(root.clone()))?;
+        let identity = test_identity("state_recovery");
+        let settings = SourceSettings::from_values(Vec::new(), None);
+        let paths = test_source_paths(&root.join("missing"));
+        let mut collections = 0;
+        let mut fail_state = true;
+
+        let first = super::collect_to_inbox_with_state_writer(
+            Some(root.clone()),
+            &paths,
+            &settings,
+            &identity,
+            |_, state, _, writer| {
+                collections += 1;
+                state.threads.insert(
+                    "T-once".into(),
+                    crate::importers::amp::AmpCollectorThreadState {
+                        message_count: 1,
+                        updated_at_ns: 2,
+                        fingerprint: Some("once".into()),
+                        event_count: 1,
+                        status: "imported".into(),
+                    },
+                );
+                injected_amp_report(writer)
+            },
+            |from, to| {
+                std::fs::rename(from, to)?;
+                Ok(())
+            },
+            |path, state| {
+                if fail_state
+                    && path.file_name().and_then(|v| v.to_str()) == Some("state_recovery.json")
+                {
+                    fail_state = false;
+                    anyhow::bail!("forced state persistence failure");
+                }
+                super::write_collector_state(path, state)
+            },
+        );
+        assert!(first.is_err());
+        assert_eq!(
+            std::fs::read_dir(&workspace.inbox_dir)?
+                .filter_map(Result::ok)
+                .filter(|entry| entry.path().extension().and_then(|v| v.to_str()) == Some("jsonl"))
+                .count(),
+            1
+        );
+
+        let second = super::collect_to_inbox_with_state_writer(
+            Some(root.clone()),
+            &paths,
+            &settings,
+            &identity,
+            |_, _, _, _| {
+                collections += 1;
+                anyhow::bail!("must not replay collection")
+            },
+            |_, _| anyhow::bail!("must not publish again"),
+            |path, state| super::write_collector_state(path, state),
+        )?;
+        assert_eq!(collections, 1);
+        assert_eq!(second.events_collected, 0);
+        let state: super::CollectorState = serde_json::from_slice(&std::fs::read(
+            workspace
+                .workspace_dir
+                .join("collector-state/state_recovery.json"),
+        )?)?;
+        assert!(state.amp.threads.contains_key("T-once"));
+        let _ = std::fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn collector_error_removes_temporary_inbox_file() -> Result<()> {
+        let root =
+            std::env::temp_dir().join(format!("shirabe-collector-cleanup-{}", super::now_ns()));
+        let workspace = prepare(Some(root.clone()))?;
+        let result = collect_to_inbox_with(
+            Some(root.clone()),
+            &test_source_paths(&root.join("missing")),
+            &SourceSettings::from_values(Vec::new(), None),
+            &test_identity("cleanup"),
+            |_, _, _, writer| {
+                writer.write_all(b"partial")?;
+                anyhow::bail!("collector failed")
+            },
+            |_, _| unreachable!(),
+        );
+        assert!(result.is_err());
+        assert!(std::fs::read_dir(&workspace.inbox_dir)?.next().is_none());
         let _ = std::fs::remove_dir_all(root);
         Ok(())
     }
