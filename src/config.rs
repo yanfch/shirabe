@@ -361,7 +361,7 @@ fn expand_tilde_with_home(path: PathBuf, home: Option<PathBuf>) -> Result<PathBu
         return home.context("home directory is not set");
     }
 
-    if let Some(rest) = raw.strip_prefix("~/") {
+    if let Some(rest) = raw.strip_prefix("~/").or_else(|| raw.strip_prefix(r"~\")) {
         let home = home.context("home directory is not set")?;
         return Ok(home.join(rest));
     }
@@ -424,7 +424,8 @@ pub(crate) fn resolve_amp_paths_from_values(
 
     if candidates.is_empty() {
         candidates.push(
-            home.unwrap_or_else(|| PathBuf::from("."))
+            home.clone()
+                .unwrap_or_else(|| PathBuf::from("."))
                 .join(".local/share/amp/threads"),
         );
     }
@@ -432,7 +433,7 @@ pub(crate) fn resolve_amp_paths_from_values(
     let mut seen = HashSet::new();
     let mut paths = Vec::new();
     for candidate in candidates {
-        let path = expand_tilde(candidate)?;
+        let path = expand_tilde_with_home(candidate, home.clone())?;
         if seen.insert(path.clone()) {
             paths.push(path);
         }
@@ -556,7 +557,8 @@ mod tests {
 
     use super::{
         SourceSettings, config_dir_for_data_dir_with_home, default_shared_workspace_dir,
-        is_shared_workspace_dir, parse_platform_uuid, resolve_amp_paths_from_values,
+        expand_tilde_with_home, is_shared_workspace_dir, parse_platform_uuid,
+        resolve_amp_paths_from_values,
     };
 
     #[test]
@@ -616,6 +618,51 @@ mod tests {
             paths,
             vec![PathBuf::from("/one/threads"), PathBuf::from("/two/threads")]
         );
+    }
+
+    #[test]
+    fn expands_supported_tilde_separators_with_injected_home() {
+        let home = Some(PathBuf::from("/home/test"));
+
+        assert_eq!(
+            expand_tilde_with_home(PathBuf::from("~/amp"), home.clone()).unwrap(),
+            PathBuf::from("/home/test/amp")
+        );
+        assert_eq!(
+            expand_tilde_with_home(PathBuf::from(r"~\amp"), home).unwrap(),
+            PathBuf::from("/home/test/amp")
+        );
+    }
+
+    #[test]
+    fn preserves_literal_filenames_beginning_with_tilde() {
+        let path = PathBuf::from("~amp");
+
+        assert_eq!(
+            expand_tilde_with_home(path.clone(), Some(PathBuf::from("/home/test"))).unwrap(),
+            path
+        );
+    }
+
+    #[test]
+    fn amp_resolver_expands_configured_and_environment_tildes_with_injected_home() {
+        let configured = resolve_amp_paths_from_values(
+            Some(PathBuf::from("~/amp")),
+            None,
+            None,
+            Some(PathBuf::from("/home/test")),
+        )
+        .unwrap();
+        let environment = resolve_amp_paths_from_values(
+            None,
+            Some(PathBuf::from(r"~\amp")),
+            None,
+            Some(PathBuf::from("/home/test")),
+        )
+        .unwrap();
+
+        assert_eq!(configured, vec![PathBuf::from("/home/test/amp")]);
+        assert_eq!(environment, vec![PathBuf::from("/home/test/amp")]);
     }
 
     #[test]
