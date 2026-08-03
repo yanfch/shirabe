@@ -323,8 +323,7 @@ pub fn collect_to_inbox(
                     temp_file.display(),
                     inbox_file.display()
                 )
-            })?;
-            set_and_verify_published_mode(inbox_file)
+            })
         },
     )
 }
@@ -481,7 +480,11 @@ where
         writer
             .flush()
             .with_context(|| format!("flush {}", temp_file.display()))?;
-        drop(writer);
+        let completed_file = writer
+            .into_inner()
+            .map_err(|error| error.into_error())
+            .with_context(|| format!("complete {}", temp_file.display()))?;
+        set_and_verify_completed_mode(&completed_file, &temp_file)?;
         let collected_at_ns = now_ns();
         for source in &sources {
             if source.files_seen > 0 {
@@ -998,6 +1001,16 @@ fn sqlite_table_exists(conn: &Connection, table: &str) -> Result<bool> {
 
 #[cfg(unix)]
 fn enforce_shared_sticky_directory(path: &Path) -> Result<()> {
+    enforce_shared_sticky_directory_with(path, |directory| {
+        directory.set_permissions(fs::Permissions::from_mode(0o1777))
+    })
+}
+
+#[cfg(unix)]
+fn enforce_shared_sticky_directory_with<F>(path: &Path, chmod: F) -> Result<()>
+where
+    F: FnOnce(&File) -> std::io::Result<()>,
+{
     let directory = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
@@ -1011,9 +1024,17 @@ fn enforce_shared_sticky_directory(path: &Path) -> Result<()> {
         "shared path is not a directory: {}",
         path.display()
     );
-    directory
-        .set_permissions(fs::Permissions::from_mode(0o1777))
-        .with_context(|| format!("enforce sticky shared directory mode on {}", path.display()))?;
+    if before.mode() & 0o7777 != 0o1777 {
+        match chmod(&directory) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("enforce sticky shared directory mode on {}", path.display())
+                });
+            }
+        }
+    }
     let verified = directory
         .metadata()
         .with_context(|| format!("verify shared directory {}", path.display()))?;
@@ -1046,37 +1067,34 @@ fn enforce_shared_sticky_directory(path: &Path) -> Result<()> {
 }
 
 #[cfg(unix)]
-fn set_and_verify_published_mode(path: &Path) -> Result<()> {
-    let file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)
-        .with_context(|| format!("securely open published inbox file {}", path.display()))?;
+fn set_and_verify_completed_mode(file: &File, path: &Path) -> Result<()> {
     file.set_permissions(fs::Permissions::from_mode(0o644))
-        .with_context(|| format!("set published inbox mode on {}", path.display()))?;
+        .with_context(|| format!("set completed inbox mode on {}", path.display()))?;
     let verified = file
         .metadata()
-        .with_context(|| format!("verify published inbox file {}", path.display()))?;
+        .with_context(|| format!("verify completed inbox file {}", path.display()))?;
     anyhow::ensure!(
         verified.file_type().is_file() && verified.mode() & 0o777 == 0o644,
-        "published inbox file does not have verified mode 0644: {}",
+        "completed inbox file does not have verified mode 0644: {}",
         path.display()
     );
     let current = fs::symlink_metadata(path)
-        .with_context(|| format!("verify published inbox path {}", path.display()))?;
+        .with_context(|| format!("verify completed inbox path {}", path.display()))?;
     anyhow::ensure!(
         current.file_type().is_file()
             && (current.dev(), current.ino()) == (verified.dev(), verified.ino()),
-        "published inbox path changed during verification: {}",
+        "completed inbox path changed during verification: {}",
         path.display()
     );
     Ok(())
 }
 
 #[cfg(not(unix))]
-fn set_and_verify_published_mode(path: &Path) -> Result<()> {
+fn set_and_verify_completed_mode(file: &File, path: &Path) -> Result<()> {
+    file.set_permissions(fs::Permissions::from_readonly(false))
+        .with_context(|| format!("set completed inbox mode on {}", path.display()))?;
     let metadata = fs::symlink_metadata(path)
-        .with_context(|| format!("verify published inbox file {}", path.display()))?;
+        .with_context(|| format!("verify completed inbox file {}", path.display()))?;
     anyhow::ensure!(
         metadata.file_type().is_file(),
         "published inbox path is not a regular file: {}",
@@ -1152,7 +1170,8 @@ mod tests {
     };
 
     use super::{
-        collect_to_inbox, collect_to_inbox_with, drain_inbox, prepare, seed_pricing_cache,
+        collect_to_inbox, collect_to_inbox_with, drain_inbox, enforce_shared_sticky_directory_with,
+        prepare, seed_pricing_cache,
     };
 
     fn injected_amp_report(writer: &mut dyn Write) -> Result<crate::importers::ImportReport> {
@@ -1223,6 +1242,23 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn verified_shared_sticky_directory_does_not_require_chmod() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!("shirabe-sticky-ready-{}", super::now_ns()));
+        std::fs::create_dir_all(&root)?;
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o1777))?;
+
+        enforce_shared_sticky_directory_with(&root, |_| {
+            panic!("chmod must not be attempted for an already-correct directory")
+        })?;
+
+        let _ = std::fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn prepare_rejects_symlinked_critical_shared_directory() -> Result<()> {
         let root = std::env::temp_dir().join(format!("shirabe-sticky-symlink-{}", super::now_ns()));
         let external = root.with_extension("external");
@@ -1245,7 +1281,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn collection_temp_file_is_created_mode_0600() -> Result<()> {
+    fn collection_temp_file_is_published_mode_0644() -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
 
         let root = std::env::temp_dir().join(format!("shirabe-temp-mode-{}", super::now_ns()));
@@ -1266,6 +1302,11 @@ mod tests {
                 injected_amp_report(writer)
             },
             |from, to| {
+                assert_eq!(
+                    std::fs::metadata(from)?.permissions().mode() & 0o777,
+                    0o644,
+                    "publish callback must observe final mode before rename"
+                );
                 std::fs::rename(from, to)?;
                 Ok(())
             },
@@ -1273,7 +1314,7 @@ mod tests {
         let published = report.inbox_file.expect("published inbox file");
         assert_eq!(
             std::fs::metadata(published)?.permissions().mode() & 0o777,
-            0o600
+            0o644
         );
         let _ = std::fs::remove_dir_all(root);
         Ok(())
