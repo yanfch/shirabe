@@ -41,6 +41,8 @@ struct Thread {
 struct Message {
     #[serde(default)]
     role: Option<String>,
+    #[serde(default, rename = "messageId", deserialize_with = "narrow")]
+    message_id: Option<String>,
     #[serde(default)]
     model: Option<String>,
     #[serde(default, deserialize_with = "narrow")]
@@ -70,14 +72,19 @@ struct CurrentUsage {
     total_tokens: Option<i64>,
     #[serde(default)]
     max_input_tokens: Option<i64>,
-    #[serde(default, deserialize_with = "narrow")]
-    message_id: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct Ledger {
     #[serde(default)]
-    events: Vec<LedgerEvent>,
+    events: Vec<LenientLedgerEvent>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum LenientLedgerEvent {
+    Event(LedgerEvent),
+    Malformed(serde::de::IgnoredAny),
 }
 
 #[derive(Deserialize)]
@@ -154,6 +161,13 @@ pub(crate) fn parse_thread(
         else {
             continue;
         };
+        if let Some(id) = message.message_id.as_ref() {
+            let cache_write = usage.cache_creation_input_tokens.unwrap_or(0);
+            let cache_read = usage.cache_read_input_tokens.unwrap_or(0);
+            if cache_write >= 0 && cache_read >= 0 {
+                cache.insert(id.clone(), (cache_write, cache_read));
+            }
+        }
         let Some(model) = usage
             .model
             .as_deref()
@@ -173,10 +187,7 @@ pub(crate) fn parse_thread(
         let Some(mapped) = map_current(usage, &mut diagnostics) else {
             continue;
         };
-        let canonical = usage.message_id.clone();
-        if let Some(id) = canonical.as_ref() {
-            cache.insert(id.clone(), (mapped.cache_write, mapped.cache_read));
-        }
+        let canonical = message.message_id.clone();
         let id = canonical
             .unwrap_or_else(|| stable_hash(&format!("{thread_id}:{occurred}:{index}:{model}")));
         message_events.push(make_event(
@@ -195,6 +206,9 @@ pub(crate) fn parse_thread(
     let mut ledger_events = Vec::new();
     if let Some(ledger) = thread.usage_ledger {
         for (index, item) in ledger.events.iter().enumerate() {
+            let LenientLedgerEvent::Event(item) = item else {
+                continue;
+            };
             let Some(tokens) = item.tokens.as_ref() else {
                 continue;
             };
@@ -485,7 +499,7 @@ mod tests {
         let json = wrap(
             "",
             &format!(
-                r#"[{{"role":"assistant","content":"{private}","thinking":{{"x":"{private}"}},"model":"fallback","usage":{{"model":"claude-sonnet","timestamp":1767225602000,"inputTokens":10,"outputTokens":5,"cacheCreationInputTokens":3,"cacheReadInputTokens":2,"totalInputTokens":15,"maxInputTokens":200000,"messageId":"m-1"}}}}]"#
+                r#"[{{"role":"assistant","messageId":"m-1","content":"{private}","thinking":{{"x":"{private}"}},"model":"fallback","usage":{{"model":"claude-sonnet","timestamp":1767225602000,"inputTokens":10,"outputTokens":5,"cacheCreationInputTokens":3,"cacheReadInputTokens":2,"totalInputTokens":15,"maxInputTokens":200000}}}}]"#
             ),
         );
         let parsed = parse(&json).unwrap();
@@ -502,6 +516,10 @@ mod tests {
         );
         assert_eq!(event.usage.provider.as_deref(), Some("anthropic"));
         assert_eq!(event.usage.model_context_window, Some(200000));
+        assert_eq!(
+            event.source_event_id.as_deref(),
+            Some("amp:T-test-1:message:m-1")
+        );
         assert!(!serde_json::to_string(event).unwrap().contains(private));
         assert!(!format!("{parsed:?}").contains(private));
     }
@@ -512,14 +530,14 @@ mod tests {
             r#","usageLedger":"bad""#,
             r#","usageLedger":{"events":"bad"}"#,
         ] {
-            let p=parse(&wrap(ledger,r#"[{"role":"assistant","model":"gpt-4","timestamp":"2026-01-01T00:00:00Z","usage":{"inputTokens":1,"messageId":1}}]"#)).unwrap();
+            let p=parse(&wrap(ledger,r#"[{"role":"assistant","messageId":1,"model":"gpt-4","timestamp":"2026-01-01T00:00:00Z","usage":{"inputTokens":1}}]"#)).unwrap();
             assert_eq!(p.events.len(), 1);
             assert!(!p.used_ledger);
         }
     }
     #[test]
     fn ledger_joins_cache_suppresses_and_canonicalizes_ids() {
-        let p=parse(&wrap(r#", "usageLedger":{"events":[{"id":9,"timestamp":"1767225603000","model":"claude-x","tokens":{"input":12,"output":4,"total":16},"toMessageId":"7"}]}"#,r#"[{"role":"assistant","model":"claude-x","timestamp":1767225602000,"usage":{"inputTokens":10,"cacheCreationInputTokens":1,"cacheReadInputTokens":2,"messageId":7}}]"#)).unwrap();
+        let p=parse(&wrap(r#", "usageLedger":{"events":[{"id":9,"timestamp":"1767225603000","model":"claude-x","tokens":{"input":12,"output":4,"total":16},"toMessageId":"7"}]}"#,r#"[{"role":"assistant","messageId":7,"usage":{"cacheCreationInputTokens":1,"cacheReadInputTokens":2}},{"role":"assistant","messageId":8,"model":"claude-x","timestamp":1767225602000,"usage":{"inputTokens":10}}]"#)).unwrap();
         assert!(p.used_ledger);
         assert_eq!(p.events.len(), 1);
         assert_eq!(
@@ -535,7 +553,7 @@ mod tests {
         );
         assert_eq!(
             p.superseded_source_event_ids,
-            vec!["amp:T-test-1:message:7"]
+            vec!["amp:T-test-1:message:8"]
         );
     }
     #[test]
@@ -563,11 +581,55 @@ mod tests {
         );
     }
     #[test]
+    fn numeric_and_string_top_level_message_ids_are_identical() {
+        let numeric = parse(&wrap("", r#"[{"role":"assistant","messageId":7,"model":"x","timestamp":1,"usage":{"inputTokens":1}}]"#)).unwrap();
+        let string = parse(&wrap("", r#"[{"role":"assistant","messageId":"7","model":"x","timestamp":1,"usage":{"inputTokens":1}}]"#)).unwrap();
+        assert_eq!(
+            numeric.events[0].source_event_id,
+            string.events[0].source_event_id
+        );
+        assert_eq!(
+            numeric.events[0].source_event_id.as_deref(),
+            Some("amp:T-test-1:message:7")
+        );
+    }
+    #[test]
+    fn missing_ledger_id_fallback_is_deterministic() {
+        let json = wrap(
+            r#", "usageLedger":{"events":[{"timestamp":2,"model":"x","tokens":{"input":1}}]}"#,
+            "[]",
+        );
+        assert_eq!(
+            parse(&json).unwrap().events[0].source_event_id,
+            parse(&json).unwrap().events[0].source_event_id
+        );
+    }
+    #[test]
+    fn ledger_skips_negative_and_all_zero_records() {
+        let p = parse(&wrap(r#", "usageLedger":{"events":[{"id":"negative","timestamp":1,"model":"x","tokens":{"input":-1}},{"id":"zero","timestamp":1,"model":"x","tokens":{"input":0,"output":0,"total":0}},{"id":"usable","timestamp":1,"model":"x","tokens":{"input":2}}]}"#, "[]")).unwrap();
+        assert_eq!(p.events.len(), 1);
+        assert_eq!(
+            p.events[0].source_event_id.as_deref(),
+            Some("amp:T-test-1:ledger:usable")
+        );
+    }
+    #[test]
+    fn malformed_ledger_element_does_not_hide_usable_events() {
+        let p = parse(&wrap(r#", "usageLedger":{"events":[{"timestamp":{"private":"secret"},"tokens":{"input":"bad"}}, {"id":"usable","timestamp":1,"model":"x","tokens":{"input":2}}]}"#, "[]")).unwrap();
+        assert!(p.used_ledger);
+        assert_eq!(p.events.len(), 1);
+        assert_eq!(
+            p.events[0].source_event_id.as_deref(),
+            Some("amp:T-test-1:ledger:usable")
+        );
+        assert!(!format!("{p:?}").contains("secret"));
+    }
+    #[test]
     fn rejects_invalid_thread_id_without_leaking_nested_private_values() {
         assert!(parse(r#"{"id":"bad/private","messages":[]}"#).is_err());
         let private = "PRIVATE_SENTINEL";
         let json = format!(
-            r#"{{"id":"T-safe","updatedAt":{{"x":"{private}"}},"messages":[{{"role":"assistant","model":"x","timestamp":1,"usage":{{"inputTokens":1,"messageId":{{"x":"{private}"}}}}}}],"usageLedger":{{"events":[{{"id":1,"timestamp":2,"model":"x","tokens":{{"input":1}},"toMessageId":{{"x":"{private}"}}}}]}}}}"#
+            r#"{{"id":"T-safe","updatedAt":{{"x":"{private}"}},"messages":[{{"role":"assistant","messageId":{{"x":"{private}"}},"model":"x","timestamp":1,"usage":{{"inputTokens":1}}}}],"usageLedger":{{"events":[{{"id":1,"timestamp":2,"model":"x","tokens":{{"input":1}},"toMessageId":{{"x":"{private}"}}}}]}}}}"#
         );
         let result = parse(&json);
         assert!(!format!("{result:?}").contains(private));
