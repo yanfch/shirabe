@@ -34,6 +34,16 @@ struct ScannedFile {
     inode: u64,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct DescriptorSnapshot {
+    size: u64,
+    modified_ns: i64,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
 pub fn import_local_with_identity(
     db: &Database,
     path: PathBuf,
@@ -102,9 +112,7 @@ pub fn collect_local_recent(
         stats.files_seen += 1;
         stats.files_imported += 1;
         stats.bytes = stats.bytes.saturating_add(scanned.size);
-        let bytes = match open_scanned_file(&scanned)
-            .and_then(|file| read_bounded(file, MAX_THREAD_JSON_BYTES))
-        {
+        let bytes = match read_scanned_file(&scanned, MAX_THREAD_JSON_BYTES) {
             Ok(bytes) => bytes,
             Err(_) => {
                 stats.warnings += 1;
@@ -173,7 +181,7 @@ fn import_file_with_limit(
     limit: u64,
 ) -> Result<()> {
     let file_size = Some(scanned.size);
-    let bytes = match open_scanned_file(scanned).and_then(|file| read_bounded(file, limit)) {
+    let bytes = match read_scanned_file(scanned, limit) {
         Ok(bytes) => bytes,
         Err(_) => {
             stats.warnings += 1;
@@ -354,7 +362,37 @@ fn scanned_file_from_metadata(path: PathBuf, metadata: Metadata, modified_ns: i6
     }
 }
 
-fn open_scanned_file(scanned: &ScannedFile) -> Result<File> {
+fn descriptor_snapshot(file: &File) -> Result<DescriptorSnapshot> {
+    let metadata = file.metadata()?;
+    #[cfg(unix)]
+    use std::os::unix::fs::MetadataExt;
+
+    Ok(DescriptorSnapshot {
+        size: metadata.len(),
+        modified_ns: metadata.modified().map(system_time_ns)?,
+        #[cfg(unix)]
+        device: metadata.dev(),
+        #[cfg(unix)]
+        inode: metadata.ino(),
+    })
+}
+
+fn validate_descriptor_snapshot(
+    scanned: &ScannedFile,
+    opened: &DescriptorSnapshot,
+    current: &DescriptorSnapshot,
+) -> Result<()> {
+    let matches_scan = opened.size == scanned.size && opened.modified_ns == scanned.modified_ns;
+    #[cfg(unix)]
+    let matches_scan =
+        matches_scan && opened.device == scanned.device && opened.inode == scanned.inode;
+    if !matches_scan || current != opened {
+        bail!("Amp JSON changed after scan")
+    }
+    Ok(())
+}
+
+fn open_scanned_file(scanned: &ScannedFile) -> Result<(File, DescriptorSnapshot)> {
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -365,31 +403,24 @@ fn open_scanned_file(scanned: &ScannedFile) -> Result<File> {
     let file = options
         .open(&scanned.path)
         .with_context(|| format!("open {}", scanned.path.display()))?;
-    let opened = file.metadata()?;
-    if !opened.is_file() {
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
         bail!("opened Amp JSON is not a regular file")
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        if opened.dev() != scanned.device || opened.ino() != scanned.inode {
-            bail!("Amp JSON changed identity after scan")
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let current = fs::symlink_metadata(&scanned.path)?;
-        if !current.file_type().is_file()
-            || current.len() != opened.len()
-            || current.modified().ok() != opened.modified().ok()
-        {
-            bail!("Amp JSON changed after scan")
-        }
-    }
-    Ok(file)
+    let opened = descriptor_snapshot(&file)?;
+    validate_descriptor_snapshot(scanned, &opened, &opened)?;
+    Ok((file, opened))
 }
 
-fn read_bounded(file: File, limit: u64) -> Result<Vec<u8>> {
+fn read_scanned_file(scanned: &ScannedFile, limit: u64) -> Result<Vec<u8>> {
+    let (mut file, opened) = open_scanned_file(scanned)?;
+    let bytes = read_bounded(&mut file, limit)?;
+    let after = descriptor_snapshot(&file)?;
+    validate_descriptor_snapshot(scanned, &opened, &after)?;
+    Ok(bytes)
+}
+
+fn read_bounded(file: &mut File, limit: u64) -> Result<Vec<u8>> {
     if file.metadata()?.len() > limit {
         bail!("Amp JSON exceeds size limit")
     }
@@ -1506,20 +1537,49 @@ mod tests {
     }
 
     #[test]
+    fn secure_open_rejects_metadata_changed_after_scan() -> Result<()> {
+        let root = temp_dir("amp-local-scan-metadata-change");
+        fs::create_dir_all(&root)?;
+        let path = root.join("thread.json");
+        fs::write(&path, "{}")?;
+        let mut scanned = scanned_file(&path)?;
+        scanned.size += 1;
+
+        assert!(open_scanned_file(&scanned).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn post_read_validation_rejects_descriptor_truncated_after_open() -> Result<()> {
+        let root = temp_dir("amp-local-post-read-change");
+        fs::create_dir_all(&root)?;
+        let path = root.join("thread.json");
+        fs::write(&path, "12345")?;
+        let scanned = scanned_file(&path)?;
+        let (file, opened) = open_scanned_file(&scanned)?;
+
+        File::create(&path)?.set_len(0)?;
+        let after = descriptor_snapshot(&file)?;
+
+        assert!(validate_descriptor_snapshot(&scanned, &opened, &after).is_err());
+        Ok(())
+    }
+
+    #[test]
     fn bounded_read_rejects_metadata_oversize_and_growth() -> Result<()> {
         let root = temp_dir("amp-local-size-limit");
         fs::create_dir_all(&root)?;
         let path = root.join("thread.json");
         fs::write(&path, "12345")?;
         let scanned = scanned_file(&path)?;
-        let file = open_scanned_file(&scanned)?;
-        assert!(read_bounded(file, 4).is_err());
+        let (mut file, _) = open_scanned_file(&scanned)?;
+        assert!(read_bounded(&mut file, 4).is_err());
 
         fs::write(&path, "1234")?;
         let scanned = scanned_file(&path)?;
-        let file = open_scanned_file(&scanned)?;
+        let (mut file, _) = open_scanned_file(&scanned)?;
         fs::write(&path, "12345")?;
-        assert!(read_bounded(file, 4).is_err());
+        assert!(read_bounded(&mut file, 4).is_err());
         Ok(())
     }
 
