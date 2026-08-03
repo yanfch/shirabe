@@ -633,6 +633,7 @@ impl<'a> Projector<'a> {
                 total_cost_usd = excluded.total_cost_usd,
                 pricing_status = COALESCE(excluded.pricing_status, llm_calls.pricing_status),
                 cost_confidence = COALESCE(excluded.cost_confidence, llm_calls.cost_confidence),
+                started_at_ns = excluded.started_at_ns,
                 started_day = excluded.started_day,
                 started_month = excluded.started_month,
                 trace_id = COALESCE(excluded.trace_id, llm_calls.trace_id),

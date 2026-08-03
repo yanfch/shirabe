@@ -1149,6 +1149,54 @@ impl Database {
         })
     }
 
+    pub(crate) fn retire_source_events(
+        &self,
+        profile_id: &str,
+        source: &str,
+        source_event_ids: &[String],
+    ) -> Result<Vec<(String, Option<String>)>> {
+        let mut touched = Vec::new();
+        for source_event_id in source_event_ids {
+            let mut statement = self.conn.prepare(
+                "SELECT DISTINCT run_id, session_id FROM run_steps
+                 WHERE profile_id = ?1 AND source = ?2 AND source_event_id = ?3",
+            )?;
+            let rows = statement
+                .query_map(params![profile_id, source, source_event_id], |row| {
+                    Ok((row.get(0)?, row.get(1)?))
+                })?;
+            for row in rows {
+                touched.push(row?);
+            }
+            self.conn.execute(
+                "DELETE FROM run_steps
+                 WHERE profile_id = ?1 AND source = ?2 AND source_event_id = ?3",
+                params![profile_id, source, source_event_id],
+            )?;
+            self.conn.execute(
+                "DELETE FROM llm_calls
+                 WHERE profile_id = ?1 AND source = ?2
+                   AND llm_call_id IN (
+                     SELECT entity_id FROM event_identities
+                     WHERE profile_id = ?1 AND source = ?2 AND kind = 'llm' AND source_event_id = ?3
+                   )",
+                params![profile_id, source, source_event_id],
+            )?;
+            // Most sources derive entity IDs directly and therefore have no identity row.
+            let llm_id = ids::event_scoped_id(profile_id, source, "llm", Some(source_event_id), "");
+            self.conn.execute(
+                "DELETE FROM llm_calls WHERE profile_id = ?1 AND source = ?2 AND llm_call_id = ?3",
+                params![profile_id, source, llm_id],
+            )?;
+            self.conn.execute(
+                "DELETE FROM event_identities
+                 WHERE profile_id = ?1 AND source = ?2 AND source_event_id = ?3",
+                params![profile_id, source, source_event_id],
+            )?;
+        }
+        Ok(touched)
+    }
+
     pub fn finish_import_file(
         &self,
         file_id: &str,

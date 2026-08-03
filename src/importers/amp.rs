@@ -1,16 +1,325 @@
-use std::collections::HashMap;
+use std::{
+    collections::{HashMap, HashSet},
+    fs,
+    io::Write,
+    path::{Path, PathBuf},
+    time::Instant,
+};
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Deserializer};
+use walkdir::WalkDir;
 
 use crate::{
-    db::stable_hash,
+    db::{Database, stable_hash, system_time_ns},
     projection::event::{
         EntityHint, NormalizedEvent, Operation, OperationStatus, OperationType, TraceContext, Usage,
     },
+    projection::projector::{ProjectionCache, Projector},
 };
 
-use super::ImportIdentity;
+use super::{ImportIdentity, ImportReport, ImportTiming, write_collected_event};
+
+const SOURCE_KIND: &str = "amp_local_thread_json";
+
+pub fn import_local_with_identity(
+    db: &Database,
+    path: PathBuf,
+    identity: &ImportIdentity,
+) -> Result<ImportReport> {
+    import_local_recent_with_identity(db, &[path], i64::MIN, identity)
+}
+
+pub fn import_local_recent_with_identity(
+    db: &Database,
+    roots: &[PathBuf],
+    modified_since_ns: i64,
+    identity: &ImportIdentity,
+) -> Result<ImportReport> {
+    let total_started = Instant::now();
+    let root_path = report_root(roots);
+    // Amp file identities must remain stable when callers group the same files under
+    // different root lists, so the catalog source is intentionally path-independent.
+    let source_id = db.record_import_source_for_profile(
+        "amp",
+        SOURCE_KIND,
+        Path::new("<amp-local>"),
+        &identity.profile_id,
+        &identity.device_id,
+    )?;
+    let scan_started = Instant::now();
+    let tx = db.begin_batch()?;
+    let files = recent_json_files(roots, modified_since_ns)?;
+    let mut stats = ScanStats::default();
+    for (path, size, modified_ns) in files {
+        stats.files_seen += 1;
+        stats.bytes = stats.bytes.saturating_add(size);
+        let prepared = db.prepare_import_file(&source_id, &path, size, modified_ns)?;
+        if !prepared.should_import {
+            stats.files_skipped += 1;
+            continue;
+        }
+        stats.files_imported += 1;
+        import_file(db, &prepared.file_id, &path, identity, &mut stats)?;
+    }
+    tx.commit()?;
+    let scan_elapsed_ms = scan_started.elapsed().as_millis();
+    let written = fs::metadata(db.path()).map(|m| m.len()).unwrap_or_default();
+    Ok(report(
+        root_path,
+        source_id,
+        stats,
+        written,
+        scan_elapsed_ms,
+        total_started,
+    ))
+}
+
+pub fn collect_local_recent(
+    roots: &[PathBuf],
+    identity: &ImportIdentity,
+    writer: &mut dyn Write,
+    modified_since_ns: i64,
+) -> Result<ImportReport> {
+    let total_started = Instant::now();
+    let root_path = report_root(roots);
+    let scan_started = Instant::now();
+    let mut stats = ScanStats::default();
+    for (path, size, _) in recent_json_files(roots, modified_since_ns)? {
+        stats.files_seen += 1;
+        stats.files_imported += 1;
+        stats.bytes = stats.bytes.saturating_add(size);
+        let json = match fs::read_to_string(&path) {
+            Ok(json) => json,
+            Err(_) => {
+                stats.warnings += 1;
+                continue;
+            }
+        };
+        match parse_thread(&json, SOURCE_KIND, identity) {
+            Ok(parsed) => {
+                stats.add_diagnostics(&parsed);
+                for event in parsed.events {
+                    write_collected_event(writer, &event)?;
+                    stats.events += 1;
+                }
+            }
+            Err(_) => stats.warnings += 1,
+        }
+    }
+    let scan_elapsed_ms = scan_started.elapsed().as_millis();
+    Ok(report(
+        root_path,
+        format!("{}:amp:collector", identity.profile_id),
+        stats,
+        0,
+        scan_elapsed_ms,
+        total_started,
+    ))
+}
+
+#[derive(Default)]
+struct ScanStats {
+    files_seen: usize,
+    files_imported: usize,
+    files_skipped: usize,
+    events: usize,
+    bytes: u64,
+    warnings: usize,
+}
+
+impl ScanStats {
+    fn add_diagnostics(&mut self, parsed: &ParsedThread) {
+        self.warnings = self
+            .warnings
+            .saturating_add(parsed.split_total_mismatch_count)
+            .saturating_add(parsed.aggregate_only_count)
+            .saturating_add(parsed.malformed_ledger_count)
+            .saturating_add(parsed.ledger_total_mismatch_count);
+    }
+}
+
+fn import_file(
+    db: &Database,
+    file_id: &str,
+    path: &Path,
+    identity: &ImportIdentity,
+    stats: &mut ScanStats,
+) -> Result<()> {
+    let json = match fs::read_to_string(path) {
+        Ok(json) => json,
+        Err(_) => {
+            stats.warnings += 1;
+            db.finish_import_file(
+                file_id,
+                "partial",
+                0,
+                1,
+                None,
+                None,
+                None,
+                Some("Amp JSON file could not be read"),
+            )?;
+            return Ok(());
+        }
+    };
+    let parsed = match parse_thread(&json, SOURCE_KIND, identity) {
+        Ok(parsed) => parsed,
+        Err(_) => {
+            stats.warnings += 1;
+            db.finish_import_file(
+                file_id,
+                "partial",
+                0,
+                1,
+                Some(json.len() as u64),
+                None,
+                None,
+                Some("Amp JSON schema could not be parsed"),
+            )?;
+            return Ok(());
+        }
+    };
+    stats.add_diagnostics(&parsed);
+    let projector = Projector::new(db);
+    let mut cache = ProjectionCache::default();
+    let mut run_ids = HashSet::new();
+    let mut session_ids = HashSet::new();
+    if parsed.used_ledger && parsed.malformed_ledger_count == 0 {
+        for (run_id, session_id) in db.retire_source_events(
+            &identity.profile_id,
+            "amp",
+            &parsed.superseded_source_event_ids,
+        )? {
+            run_ids.insert(run_id);
+            if let Some(session_id) = session_id {
+                session_ids.insert(session_id);
+            }
+        }
+    }
+    let first = parsed.events.iter().map(|e| e.occurred_at_ns).min();
+    let last = parsed.events.iter().map(|e| e.occurred_at_ns).max();
+    let event_count = parsed.events.len();
+    for event in &parsed.events {
+        let result = projector.project_with_cache(event, &mut cache)?;
+        run_ids.insert(result.run_id);
+        if let Some(session_id) = result.session_id {
+            session_ids.insert(session_id);
+        }
+    }
+    projector.refresh_run_summaries(run_ids.iter().map(String::as_str))?;
+    db.refresh_observed_llm_latency_for_runs(run_ids.iter().map(String::as_str))?;
+    projector.refresh_session_summaries(session_ids.iter().map(String::as_str))?;
+    let file_warnings = parsed.split_total_mismatch_count
+        + parsed.aggregate_only_count
+        + parsed.malformed_ledger_count
+        + parsed.ledger_total_mismatch_count;
+    db.finish_import_file(
+        file_id,
+        if file_warnings == 0 {
+            "imported"
+        } else {
+            "partial"
+        },
+        event_count,
+        file_warnings,
+        Some(json.len() as u64),
+        first,
+        last,
+        None,
+    )?;
+    stats.events += event_count;
+    Ok(())
+}
+
+fn recent_json_files(
+    roots: &[PathBuf],
+    modified_since_ns: i64,
+) -> Result<Vec<(PathBuf, u64, i64)>> {
+    let mut paths = Vec::new();
+    for root in roots {
+        if !root.exists() {
+            continue;
+        }
+        if root.is_file() {
+            if root
+                .extension()
+                .and_then(|v| v.to_str())
+                .is_some_and(|v| v.eq_ignore_ascii_case("json"))
+            {
+                paths.push(root.clone());
+            }
+            continue;
+        }
+        for entry in WalkDir::new(root).follow_links(false) {
+            let entry = entry.with_context(|| format!("scan {}", root.display()))?;
+            if entry.file_type().is_file()
+                && entry
+                    .path()
+                    .extension()
+                    .and_then(|v| v.to_str())
+                    .is_some_and(|v| v.eq_ignore_ascii_case("json"))
+            {
+                paths.push(entry.into_path());
+            }
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    let mut files = Vec::new();
+    for path in paths {
+        let metadata = fs::metadata(&path).with_context(|| format!("stat {}", path.display()))?;
+        let modified_ns = metadata.modified().map(system_time_ns).unwrap_or_default();
+        if modified_ns >= modified_since_ns {
+            files.push((path, metadata.len(), modified_ns));
+        }
+    }
+    Ok(files)
+}
+
+fn report_root(roots: &[PathBuf]) -> PathBuf {
+    roots.first().cloned().unwrap_or_default()
+}
+
+fn report(
+    root_path: PathBuf,
+    source_id: String,
+    stats: ScanStats,
+    written: u64,
+    scan_ms: u128,
+    total: Instant,
+) -> ImportReport {
+    ImportReport {
+        source: "amp".into(),
+        source_id,
+        root_path,
+        files_seen: stats.files_seen,
+        files_imported: stats.files_imported,
+        files_skipped: stats.files_skipped,
+        events_projected: stats.events,
+        source_bytes_scanned: stats.bytes,
+        shirabe_bytes_written: written,
+        timings: vec![
+            ImportTiming {
+                stage: "scan_project",
+                elapsed_ms: scan_ms,
+            },
+            ImportTiming {
+                stage: "total_importer",
+                elapsed_ms: total.elapsed().as_millis(),
+            },
+        ],
+        warnings: (stats.warnings > 0)
+            .then(|| {
+                format!(
+                    "{} Amp files or schema diagnostics were skipped or degraded",
+                    stats.warnings
+                )
+            })
+            .into_iter()
+            .collect(),
+    }
+}
 
 #[allow(dead_code)]
 #[derive(Debug)]
@@ -586,6 +895,10 @@ fn parse_rfc3339_ns(value: &str) -> Option<i64> {
 
 #[cfg(test)]
 mod tests {
+    use std::{fs, path::PathBuf, time::SystemTime};
+
+    use crate::db::Database;
+
     use super::*;
     fn parse(json: &str) -> Result<ParsedThread> {
         parse_thread(json, "amp_thread_json", &ImportIdentity::new("p", "d"))
@@ -924,5 +1237,181 @@ mod tests {
         );
         assert!(parsed.events.iter().all(|event| event.operation.metadata
             == Some(serde_json::json!({"identity_fallback": true}))));
+    }
+
+    #[test]
+    fn local_import_scans_multiple_roots_and_is_idempotent() -> Result<()> {
+        let root = temp_dir("amp-local-multiple");
+        let first = root.join("one");
+        let second = root.join("two");
+        fs::create_dir_all(&first)?;
+        fs::create_dir_all(&second)?;
+        fs::write(
+            first.join("a.json"),
+            message_thread("T-one", "m1", 10, 5, 3, 2),
+        )?;
+        fs::write(
+            second.join("b.json"),
+            message_thread("T-two", "m2", 20, 7, 4, 1),
+        )?;
+        let db = test_db(&root)?;
+        let identity = ImportIdentity::new("profile", "device");
+
+        let report = import_local_recent_with_identity(&db, &[first, second], 0, &identity)?;
+        assert_eq!(
+            (
+                report.files_seen,
+                report.files_imported,
+                report.events_projected
+            ),
+            (2, 2, 2)
+        );
+        assert_eq!(count(&db, "sessions")?, 2);
+        assert_eq!(count(&db, "llm_calls")?, 2);
+        let totals: (i64, i64, i64, i64) = db.connection().query_row(
+            "SELECT SUM(input_tokens), SUM(output_tokens), SUM(cache_write_tokens), SUM(cache_read_tokens) FROM llm_calls",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+        assert_eq!(totals, (30, 12, 7, 3));
+
+        let repeated = import_local_recent_with_identity(&db, &[root], 0, &identity)?;
+        assert_eq!(
+            (
+                repeated.files_imported,
+                repeated.files_skipped,
+                repeated.events_projected
+            ),
+            (0, 2, 0)
+        );
+        assert_eq!(count(&db, "llm_calls")?, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn finalized_message_updates_all_mutable_usage_fields() -> Result<()> {
+        let root = temp_dir("amp-local-update");
+        fs::create_dir_all(&root)?;
+        let path = root.join("thread.json");
+        fs::write(&path, message_thread("T-one", "m1", 10, 5, 3, 2))?;
+        let db = test_db(&root)?;
+        let identity = ImportIdentity::new("profile", "device");
+        import_local_with_identity(&db, path.clone(), &identity)?;
+
+        fs::write(
+            &path,
+            r#"{"id":"T-one","updatedAt":"2026-01-02T00:00:00Z","messages":[{"role":"assistant","messageId":"m1","model":"ignored-padding","usage":{"model":"gpt-5","timestamp":1767312000000,"inputTokens":100,"outputTokens":50,"cacheCreationInputTokens":30,"cacheReadInputTokens":20,"maxInputTokens":400000}}]}"#,
+        )?;
+        import_local_with_identity(&db, path, &identity)?;
+
+        let values: (i64, i64, i64, i64, String, i64, i64) = db.connection().query_row(
+            "SELECT input_tokens, output_tokens, cache_write_tokens, cache_read_tokens, model, started_at_ns, model_context_window FROM llm_calls",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?)),
+        )?;
+        assert_eq!(
+            values,
+            (
+                100,
+                50,
+                30,
+                20,
+                "gpt-5".into(),
+                1_767_312_000_000_000_000,
+                400000
+            )
+        );
+        assert_eq!(count(&db, "llm_calls")?, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn usable_ledger_retires_superseded_message_but_parse_failure_does_not() -> Result<()> {
+        let root = temp_dir("amp-local-reconcile");
+        fs::create_dir_all(&root)?;
+        let path = root.join("thread.json");
+        fs::write(&path, message_thread("T-one", "m1", 10, 5, 3, 2))?;
+        let db = test_db(&root)?;
+        let identity = ImportIdentity::new("profile", "device");
+        import_local_with_identity(&db, path.clone(), &identity)?;
+
+        fs::write(&path, "{ malformed and a different size")?;
+        let failed = import_local_with_identity(&db, path.clone(), &identity)?;
+        assert_eq!(failed.events_projected, 0);
+        assert_eq!(count(&db, "llm_calls")?, 1);
+
+        fs::write(
+            &path,
+            r#"{"id":"T-one","updatedAt":"2026-01-02T00:00:00Z","messages":[{"role":"assistant","messageId":"m1","model":"claude-old","usage":{"timestamp":1767225600000,"inputTokens":10,"outputTokens":5,"cacheCreationInputTokens":3,"cacheReadInputTokens":2}}],"usageLedger":{"events":[{"id":"ledger-1","toMessageId":"m1","timestamp":1767312000000,"model":"claude-new","tokens":{"input":40,"output":9,"total":49}}]}}"#,
+        )?;
+        import_local_with_identity(&db, path, &identity)?;
+        assert_eq!(count(&db, "llm_calls")?, 1);
+        assert_eq!(count(&db, "run_steps")?, 1);
+        let values: (String, i64, i64, i64, i64) = db.connection().query_row(
+            "SELECT model, input_tokens, output_tokens, cache_write_tokens, cache_read_tokens FROM llm_calls",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        )?;
+        assert_eq!(values, ("claude-new".into(), 40, 9, 3, 2));
+        Ok(())
+    }
+
+    #[test]
+    fn missing_root_and_private_collector_are_safe() -> Result<()> {
+        let root = temp_dir("amp-local-collector");
+        let missing = root.join("missing");
+        let db = test_db(&root)?;
+        let identity = ImportIdentity::new("profile", "device");
+        let empty = import_local_recent_with_identity(&db, &[missing], 0, &identity)?;
+        assert_eq!((empty.files_seen, empty.events_projected), (0, 0));
+
+        fs::create_dir_all(&root)?;
+        fs::write(
+            root.join("thread.json"),
+            message_thread("T-private", "m-private", 10, 5, 3, 2),
+        )?;
+        let mut output = Vec::new();
+        let report = collect_local_recent(&[root], &identity, &mut output, 0)?;
+        assert_eq!(report.events_projected, 1);
+        let json = String::from_utf8(output)?;
+        assert!(json.contains("input_tokens"));
+        assert!(!json.contains("PRIVATE_SENTINEL"));
+        Ok(())
+    }
+
+    fn message_thread(
+        thread: &str,
+        message: &str,
+        input: i64,
+        output: i64,
+        write: i64,
+        read: i64,
+    ) -> String {
+        format!(
+            r#"{{"id":"{thread}","updatedAt":"2026-01-01T00:00:00Z","messages":[{{"role":"assistant","messageId":"{message}","model":"claude-test","content":"PRIVATE_SENTINEL","usage":{{"timestamp":1767225600000,"inputTokens":{input},"outputTokens":{output},"cacheCreationInputTokens":{write},"cacheReadInputTokens":{read},"maxInputTokens":200000}}}}]}}"#
+        )
+    }
+
+    fn temp_dir(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "shirabe-{name}-{}-{:?}",
+            std::process::id(),
+            SystemTime::now()
+        ))
+    }
+
+    fn test_db(root: &std::path::Path) -> Result<Database> {
+        fs::create_dir_all(root)?;
+        let db = Database::open(&root.join("catalog.sqlite"))?;
+        db.migrate()?;
+        Ok(db)
+    }
+
+    fn count(db: &Database, table: &str) -> Result<i64> {
+        Ok(db
+            .connection()
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })?)
     }
 }
