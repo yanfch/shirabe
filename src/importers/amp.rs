@@ -22,6 +22,7 @@ pub(crate) struct ParsedThread {
     pub(crate) split_total_mismatch_count: usize,
     pub(crate) used_ledger: bool,
     pub(crate) aggregate_only_count: usize,
+    pub(crate) malformed_ledger_count: usize,
 }
 
 #[derive(Deserialize)]
@@ -33,8 +34,8 @@ struct Thread {
     updated_at: Option<String>,
     #[serde(default)]
     messages: Vec<Message>,
-    #[serde(default, deserialize_with = "optional_ledger")]
-    usage_ledger: Option<Ledger>,
+    #[serde(default)]
+    usage_ledger: LedgerInput,
 }
 
 #[derive(Deserialize)]
@@ -76,8 +77,17 @@ struct CurrentUsage {
 
 #[derive(Deserialize)]
 struct Ledger {
-    #[serde(default)]
     events: Vec<LenientLedgerEvent>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(untagged)]
+enum LedgerInput {
+    Ledger(Ledger),
+    Null(()),
+    Malformed(serde::de::IgnoredAny),
+    #[default]
+    Absent,
 }
 
 #[derive(Deserialize)]
@@ -110,12 +120,6 @@ struct LedgerTokens {
     output: Option<i64>,
     #[serde(default)]
     total: Option<i64>,
-}
-
-fn optional_ledger<'de, D: Deserializer<'de>>(
-    d: D,
-) -> std::result::Result<Option<Ledger>, D::Error> {
-    Ok(Ledger::deserialize(d).ok())
 }
 
 fn narrow<'de, D: Deserializer<'de>>(d: D) -> std::result::Result<Option<String>, D::Error> {
@@ -187,8 +191,10 @@ pub(crate) fn parse_thread(
         let Some(mapped) = map_current(usage, &mut diagnostics) else {
             continue;
         };
-        let canonical = message.message_id.clone();
-        let id = canonical
+        let identity_fallback = message.message_id.is_none();
+        let id = message
+            .message_id
+            .clone()
             .unwrap_or_else(|| stable_hash(&format!("{thread_id}:{occurred}:{index}:{model}")));
         message_events.push(make_event(
             identity,
@@ -200,13 +206,17 @@ pub(crate) fn parse_thread(
             model,
             mapped,
             index,
+            identity_fallback,
         ));
     }
 
     let mut ledger_events = Vec::new();
-    if let Some(ledger) = thread.usage_ledger {
+    let mut malformed_ledger_count =
+        usize::from(matches!(thread.usage_ledger, LedgerInput::Malformed(_)));
+    if let LedgerInput::Ledger(ledger) = thread.usage_ledger {
         for (index, item) in ledger.events.iter().enumerate() {
             let LenientLedgerEvent::Event(item) = item else {
+                malformed_ledger_count += 1;
                 continue;
             };
             let Some(tokens) = item.tokens.as_ref() else {
@@ -244,6 +254,7 @@ pub(crate) fn parse_thread(
             if input == 0 && output == 0 && cache_write == 0 && cache_read == 0 {
                 continue;
             }
+            let identity_fallback = item.id.is_none();
             let id = item
                 .id
                 .clone()
@@ -265,6 +276,7 @@ pub(crate) fn parse_thread(
                     confidence: 0.9,
                 },
                 index,
+                identity_fallback,
             ));
         }
     }
@@ -288,6 +300,7 @@ pub(crate) fn parse_thread(
         superseded_source_event_ids,
         split_total_mismatch_count: diagnostics.mismatches,
         aggregate_only_count: diagnostics.aggregates,
+        malformed_ledger_count,
         used_ledger,
     })
 }
@@ -363,6 +376,7 @@ fn make_event(
     model: &str,
     mapped: Mapped,
     index: usize,
+    identity_fallback: bool,
 ) -> NormalizedEvent {
     let external_id = format!("amp:{thread}:{schema}:{id}");
     NormalizedEvent {
@@ -397,7 +411,7 @@ fn make_event(
             ended_at_ns: Some(occurred),
             duration_ns: None,
             order_index: Some(index as i64),
-            metadata: None,
+            metadata: identity_fallback.then(|| serde_json::json!({ "identity_fallback": true })),
         },
         usage: Usage {
             provider: provider(model).map(str::to_string),
@@ -413,7 +427,11 @@ fn make_event(
             ..Usage::default()
         },
         skill_events: Vec::new(),
-        confidence: mapped.confidence,
+        confidence: if identity_fallback {
+            mapped.confidence * 0.8
+        } else {
+            mapped.confidence
+        },
     }
 }
 
@@ -536,6 +554,19 @@ mod tests {
         }
     }
     #[test]
+    fn malformed_whole_ledger_is_diagnosed_without_retaining_private_data() {
+        let private = "PRIVATE_LEDGER_SENTINEL";
+        let p = parse(&wrap(
+            &format!(r#","usageLedger":{{"private":"{private}"}}"#),
+            r#"[{"role":"assistant","messageId":"m","model":"x","timestamp":1,"usage":{"inputTokens":1}}]"#,
+        ))
+        .unwrap();
+        assert_eq!(p.malformed_ledger_count, 1);
+        assert!(!p.used_ledger);
+        assert_eq!(p.events.len(), 1);
+        assert!(!format!("{p:?}").contains(private));
+    }
+    #[test]
     fn ledger_joins_cache_suppresses_and_canonicalizes_ids() {
         let p=parse(&wrap(r#", "usageLedger":{"events":[{"id":9,"timestamp":"1767225603000","model":"claude-x","tokens":{"input":12,"output":4,"total":16},"toMessageId":"7"}]}"#,r#"[{"role":"assistant","messageId":7,"usage":{"cacheCreationInputTokens":1,"cacheReadInputTokens":2}},{"role":"assistant","messageId":8,"model":"claude-x","timestamp":1767225602000,"usage":{"inputTokens":10}}]"#)).unwrap();
         assert!(p.used_ledger);
@@ -575,10 +606,18 @@ mod tests {
             "",
             r#"[{"role":"assistant","model":"x","timestamp":1,"usage":{"inputTokens":1}}]"#,
         );
+        let fallback = parse(&json).unwrap();
+        let explicit = parse(&wrap("", r#"[{"role":"assistant","messageId":"m","model":"x","timestamp":1,"usage":{"inputTokens":1}}]"#)).unwrap();
         assert_eq!(
-            parse(&json).unwrap().events[0].source_event_id,
+            fallback.events[0].source_event_id,
             parse(&json).unwrap().events[0].source_event_id
         );
+        assert_eq!(
+            fallback.events[0].operation.metadata,
+            Some(serde_json::json!({"identity_fallback": true}))
+        );
+        assert!(fallback.events[0].confidence < explicit.events[0].confidence);
+        assert_eq!(explicit.events[0].operation.metadata, None);
     }
     #[test]
     fn numeric_and_string_top_level_message_ids_are_identical() {
@@ -599,10 +638,18 @@ mod tests {
             r#", "usageLedger":{"events":[{"timestamp":2,"model":"x","tokens":{"input":1}}]}"#,
             "[]",
         );
+        let fallback = parse(&json).unwrap();
+        let explicit = parse(&wrap(r#", "usageLedger":{"events":[{"id":"l","timestamp":2,"model":"x","tokens":{"input":1}}]}"#, "[]")).unwrap();
         assert_eq!(
-            parse(&json).unwrap().events[0].source_event_id,
+            fallback.events[0].source_event_id,
             parse(&json).unwrap().events[0].source_event_id
         );
+        assert_eq!(
+            fallback.events[0].operation.metadata,
+            Some(serde_json::json!({"identity_fallback": true}))
+        );
+        assert!(fallback.events[0].confidence < explicit.events[0].confidence);
+        assert_eq!(explicit.events[0].operation.metadata, None);
     }
     #[test]
     fn ledger_skips_negative_and_all_zero_records() {
@@ -615,14 +662,16 @@ mod tests {
     }
     #[test]
     fn malformed_ledger_element_does_not_hide_usable_events() {
-        let p = parse(&wrap(r#", "usageLedger":{"events":[{"timestamp":{"private":"secret"},"tokens":{"input":"bad"}}, {"id":"usable","timestamp":1,"model":"x","tokens":{"input":2}}]}"#, "[]")).unwrap();
+        let private = "PRIVATE_ELEMENT_SENTINEL";
+        let p = parse(&wrap(&format!(r#", "usageLedger":{{"events":[{{"timestamp":{{"private":"{private}"}},"tokens":{{"input":"bad"}}}}, {{"id":"usable","timestamp":1,"model":"x","tokens":{{"input":2}}}}]}}"#), "[]")).unwrap();
         assert!(p.used_ledger);
+        assert_eq!(p.malformed_ledger_count, 1);
         assert_eq!(p.events.len(), 1);
         assert_eq!(
             p.events[0].source_event_id.as_deref(),
             Some("amp:T-test-1:ledger:usable")
         );
-        assert!(!format!("{p:?}").contains("secret"));
+        assert!(!format!("{p:?}").contains(private));
     }
     #[test]
     fn rejects_invalid_thread_id_without_leaking_nested_private_values() {
