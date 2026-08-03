@@ -3,15 +3,19 @@ use std::{
     fs::{self, File, Metadata, OpenOptions},
     io::{BufReader, Cursor, Read, Write},
     path::{Path, PathBuf},
-    time::Instant,
+    process::{Command, Stdio},
+    sync::mpsc,
+    thread,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Deserializer};
+use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 
 use crate::{
-    db::{Database, stable_hash, system_time_ns},
+    db::{AmpVirtualImportState, Database, now_ns, stable_hash, system_time_ns},
     projection::event::{
         EntityHint, NormalizedEvent, Operation, OperationStatus, OperationType, TraceContext, Usage,
     },
@@ -22,6 +26,343 @@ use super::{ImportIdentity, ImportReport, ImportTiming, write_collected_event};
 
 const SOURCE_KIND: &str = "amp_local_thread_json";
 const MAX_THREAD_JSON_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_LIST_BYTES: usize = 8 * 1024 * 1024;
+const RECENT_NS: i64 = 15 * 60 * 1_000_000_000;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CliThread {
+    pub id: String,
+    pub message_count: usize,
+}
+struct CliPage {
+    threads: Vec<CliThread>,
+    candidate_rows: usize,
+}
+
+fn parse_cli_thread_page(bytes: &[u8]) -> Result<CliPage> {
+    let text = std::str::from_utf8(bytes).context("Amp list output is not UTF-8")?;
+    let mut threads = Vec::new();
+    let mut candidates = 0;
+    for line in text.lines() {
+        let words: Vec<_> = line.split_whitespace().collect();
+        let id = words
+            .iter()
+            .find(|word| word.starts_with("T-") && word.len() > 2);
+        if let Some(id) = id {
+            candidates += 1;
+            let count = words
+                .last()
+                .and_then(|word| word.parse::<usize>().ok())
+                .context("malformed Amp thread listing row")?;
+            threads.push(CliThread {
+                id: (*id).to_string(),
+                message_count: count,
+            });
+        }
+    }
+    Ok(CliPage {
+        threads,
+        candidate_rows: candidates,
+    })
+}
+
+pub(crate) trait AmpCommandRunner {
+    fn list(&self, offset: usize) -> Result<Vec<u8>>;
+    fn export(&self, thread_id: &str) -> Result<Vec<u8>>;
+}
+
+struct ProcessAmpRunner {
+    executable: PathBuf,
+    deadline: Duration,
+    list_cap: usize,
+    export_cap: usize,
+}
+impl ProcessAmpRunner {
+    fn run(
+        &self,
+        kind: &'static str,
+        args: &[&str],
+        cap: usize,
+        thread_id: Option<&str>,
+    ) -> Result<Vec<u8>> {
+        let mut child = Command::new(&self.executable)
+            .args(args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .with_context(|| format!("start Amp {kind} command"))?;
+        let stdout = child.stdout.take().unwrap();
+        let stderr = child.stderr.take().unwrap();
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let mut sink = std::io::sink();
+            let mut input = stderr;
+            let _ = std::io::copy(&mut input, &mut sink);
+        });
+        thread::spawn(move || {
+            let mut input = stdout;
+            let mut output = Vec::new();
+            let result = (&mut input)
+                .take((cap + 1) as u64)
+                .read_to_end(&mut output)
+                .map(|_| output);
+            let _ = tx.send(result);
+            let _ = std::io::copy(&mut input, &mut std::io::sink());
+        });
+        let started = Instant::now();
+        let mut captured = None;
+        loop {
+            if captured.is_none() {
+                if let Ok(result) = rx.try_recv() {
+                    let output = result?;
+                    if output.len() > cap {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        bail!(
+                            "Amp {kind} output limit exceeded{}",
+                            thread_id.map(|id| format!(" for {id}")).unwrap_or_default()
+                        )
+                    }
+                    captured = Some(output);
+                }
+            }
+            if started.elapsed() >= self.deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                bail!(
+                    "Amp {kind} command timed out{}",
+                    thread_id.map(|id| format!(" for {id}")).unwrap_or_default()
+                )
+            }
+            if let Some(status) = child.try_wait()? {
+                let output = match captured {
+                    Some(output) => output,
+                    None => rx
+                        .recv_timeout(Duration::from_secs(1))
+                        .map_err(|_| anyhow::anyhow!("Amp {kind} output unavailable"))??,
+                };
+                if output.len() > cap {
+                    bail!(
+                        "Amp {kind} output limit exceeded{}",
+                        thread_id.map(|id| format!(" for {id}")).unwrap_or_default()
+                    )
+                }
+                if !status.success() {
+                    bail!(
+                        "Amp {kind} command exited with status {}{}",
+                        status
+                            .code()
+                            .map(|v| v.to_string())
+                            .unwrap_or_else(|| "signal".into()),
+                        thread_id.map(|id| format!(" for {id}")).unwrap_or_default()
+                    )
+                }
+                return Ok(output);
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+}
+impl AmpCommandRunner for ProcessAmpRunner {
+    fn list(&self, offset: usize) -> Result<Vec<u8>> {
+        self.run(
+            "list",
+            &[
+                "threads",
+                "list",
+                "--include-archived",
+                "--limit",
+                "100",
+                "--offset",
+                &offset.to_string(),
+            ],
+            self.list_cap,
+            None,
+        )
+    }
+    fn export(&self, id: &str) -> Result<Vec<u8>> {
+        if !valid_thread_id(id) {
+            bail!("invalid Amp thread id")
+        }
+        self.run(
+            "export",
+            &["threads", "export", id],
+            self.export_cap,
+            Some(id),
+        )
+    }
+}
+
+pub fn sync_cli_first_with_identity(
+    db: &Database,
+    fallback_roots: &[PathBuf],
+    identity: &ImportIdentity,
+) -> Result<ImportReport> {
+    sync_cli_first_recent_with_identity(db, fallback_roots, i64::MIN, identity)
+}
+
+pub fn sync_cli_first_recent_with_identity(
+    db: &Database,
+    fallback_roots: &[PathBuf],
+    modified_since_ns: i64,
+    identity: &ImportIdentity,
+) -> Result<ImportReport> {
+    let runner = match resolve_amp_cli() {
+        Some(executable) => ProcessAmpRunner {
+            executable,
+            deadline: Duration::from_secs(30),
+            list_cap: MAX_LIST_BYTES,
+            export_cap: MAX_THREAD_JSON_BYTES as usize,
+        },
+        None => {
+            return import_local_recent_with_identity(
+                db,
+                fallback_roots,
+                modified_since_ns,
+                identity,
+            );
+        }
+    };
+    match sync_with_runner(db, &runner, identity) {
+        Ok(report) => Ok(report),
+        Err(_) => {
+            import_local_recent_with_identity(db, fallback_roots, modified_since_ns, identity)
+        }
+    }
+}
+
+fn resolve_amp_cli() -> Option<PathBuf> {
+    if let Some(value) = std::env::var_os("AMP_CLI").filter(|v| !v.is_empty()) {
+        let path = PathBuf::from(value);
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+    if let Some(paths) = std::env::var_os("PATH") {
+        for directory in std::env::split_paths(&paths) {
+            let path = directory.join("amp");
+            if path.is_file() {
+                return Some(path);
+            }
+        }
+    }
+    crate::config::home_dir()
+        .map(|home| home.join(".amp/bin/amp"))
+        .filter(|path| path.is_file())
+}
+
+fn sync_with_runner(
+    db: &Database,
+    runner: &dyn AmpCommandRunner,
+    identity: &ImportIdentity,
+) -> Result<ImportReport> {
+    let started = Instant::now();
+    let source_id = db.record_import_source_for_profile(
+        "amp",
+        "amp_cli_thread_export",
+        Path::new("<amp-cli>"),
+        &identity.profile_id,
+        &identity.device_id,
+    )?;
+    let mut offset = 0usize;
+    let mut seen_pages = HashSet::new();
+    let mut threads = Vec::new();
+    loop {
+        let bytes = runner.list(offset)?;
+        let signature = stable_hash(&hex::encode(Sha256::digest(&bytes)));
+        if !seen_pages.insert(signature) {
+            bail!("Amp list pagination did not advance")
+        }
+        let page = parse_cli_thread_page(&bytes)?;
+        if page.candidate_rows == 0 {
+            break;
+        }
+        let next = offset
+            .checked_add(page.candidate_rows)
+            .context("Amp list offset overflow")?;
+        if next <= offset {
+            bail!("Amp list pagination did not advance")
+        }
+        threads.extend(page.threads);
+        offset = next;
+        if offset > 1_000_000 {
+            bail!("Amp list pagination limit exceeded")
+        }
+        if offset % 100 != 0 || page.candidate_rows < 100 {
+            break;
+        }
+    }
+    let mut stats = ScanStats::default();
+    for thread in threads {
+        stats.files_seen += 1;
+        let prior = db.amp_virtual_state(&source_id, &thread.id)?;
+        let should_export = prior.as_ref().is_none_or(|state| {
+            state.message_count != thread.message_count
+                || !matches!(state.status.as_str(), "imported" | "partial")
+                || state.updated_at_ns >= now_ns().saturating_sub(RECENT_NS)
+        });
+        if !should_export {
+            stats.files_skipped += 1;
+            continue;
+        }
+        let preserved = prior.unwrap_or_default();
+        let file_id = db.prepare_amp_virtual(&source_id, &thread.id, thread.message_count)?;
+        let bytes = match runner.export(&thread.id) {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                db.fail_amp_virtual(
+                    &file_id,
+                    &preserved,
+                    &format!("Amp export command failed for {}", thread.id),
+                )?;
+                stats.warnings += 1;
+                continue;
+            }
+        };
+        stats.bytes = stats.bytes.saturating_add(bytes.len() as u64);
+        let digest = hex::encode(Sha256::digest(&bytes));
+        let parsed =
+            match parse_thread_reader(Cursor::new(bytes), "amp_cli_thread_export", identity) {
+                Ok(parsed) => parsed,
+                Err(_) => {
+                    db.fail_amp_virtual(
+                        &file_id,
+                        &preserved,
+                        &format!("Amp export schema failed for {}", thread.id),
+                    )?;
+                    stats.warnings += 1;
+                    continue;
+                }
+            };
+        let event_count = parsed.events.len();
+        let updated = parsed.updated_at_ns;
+        let warnings = parsed_warning_count(&parsed);
+        let tx = db.begin_batch()?;
+        project_parsed_thread(db, &parsed, identity)?;
+        let status = if warnings == 0 { "imported" } else { "partial" };
+        let state = AmpVirtualImportState {
+            status: status.into(),
+            message_count: thread.message_count,
+            updated_at_ns: updated,
+            payload_fingerprint: Some(digest),
+            event_count,
+        };
+        db.finish_amp_virtual(&file_id, status, &state)?;
+        tx.commit()?;
+        stats.files_imported += 1;
+        stats.events += event_count;
+        stats.warnings += warnings;
+    }
+    let written = fs::metadata(db.path()).map(|m| m.len()).unwrap_or_default();
+    Ok(report(
+        PathBuf::from("<amp-cli>"),
+        source_id,
+        stats,
+        written,
+        started.elapsed().as_millis(),
+        started,
+    ))
+}
 
 #[derive(Debug)]
 struct ScannedFile {
@@ -221,6 +562,41 @@ fn import_file_with_limit(
         }
     };
     stats.add_diagnostics(&parsed);
+    project_parsed_thread(db, &parsed, identity)?;
+    let first = parsed.events.iter().map(|e| e.occurred_at_ns).min();
+    let last = parsed.events.iter().map(|e| e.occurred_at_ns).max();
+    let event_count = parsed.events.len();
+    let file_warnings = parsed_warning_count(&parsed);
+    db.finish_import_file(
+        file_id,
+        if file_warnings == 0 {
+            "imported"
+        } else {
+            "partial"
+        },
+        event_count,
+        file_warnings,
+        file_size,
+        first,
+        last,
+        None,
+    )?;
+    stats.events += event_count;
+    Ok(())
+}
+
+fn parsed_warning_count(parsed: &ParsedThread) -> usize {
+    parsed.split_total_mismatch_count
+        + parsed.aggregate_only_count
+        + parsed.malformed_ledger_count
+        + parsed.ledger_total_mismatch_count
+}
+
+fn project_parsed_thread(
+    db: &Database,
+    parsed: &ParsedThread,
+    identity: &ImportIdentity,
+) -> Result<()> {
     let projector = Projector::new(db);
     let mut cache = ProjectionCache::default();
     let mut run_ids = HashSet::new();
@@ -245,9 +621,6 @@ fn import_file_with_limit(
             }
         }
     }
-    let first = parsed.events.iter().map(|e| e.occurred_at_ns).min();
-    let last = parsed.events.iter().map(|e| e.occurred_at_ns).max();
-    let event_count = parsed.events.len();
     for event in &parsed.events {
         let result = projector.project_with_cache(event, &mut cache)?;
         run_ids.insert(result.run_id);
@@ -258,25 +631,6 @@ fn import_file_with_limit(
     projector.refresh_run_summaries(run_ids.iter().map(String::as_str))?;
     db.refresh_observed_llm_latency_for_runs(run_ids.iter().map(String::as_str))?;
     projector.refresh_session_summaries(session_ids.iter().map(String::as_str))?;
-    let file_warnings = parsed.split_total_mismatch_count
-        + parsed.aggregate_only_count
-        + parsed.malformed_ledger_count
-        + parsed.ledger_total_mismatch_count;
-    db.finish_import_file(
-        file_id,
-        if file_warnings == 0 {
-            "imported"
-        } else {
-            "partial"
-        },
-        event_count,
-        file_warnings,
-        file_size,
-        first,
-        last,
-        None,
-    )?;
-    stats.events += event_count;
     Ok(())
 }
 
@@ -1083,11 +1437,103 @@ fn parse_rfc3339_ns(value: &str) -> Option<i64> {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, io::Cursor, path::PathBuf, time::SystemTime};
+    use std::{fs, io::Cursor, path::PathBuf, sync::Mutex, time::SystemTime};
 
     use crate::db::Database;
 
     use super::*;
+
+    #[test]
+    fn cli_table_parser_accepts_unicode_spaces_and_archived_rows() {
+        let table = "ID  Title  Updated  Messages\n--  -----  -------  --------\nT-one  日本語 title with spaces  2 days ago  7\nT-two  archived café  1 year ago  0\n";
+        let page = parse_cli_thread_page(table.as_bytes()).unwrap();
+        assert_eq!(page.candidate_rows, 2);
+        assert_eq!(
+            page.threads[0],
+            CliThread {
+                id: "T-one".into(),
+                message_count: 7
+            }
+        );
+        assert_eq!(page.threads[1].id, "T-two");
+    }
+
+    #[test]
+    fn cli_table_parser_rejects_a_malformed_candidate() {
+        let table =
+            b"ID Title Updated Messages\nT-good title yesterday 2\nT-bad title yesterday nope\n";
+        assert!(parse_cli_thread_page(table).is_err());
+    }
+
+    struct FakeRunner {
+        offsets: Mutex<Vec<usize>>,
+        fail: Option<String>,
+    }
+    impl AmpCommandRunner for FakeRunner {
+        fn list(&self, offset: usize) -> Result<Vec<u8>> {
+            self.offsets.lock().unwrap().push(offset);
+            let range = if offset == 0 { 0..100 } else { 100..101 };
+            Ok(range
+                .map(|i| format!("T-{i} title archived 1 day ago 0\n"))
+                .collect::<String>()
+                .into_bytes())
+        }
+        fn export(&self, id: &str) -> Result<Vec<u8>> {
+            if self.fail.as_deref() == Some(id) {
+                bail!("private failure")
+            }
+            Ok(
+                format!(r#"{{"id":"{id}","updatedAt":"2020-01-01T00:00:00Z","messages":[]}}"#)
+                    .into_bytes(),
+            )
+        }
+    }
+
+    #[test]
+    fn cli_sync_pages_archived_threads_and_skips_stale_unchanged_threads() {
+        let path = std::env::temp_dir().join(format!("shirabe-amp-cli-{}.db", now_ns()));
+        let db = Database::open(&path).unwrap();
+        db.migrate().unwrap();
+        let runner = FakeRunner {
+            offsets: Mutex::new(Vec::new()),
+            fail: None,
+        };
+        let identity = ImportIdentity::new("p", "d");
+        let first = sync_with_runner(&db, &runner, &identity).unwrap();
+        assert_eq!(first.files_imported, 101);
+        assert_eq!(*runner.offsets.lock().unwrap(), vec![0, 100]);
+        runner.offsets.lock().unwrap().clear();
+        let second = sync_with_runner(&db, &runner, &identity).unwrap();
+        assert_eq!(second.files_skipped, 101);
+        assert_eq!(second.files_imported, 0);
+        drop(db);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn one_export_failure_does_not_block_other_threads() {
+        let path = std::env::temp_dir().join(format!("shirabe-amp-failure-{}.db", now_ns()));
+        let db = Database::open(&path).unwrap();
+        db.migrate().unwrap();
+        let runner = FakeRunner {
+            offsets: Mutex::new(Vec::new()),
+            fail: Some("T-0".into()),
+        };
+        let report = sync_with_runner(&db, &runner, &ImportIdentity::new("p", "d")).unwrap();
+        assert_eq!(report.files_imported, 100);
+        assert_eq!(report.warnings.len(), 1);
+        let errors: String = db
+            .connection()
+            .query_row(
+                "SELECT group_concat(COALESCE(error_message,''),' ') FROM import_files",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(!errors.contains("private"));
+        drop(db);
+        let _ = fs::remove_file(path);
+    }
     fn parse(json: &str) -> Result<ParsedThread> {
         parse_thread(json, "amp_thread_json", &ImportIdentity::new("p", "d"))
     }

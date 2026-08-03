@@ -9,6 +9,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::{config::Identity, projection::ids};
@@ -33,12 +34,92 @@ pub struct PreparedImportFile {
     pub metadata_json: Option<String>,
 }
 
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub(crate) struct AmpVirtualImportState {
+    pub status: String,
+    pub message_count: usize,
+    pub updated_at_ns: i64,
+    pub payload_fingerprint: Option<String>,
+    pub event_count: usize,
+}
+
 pub struct BatchTransaction<'a> {
     conn: &'a Connection,
     finished: bool,
 }
 
 impl Database {
+    pub(crate) fn amp_virtual_state(
+        &self,
+        source_id: &str,
+        thread_id: &str,
+    ) -> Result<Option<AmpVirtualImportState>> {
+        let path = format!("amp://thread/{thread_id}");
+        Ok(self.conn.query_row(
+            "SELECT status, event_count, metadata_json, parser_version FROM import_files WHERE source_id = ?1 AND path = ?2",
+            params![source_id, path],
+            |row| {
+                let status: String = row.get(0)?;
+                let event_count = row.get::<_, i64>(1)?.max(0) as usize;
+                let metadata: Option<String> = row.get(2)?;
+                let mut state: AmpVirtualImportState = metadata.and_then(|value| serde_json::from_str(&value).ok()).unwrap_or_default();
+                state.status = status;
+                if row.get::<_, Option<String>>(3)?.as_deref() != Some(IMPORT_PARSER_VERSION) { state.status = "pending".into(); }
+                state.event_count = event_count;
+                Ok(state)
+            },
+        ).optional()?)
+    }
+
+    pub(crate) fn prepare_amp_virtual(
+        &self,
+        source_id: &str,
+        thread_id: &str,
+        message_count: usize,
+    ) -> Result<String> {
+        let path = format!("amp://thread/{thread_id}");
+        let prior = self
+            .amp_virtual_state(source_id, thread_id)?
+            .unwrap_or_default();
+        let file_id = format!("{source_id}:thread:{}", stable_hash(thread_id));
+        let metadata = serde_json::to_string(&AmpVirtualImportState {
+            status: "pending".into(),
+            message_count,
+            ..prior.clone()
+        })?;
+        self.conn.execute(
+            "INSERT INTO import_files (file_id, profile_id, device_id, source_id, path, path_hash, size_bytes, modified_ns, fingerprint, parser_version, status, last_import_ns, metadata_json)
+             VALUES (?1, COALESCE((SELECT profile_id FROM import_sources WHERE source_id=?2),'local'), COALESCE((SELECT device_id FROM import_sources WHERE source_id=?2),'local_device'), ?2, ?3, ?4, 0, 0, ?5, ?6, 'pending', ?7, ?8)
+             ON CONFLICT(file_id) DO UPDATE SET status='pending', parser_version=excluded.parser_version, last_import_ns=excluded.last_import_ns, metadata_json=excluded.metadata_json, error_message=NULL",
+            params![file_id, source_id, path, stable_hash(&path), prior.payload_fingerprint.clone().unwrap_or_default(), IMPORT_PARSER_VERSION, now_ns(), metadata],
+        )?;
+        Ok(file_id)
+    }
+
+    pub(crate) fn finish_amp_virtual(
+        &self,
+        file_id: &str,
+        status: &str,
+        state: &AmpVirtualImportState,
+    ) -> Result<()> {
+        let metadata = serde_json::to_string(state)?;
+        self.conn.execute("UPDATE import_files SET status=?2, event_count=?3, fingerprint=?4, parser_version=?5, last_import_ns=?6, error_message=NULL, metadata_json=?7 WHERE file_id=?1",
+            params![file_id, status, state.event_count.min(i64::MAX as usize) as i64, state.payload_fingerprint.as_deref().unwrap_or_default(), IMPORT_PARSER_VERSION, now_ns(), metadata])?;
+        Ok(())
+    }
+
+    pub(crate) fn fail_amp_virtual(
+        &self,
+        file_id: &str,
+        state: &AmpVirtualImportState,
+        error: &str,
+    ) -> Result<()> {
+        let mut state = state.clone();
+        state.status = "failed".into();
+        let metadata = serde_json::to_string(&state)?;
+        self.conn.execute("UPDATE import_files SET status='failed', last_import_ns=?2, error_message=?3, metadata_json=?4 WHERE file_id=?1", params![file_id, now_ns(), error, metadata])?;
+        Ok(())
+    }
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
