@@ -100,8 +100,8 @@ pub fn prepare(path: Option<PathBuf>) -> Result<WorkspaceReport> {
     fs::create_dir_all(&logs_dir).with_context(|| format!("create {}", logs_dir.display()))?;
 
     chmod_best_effort(&workspace_dir, 0o1777)?;
-    chmod_best_effort(&inbox_dir, 0o1777)?;
-    chmod_best_effort(&profiles_dir, 0o1777)?;
+    enforce_shared_sticky_directory(&inbox_dir)?;
+    enforce_shared_sticky_directory(&profiles_dir)?;
     chmod_best_effort(&collector_state_dir, 0o777)?;
     chmod_best_effort(&logs_dir, 0o777)?;
 
@@ -324,7 +324,7 @@ pub fn collect_to_inbox(
                     inbox_file.display()
                 )
             })?;
-            chmod_best_effort(inbox_file, 0o644)
+            set_and_verify_published_mode(inbox_file)
         },
     )
 }
@@ -422,8 +422,13 @@ where
         now_ns()
     ));
     let inbox_file = temp_file.with_extension("jsonl");
-    let file =
-        fs::File::create(&temp_file).with_context(|| format!("create {}", temp_file.display()))?;
+    let mut temp_options = OpenOptions::new();
+    temp_options.write(true).create_new(true);
+    #[cfg(unix)]
+    temp_options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    let file = temp_options
+        .open(&temp_file)
+        .with_context(|| format!("create {}", temp_file.display()))?;
     let mut writer = BufWriter::new(file);
 
     let result = (|| -> Result<CollectReport> {
@@ -532,22 +537,20 @@ where
 }
 
 pub fn drain_inbox(db: &Database, workspace_dir: &Path) -> Result<DrainReport> {
-    register_workspace_profiles(db, workspace_dir)?;
-
     let inbox_dir = workspace_dir.join("inbox");
-    if !inbox_dir.exists() {
-        return Ok(DrainReport {
-            status: "ok",
-            files_drained: 0,
-            events_projected: 0,
-        });
-    }
+    let profiles_dir = workspace_dir.join("profiles");
+    fs::create_dir_all(&inbox_dir).with_context(|| format!("create {}", inbox_dir.display()))?;
+    fs::create_dir_all(&profiles_dir)
+        .with_context(|| format!("create {}", profiles_dir.display()))?;
+    enforce_shared_sticky_directory(&inbox_dir)?;
+    enforce_shared_sticky_directory(&profiles_dir)?;
+    register_workspace_profiles(db, workspace_dir)?;
 
     let mut files = fs::read_dir(&inbox_dir)
         .with_context(|| format!("read {}", inbox_dir.display()))?
         .filter_map(|entry| {
             let entry = entry.ok()?;
-            entry.file_type().ok()?.is_file().then(|| entry.path())
+            Some(entry.path())
         })
         .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("jsonl"))
         .collect::<Vec<_>>();
@@ -557,7 +560,14 @@ pub fn drain_inbox(db: &Database, workspace_dir: &Path) -> Result<DrainReport> {
     let mut events_projected = 0usize;
 
     for path in files {
-        let file = fs::File::open(&path).with_context(|| format!("open {}", path.display()))?;
+        let file = open_inbox_file(&path)?;
+        #[cfg(unix)]
+        let opened_identity = {
+            let metadata = file
+                .metadata()
+                .with_context(|| format!("read opened metadata {}", path.display()))?;
+            (metadata.dev(), metadata.ino())
+        };
         let reader = BufReader::new(&file);
         let projector = Projector::new(db);
         let tx = db.begin_batch()?;
@@ -627,6 +637,16 @@ pub fn drain_inbox(db: &Database, workspace_dir: &Path) -> Result<DrainReport> {
             fs::File::open(&inbox_dir)
                 .and_then(|directory| directory.sync_all())
                 .with_context(|| format!("sync {}", inbox_dir.display()))?;
+        }
+        #[cfg(unix)]
+        {
+            let current = fs::symlink_metadata(&path)
+                .with_context(|| format!("re-stat drained inbox file {}", path.display()))?;
+            anyhow::ensure!(
+                current.file_type().is_file() && (current.dev(), current.ino()) == opened_identity,
+                "drained inbox path changed while it was open: {}",
+                path.display()
+            );
         }
         fs::remove_file(&path).with_context(|| format!("remove {}", path.display()))?;
         files_drained += 1;
@@ -977,6 +997,125 @@ fn sqlite_table_exists(conn: &Connection, table: &str) -> Result<bool> {
 }
 
 #[cfg(unix)]
+fn enforce_shared_sticky_directory(path: &Path) -> Result<()> {
+    let directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(path)
+        .with_context(|| format!("securely open shared directory {}", path.display()))?;
+    let before = directory
+        .metadata()
+        .with_context(|| format!("stat opened shared directory {}", path.display()))?;
+    anyhow::ensure!(
+        before.file_type().is_dir(),
+        "shared path is not a directory: {}",
+        path.display()
+    );
+    directory
+        .set_permissions(fs::Permissions::from_mode(0o1777))
+        .with_context(|| format!("enforce sticky shared directory mode on {}", path.display()))?;
+    let verified = directory
+        .metadata()
+        .with_context(|| format!("verify shared directory {}", path.display()))?;
+    anyhow::ensure!(
+        verified.file_type().is_dir() && verified.mode() & 0o7777 == 0o1777,
+        "shared directory is not verified mode 01777: {}",
+        path.display()
+    );
+    let current = fs::symlink_metadata(path)
+        .with_context(|| format!("verify shared directory path {}", path.display()))?;
+    anyhow::ensure!(
+        current.file_type().is_dir()
+            && (current.dev(), current.ino()) == (verified.dev(), verified.ino()),
+        "shared directory path changed during verification: {}",
+        path.display()
+    );
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn enforce_shared_sticky_directory(path: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("verify shared directory {}", path.display()))?;
+    anyhow::ensure!(
+        metadata.file_type().is_dir(),
+        "shared path is not a directory: {}",
+        path.display()
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_and_verify_published_mode(path: &Path) -> Result<()> {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .with_context(|| format!("securely open published inbox file {}", path.display()))?;
+    file.set_permissions(fs::Permissions::from_mode(0o644))
+        .with_context(|| format!("set published inbox mode on {}", path.display()))?;
+    let verified = file
+        .metadata()
+        .with_context(|| format!("verify published inbox file {}", path.display()))?;
+    anyhow::ensure!(
+        verified.file_type().is_file() && verified.mode() & 0o777 == 0o644,
+        "published inbox file does not have verified mode 0644: {}",
+        path.display()
+    );
+    let current = fs::symlink_metadata(path)
+        .with_context(|| format!("verify published inbox path {}", path.display()))?;
+    anyhow::ensure!(
+        current.file_type().is_file()
+            && (current.dev(), current.ino()) == (verified.dev(), verified.ino()),
+        "published inbox path changed during verification: {}",
+        path.display()
+    );
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn set_and_verify_published_mode(path: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("verify published inbox file {}", path.display()))?;
+    anyhow::ensure!(
+        metadata.file_type().is_file(),
+        "published inbox path is not a regular file: {}",
+        path.display()
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+fn open_inbox_file(path: &Path) -> Result<File> {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .with_context(|| format!("securely open inbox file {}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("read opened inbox metadata {}", path.display()))?;
+    anyhow::ensure!(
+        metadata.file_type().is_file(),
+        "inbox entry is not a regular file: {}",
+        path.display()
+    );
+    Ok(file)
+}
+
+#[cfg(not(unix))]
+fn open_inbox_file(path: &Path) -> Result<File> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("verify inbox file {}", path.display()))?;
+    anyhow::ensure!(
+        metadata.file_type().is_file(),
+        "inbox entry is not a regular file: {}",
+        path.display()
+    );
+    File::open(path).with_context(|| format!("open {}", path.display()))
+}
+
+#[cfg(unix)]
 fn chmod_best_effort(path: &Path, mode: u32) -> Result<()> {
     let mut permissions = fs::metadata(path)
         .with_context(|| format!("stat {}", path.display()))?
@@ -1055,6 +1194,111 @@ mod tests {
             timings: Vec::new(),
             warnings: Vec::new(),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepare_repairs_and_verifies_shared_sticky_directories() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!("shirabe-sticky-repair-{}", super::now_ns()));
+        std::fs::create_dir_all(root.join("inbox"))?;
+        std::fs::create_dir_all(root.join("profiles"))?;
+        std::fs::set_permissions(root.join("inbox"), std::fs::Permissions::from_mode(0o777))?;
+        std::fs::set_permissions(
+            root.join("profiles"),
+            std::fs::Permissions::from_mode(0o755),
+        )?;
+
+        let workspace = prepare(Some(root.clone()))?;
+
+        for directory in [&workspace.inbox_dir, &workspace.profiles_dir] {
+            let metadata = std::fs::symlink_metadata(directory)?;
+            assert!(metadata.file_type().is_dir());
+            assert_eq!(metadata.permissions().mode() & 0o7777, 0o1777);
+        }
+        let _ = std::fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepare_rejects_symlinked_critical_shared_directory() -> Result<()> {
+        let root = std::env::temp_dir().join(format!("shirabe-sticky-symlink-{}", super::now_ns()));
+        let external = root.with_extension("external");
+        std::fs::create_dir_all(&root)?;
+        std::fs::create_dir_all(&external)?;
+        std::os::unix::fs::symlink(&external, root.join("inbox"))?;
+
+        let result = prepare(Some(root.clone()));
+
+        assert!(result.is_err());
+        assert!(
+            std::fs::symlink_metadata(root.join("inbox"))?
+                .file_type()
+                .is_symlink()
+        );
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(external);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn collection_temp_file_is_created_mode_0600() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!("shirabe-temp-mode-{}", super::now_ns()));
+        let workspace = prepare(Some(root.clone()))?;
+        let report = collect_to_inbox_with(
+            Some(root.clone()),
+            &test_source_paths(&root.join("missing")),
+            &SourceSettings::from_values(Vec::new(), None),
+            &test_identity("temp_mode"),
+            |_, _, _, writer| {
+                let temp = std::fs::read_dir(&workspace.inbox_dir)?
+                    .filter_map(Result::ok)
+                    .find(|entry| {
+                        entry.path().extension().and_then(|value| value.to_str()) == Some("tmp")
+                    })
+                    .expect("open collection temp file");
+                assert_eq!(temp.metadata()?.permissions().mode() & 0o777, 0o600);
+                injected_amp_report(writer)
+            },
+            |from, to| {
+                std::fs::rename(from, to)?;
+                Ok(())
+            },
+        )?;
+        let published = report.inbox_file.expect("published inbox file");
+        assert_eq!(
+            std::fs::metadata(published)?.permissions().mode() & 0o777,
+            0o600
+        );
+        let _ = std::fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn drain_rejects_symlinked_inbox_entry_without_touching_target() -> Result<()> {
+        let root = std::env::temp_dir().join(format!("shirabe-drain-symlink-{}", super::now_ns()));
+        let workspace = prepare(Some(root.clone()))?;
+        let target = root.join("outside.jsonl");
+        std::fs::write(&target, b"")?;
+        std::os::unix::fs::symlink(&target, workspace.inbox_dir.join("linked.jsonl"))?;
+        let db = Database::open(&workspace.catalog_db)?;
+        db.migrate()?;
+
+        assert!(drain_inbox(&db, &workspace.workspace_dir).is_err());
+        assert!(target.exists());
+        assert!(
+            std::fs::symlink_metadata(workspace.inbox_dir.join("linked.jsonl"))?
+                .file_type()
+                .is_symlink()
+        );
+        let _ = std::fs::remove_dir_all(root);
+        Ok(())
     }
 
     #[test]
