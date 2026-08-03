@@ -1832,6 +1832,14 @@ fn import_sync_source(
         _ => unreachable!("unsupported sync source"),
     };
 
+    sync_source_report(source, result, elapsed_ms(started))
+}
+
+fn sync_source_report(
+    source: &str,
+    result: Result<crate::importers::ImportReport>,
+    elapsed_ms: i64,
+) -> SyncSourceReport {
     match result {
         Ok(report) => SyncSourceReport {
             source: report.source,
@@ -1845,7 +1853,7 @@ fn import_sync_source(
             threads_enumerated: report.threads_enumerated,
             threads_exported: report.threads_exported,
             unchanged_threads_skipped: report.unchanged_threads_skipped,
-            elapsed_ms: elapsed_ms(started),
+            elapsed_ms,
             error: None,
         },
         Err(error) => SyncSourceReport {
@@ -1860,7 +1868,7 @@ fn import_sync_source(
             threads_enumerated: None,
             threads_exported: None,
             unchanged_threads_skipped: None,
-            elapsed_ms: elapsed_ms(started),
+            elapsed_ms,
             error: Some(format!("{error:#}")),
         },
     }
@@ -4689,6 +4697,7 @@ mod tests {
     use crate::{
         config::{Identity, SourcePaths},
         db::Database,
+        importers::{ImportReport, ImportTiming},
         projection::{
             event::{
                 EntityHint, NormalizedEvent, Operation, OperationStatus, OperationType,
@@ -4703,8 +4712,46 @@ mod tests {
         AppState, LatencySample, MenubarQuery, SyncStatus, UsageFilters, UsageQuery, load_menubar,
         load_overview, load_pattern_latency_panel, load_run_detail, load_session_detail,
         load_sessions, load_today_latency_panel, load_usage, load_workspace_status,
-        repair_workspace_inner,
+        repair_workspace_inner, sync_source_report,
     };
+
+    #[test]
+    fn amp_sync_report_preserves_local_fallback_mode_and_thread_counters() -> Result<()> {
+        let report = ImportReport {
+            source: "amp".into(),
+            source_id: "amp-source".into(),
+            root_path: PathBuf::from("<amp-local>"),
+            files_seen: 9,
+            files_imported: 4,
+            files_skipped: 5,
+            events_projected: 12,
+            source_bytes_scanned: 345,
+            shirabe_bytes_written: 678,
+            mode: Some("local_fallback"),
+            threads_enumerated: Some(11),
+            threads_exported: Some(7),
+            unchanged_threads_skipped: Some(3),
+            timings: vec![ImportTiming {
+                stage: "total",
+                elapsed_ms: 1,
+            }],
+            warnings: Vec::new(),
+        };
+
+        let value = serde_json::to_value(sync_source_report("amp", Ok(report), 23))?;
+        assert_eq!(value["mode"], "local_fallback");
+        assert_eq!(value["threads_enumerated"], 11);
+        assert_eq!(value["threads_exported"], 7);
+        assert_eq!(value["unchanged_threads_skipped"], 3);
+
+        let error = serde_json::to_value(sync_source_report(
+            "amp",
+            Err(anyhow::anyhow!("failed")),
+            23,
+        ))?;
+        assert!(error.get("mode").is_none());
+        Ok(())
+    }
 
     #[test]
     fn overview_reads_sqlite_totals_and_recent_runs() -> Result<()> {

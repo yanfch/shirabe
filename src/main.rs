@@ -72,18 +72,20 @@ async fn main() -> Result<()> {
                 paths.identity.device_id.clone(),
             );
             let report = match source {
-                ImportSource::Amp => match path {
-                    Some(path) => importers::amp::import_local_with_identity(
-                        &database,
-                        path,
-                        &import_identity,
-                    )?,
-                    None => importers::amp::sync_cli_first_with_identity(
-                        &database,
-                        &paths.source_paths.amp,
-                        &import_identity,
-                    )?,
-                },
+                ImportSource::Amp => import_explicit_amp(
+                    &database,
+                    path,
+                    &paths.source_paths.amp,
+                    &import_identity,
+                    &paths.source_settings,
+                    |database, fallback_roots, identity| {
+                        importers::amp::sync_cli_first_with_identity(
+                            database,
+                            fallback_roots,
+                            identity,
+                        )
+                    },
+                )?,
                 ImportSource::Codex => importers::codex::import_with_identity(
                     &database,
                     path.or_else(|| Some(paths.source_paths.codex.clone())),
@@ -168,6 +170,27 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+fn import_explicit_amp<F>(
+    database: &Database,
+    path: Option<std::path::PathBuf>,
+    fallback_roots: &[std::path::PathBuf],
+    identity: &importers::ImportIdentity,
+    _source_settings: &config::SourceSettings,
+    cli_first: F,
+) -> Result<importers::ImportReport>
+where
+    F: FnOnce(
+        &Database,
+        &[std::path::PathBuf],
+        &importers::ImportIdentity,
+    ) -> Result<importers::ImportReport>,
+{
+    match path {
+        Some(path) => importers::amp::import_local_with_identity(database, path, identity),
+        None => cli_first(database, fallback_roots, identity),
+    }
+}
+
 fn open_registered_database(paths: &Paths) -> Result<(Database, bool)> {
     let database = Database::open(&paths.catalog_db)?;
     database.migrate()?;
@@ -238,4 +261,80 @@ fn process_exists(pid: u32) -> bool {
 #[cfg(not(unix))]
 fn process_exists(_pid: u32) -> bool {
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use anyhow::Result;
+
+    use crate::{
+        config::SourceSettings,
+        db::Database,
+        importers::{ImportIdentity, ImportReport},
+    };
+
+    use super::import_explicit_amp;
+
+    #[test]
+    fn explicit_amp_path_uses_local_import_even_when_amp_is_disabled() -> Result<()> {
+        let root = std::env::temp_dir().join(format!(
+            "shirabe-explicit-amp-{}-{}",
+            std::process::id(),
+            crate::db::now_ns()
+        ));
+        fs::create_dir_all(&root)?;
+        let db_path = root.join("catalog.sqlite");
+        let db = Database::open(&db_path)?;
+        db.migrate()?;
+        let settings = SourceSettings::from_values(vec!["amp".into()], None);
+
+        let report = import_explicit_amp(
+            &db,
+            Some(root.join("threads")),
+            &[root.join("fallback")],
+            &ImportIdentity::local(),
+            &settings,
+            |_, _, _| -> Result<ImportReport> { panic!("CLI-first importer must not be called") },
+        )?;
+
+        assert_eq!(report.source, "amp");
+        assert_eq!(report.root_path, root.join("threads"));
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn amp_import_without_path_selects_cli_first_strategy() -> Result<()> {
+        let root = std::env::temp_dir().join(format!(
+            "shirabe-no-path-amp-{}-{}",
+            std::process::id(),
+            crate::db::now_ns()
+        ));
+        fs::create_dir_all(&root)?;
+        let db = Database::open(&root.join("catalog.sqlite"))?;
+        let settings = SourceSettings::from_values(Vec::new(), None);
+        let mut called = false;
+
+        let result = import_explicit_amp(
+            &db,
+            None,
+            &[root.join("unused")],
+            &ImportIdentity::local(),
+            &settings,
+            |_, roots, _| {
+                called = true;
+                anyhow::bail!("CLI strategy selected for {} root", roots.len())
+            },
+        );
+
+        assert!(called);
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "CLI strategy selected for 1 root"
+        );
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
 }
