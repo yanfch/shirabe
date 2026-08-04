@@ -239,16 +239,16 @@ impl ProcessAmpRunner {
         let started = Instant::now();
         let mut captured = None;
         loop {
-            if captured.is_none() {
-                if let Ok(result) = rx.try_recv() {
-                    let output = result?;
-                    if output.len() > cap {
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        bail!("Amp {kind} output limit exceeded")
-                    }
-                    captured = Some(output);
+            if captured.is_none()
+                && let Ok(result) = rx.try_recv()
+            {
+                let output = result?;
+                if output.len() > cap {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    bail!("Amp {kind} output limit exceeded")
                 }
+                captured = Some(output);
             }
             if started.elapsed() >= self.deadline {
                 let _ = child.kill();
@@ -425,6 +425,7 @@ fn resolve_amp_cli() -> Option<PathBuf> {
         .filter(|path| path.is_file())
 }
 
+#[cfg(test)]
 fn sync_with_runner(
     db: &Database,
     runner: &dyn AmpCommandRunner,
@@ -460,7 +461,7 @@ fn discover_cli_threads(runner: &dyn AmpCommandRunner) -> Result<Vec<CliThread>>
         if offset > 1_000_000 {
             bail!("Amp list pagination limit exceeded")
         }
-        if offset % 100 != 0 || page.candidate_rows < 100 {
+        if !offset.is_multiple_of(100) || page.candidate_rows < 100 {
             break;
         }
     }
@@ -978,6 +979,7 @@ fn recent_json_files(roots: &[PathBuf], modified_since_ns: i64) -> Result<Vec<Sc
     Ok(files)
 }
 
+#[cfg(test)]
 fn scanned_file(path: &Path) -> Result<ScannedFile> {
     let metadata =
         fs::symlink_metadata(path).with_context(|| format!("stat {}", path.display()))?;

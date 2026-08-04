@@ -387,29 +387,28 @@ where
             workspace_file_stem(&identity.profile_id)
         ));
     let pending_path = state_path.with_extension("pending.json");
-    if pending_path.exists() {
-        if let Some((pending, inbox_file)) =
+    if pending_path.exists()
+        && let Some((pending, inbox_file)) =
             read_pending_collection(&pending_path, &workspace.inbox_dir)
-        {
-            let receipt = publication_receipt(&inbox_file);
-            if is_regular_file(&inbox_file) || is_regular_file(&receipt) {
-                persist_state(&state_path, &pending.state)?;
-                fs::remove_file(&pending_path)
-                    .with_context(|| format!("remove {}", pending_path.display()))?;
-                if is_regular_file(&receipt) {
-                    fs::remove_file(&receipt)
-                        .with_context(|| format!("remove {}", receipt.display()))?;
-                }
-                return Ok(CollectReport {
-                    status: "ok",
-                    workspace_dir: workspace.workspace_dir,
-                    inbox_file: Some(inbox_file),
-                    events_collected: 0,
-                    sources: Vec::new(),
-                });
+    {
+        let receipt = publication_receipt(&inbox_file);
+        if is_regular_file(&inbox_file) || is_regular_file(&receipt) {
+            persist_state(&state_path, &pending.state)?;
+            fs::remove_file(&pending_path)
+                .with_context(|| format!("remove {}", pending_path.display()))?;
+            if is_regular_file(&receipt) {
+                fs::remove_file(&receipt)
+                    .with_context(|| format!("remove {}", receipt.display()))?;
             }
-            discard_pending_collection(&pending_path, "stale");
+            return Ok(CollectReport {
+                status: "ok",
+                workspace_dir: workspace.workspace_dir,
+                inbox_file: Some(inbox_file),
+                events_collected: 0,
+                sources: Vec::new(),
+            });
         }
+        discard_pending_collection(&pending_path, "stale");
     }
     let state = read_collector_state(&state_path)?;
     let mut staged_state = state.clone();
@@ -1091,7 +1090,12 @@ fn set_and_verify_completed_mode(file: &File, path: &Path) -> Result<()> {
 
 #[cfg(not(unix))]
 fn set_and_verify_completed_mode(file: &File, path: &Path) -> Result<()> {
-    file.set_permissions(fs::Permissions::from_readonly(false))
+    let mut permissions = file
+        .metadata()
+        .with_context(|| format!("stat completed inbox file {}", path.display()))?
+        .permissions();
+    permissions.set_readonly(false);
+    file.set_permissions(permissions)
         .with_context(|| format!("set completed inbox mode on {}", path.display()))?;
     let metadata = fs::symlink_metadata(path)
         .with_context(|| format!("verify completed inbox file {}", path.display()))?;
@@ -1169,9 +1173,10 @@ mod tests {
         db::Database,
     };
 
+    #[cfg(unix)]
+    use super::enforce_shared_sticky_directory_with;
     use super::{
-        collect_to_inbox, collect_to_inbox_with, drain_inbox, enforce_shared_sticky_directory_with,
-        prepare, seed_pricing_cache,
+        collect_to_inbox, collect_to_inbox_with, drain_inbox, prepare, seed_pricing_cache,
     };
 
     fn injected_amp_report(writer: &mut dyn Write) -> Result<crate::importers::ImportReport> {
@@ -1522,7 +1527,7 @@ mod tests {
                 anyhow::bail!("must not replay collection")
             },
             |_, _| anyhow::bail!("must not publish again"),
-            |path, state| super::write_collector_state(path, state),
+            super::write_collector_state,
         )?;
         assert_eq!(collections, 1);
         assert_eq!(second.events_collected, 0);
