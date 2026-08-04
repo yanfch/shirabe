@@ -4890,6 +4890,95 @@ mod tests {
     }
 
     #[test]
+    fn today_usage_attributes_cross_midnight_run_tokens_to_each_call_day() -> Result<()> {
+        let db_path = temp_db_path("usage-cross-midnight");
+        let db = Database::open(&db_path)?;
+        db.migrate()?;
+        let today_start_ns: i64 = db.connection().query_row(
+            "SELECT CAST(strftime('%s', date('now', 'localtime', 'start of day'), 'utc') AS INTEGER) * 1000000000",
+            [],
+            |row| row.get(0),
+        )?;
+
+        let mut before_midnight = usage_test_event(
+            "cross-midnight-before",
+            today_start_ns - 1_000_000_000,
+            100,
+            10,
+        );
+        before_midnight.session = Some(EntityHint {
+            external_id: "cross-midnight".to_string(),
+            kind: "session".to_string(),
+            title: None,
+        });
+        before_midnight.run.external_id = "cross-midnight".to_string();
+
+        let mut after_midnight = usage_test_event(
+            "cross-midnight-after",
+            today_start_ns + 1_000_000_000,
+            200,
+            20,
+        );
+        after_midnight.session = before_midnight.session.clone();
+        after_midnight.run.external_id = before_midnight.run.external_id.clone();
+
+        let projector = Projector::new(&db);
+        projector.project(&before_midnight)?;
+        projector.project(&after_midnight)?;
+        rollup::refresh_all(&db)?;
+
+        let usage = load_usage(
+            &db_path,
+            UsageFilters::from_query(UsageQuery {
+                preset: Some("today".to_string()),
+                range: None,
+                from: None,
+                to: None,
+                grain: Some("auto".to_string()),
+                profile_id: None,
+                device_id: None,
+                source: Some("codex".to_string()),
+                model: None,
+            }),
+        )?;
+        let bucket_tokens: i64 = usage
+            .buckets
+            .iter()
+            .map(|bucket| bucket.input_tokens + bucket.output_tokens)
+            .sum();
+
+        assert_eq!(usage.summary.total_tokens, 220);
+        assert_eq!(bucket_tokens, usage.summary.total_tokens);
+
+        let _ = fs::remove_file(db_path);
+        Ok(())
+    }
+
+    #[test]
+    fn startup_rebuilds_rollups_without_current_semantics_version() -> Result<()> {
+        let db_path = temp_db_path("rollup-version");
+        let db = Database::open(&db_path)?;
+        db.migrate()?;
+        Projector::new(&db).project(&usage_test_event("rollup-version", 100, 100, 10))?;
+        rollup::refresh_all(&db)?;
+        db.connection()
+            .execute("UPDATE usage_source_rollups SET input_tokens = 999", [])?;
+        db.connection()
+            .execute("DELETE FROM meta WHERE key = 'usage_rollup_version'", [])?;
+
+        assert!(rollup::refresh_if_missing(&db)?.is_some());
+        let input_tokens: i64 = db.connection().query_row(
+            "SELECT input_tokens FROM usage_source_rollups WHERE bucket = 'day'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(input_tokens, 100);
+
+        let _ = fs::remove_file(db_path);
+        Ok(())
+    }
+
+    #[test]
     fn usage_cost_fallback_prices_uncached_input_and_cache_once() -> Result<()> {
         let db_path = temp_db_path("usage-cost-fallback");
         let db = Database::open(&db_path)?;
