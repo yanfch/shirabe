@@ -1,9 +1,12 @@
 use anyhow::Result;
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 use std::time::Instant;
 
 use crate::db::{Database, now_ns};
+
+const USAGE_ROLLUP_VERSION_KEY: &str = "usage_rollup_version";
+const USAGE_ROLLUP_VERSION: &str = "2";
 
 const LLM_COST_SQL: &str = "CASE
     WHEN l.total_cost_usd > 0 THEN l.total_cost_usd
@@ -52,6 +55,7 @@ pub fn refresh_all(db: &Database) -> Result<RollupRefreshReport> {
         "r.started_day",
         "t.started_day",
         "l.started_day",
+        "tc.started_day",
     )?;
     insert_source_rollups(
         conn,
@@ -59,6 +63,7 @@ pub fn refresh_all(db: &Database) -> Result<RollupRefreshReport> {
         "r.started_month",
         "t.started_month",
         "l.started_month",
+        "tc.started_month",
     )?;
     timings.push(RollupTiming {
         stage: "source_rollups",
@@ -89,6 +94,15 @@ pub fn refresh_all(db: &Database) -> Result<RollupRefreshReport> {
         elapsed_ms: started.elapsed().as_millis(),
     });
 
+    conn.execute(
+        "INSERT INTO meta (key, value, updated_at_ns)
+         VALUES (?1, ?2, ?3)
+         ON CONFLICT(key) DO UPDATE SET
+            value = excluded.value,
+            updated_at_ns = excluded.updated_at_ns",
+        params![USAGE_ROLLUP_VERSION_KEY, USAGE_ROLLUP_VERSION, now_ns()],
+    )?;
+
     let report = RollupRefreshReport {
         status: "ok",
         source_rollups: count(conn, "usage_source_rollups")?,
@@ -105,7 +119,14 @@ pub fn refresh_if_missing(db: &Database) -> Result<Option<RollupRefreshReport>> 
     let conn = db.connection();
     let rollups = count(conn, "usage_source_rollups")?;
     let events = count(conn, "llm_calls")? + count(conn, "tool_calls")?;
-    if rollups == 0 && events > 0 {
+    let version = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key = ?1",
+            params![USAGE_ROLLUP_VERSION_KEY],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    if events > 0 && (rollups == 0 || version.as_deref() != Some(USAGE_ROLLUP_VERSION)) {
         return refresh_all(db).map(Some);
     }
 
@@ -128,6 +149,7 @@ fn insert_source_rollups(
     run_bucket_expr: &str,
     turn_bucket_expr: &str,
     llm_bucket_expr: &str,
+    tool_bucket_expr: &str,
 ) -> Result<()> {
     let now = now_ns();
     let sql = format!(
@@ -143,15 +165,7 @@ fn insert_source_rollups(
                 r.source,
                 {run_bucket_expr} AS bucket_key,
                 COUNT(*) AS runs,
-                COUNT(DISTINCT r.session_id) AS sessions,
-                COALESCE(SUM(r.llm_call_count), 0) AS llm_calls,
-                COALESCE(SUM(r.tool_call_count), 0) AS tool_calls,
-                COALESCE(SUM(r.failed_tool_count), 0) AS failed_tool_calls,
-                COALESCE(SUM(r.input_tokens), 0) AS input_tokens,
-                COALESCE(SUM(r.output_tokens), 0) AS output_tokens,
-                COALESCE(SUM(r.cache_read_tokens), 0) AS cache_read_tokens,
-                COALESCE(SUM(r.cache_write_tokens), 0) AS cache_write_tokens,
-                COALESCE(SUM(r.total_cost_usd), 0) AS total_cost_usd
+                COUNT(DISTINCT r.session_id) AS sessions
             FROM runs r
             GROUP BY r.profile_id, r.device_id, r.source, bucket_key
             HAVING bucket_key IS NOT NULL
@@ -167,16 +181,33 @@ fn insert_source_rollups(
             GROUP BY t.profile_id, t.device_id, t.source, bucket_key
             HAVING bucket_key IS NOT NULL
         ),
-        llm_cost_rollups AS (
+        llm_rollups AS (
             SELECT
                 l.profile_id,
                 l.device_id,
                 l.source,
                 {llm_bucket_expr} AS bucket_key,
+                COUNT(*) AS llm_calls,
+                COALESCE(SUM(l.input_tokens), 0) AS input_tokens,
+                COALESCE(SUM(l.output_tokens), 0) AS output_tokens,
+                COALESCE(SUM(l.cache_read_tokens), 0) AS cache_read_tokens,
+                COALESCE(SUM(l.cache_write_tokens), 0) AS cache_write_tokens,
                 COALESCE(SUM({LLM_COST_SQL}), 0) AS total_cost_usd
             FROM llm_calls l
             LEFT JOIN model_prices mp ON mp.model_name = l.model
             GROUP BY l.profile_id, l.device_id, l.source, bucket_key
+            HAVING bucket_key IS NOT NULL
+        ),
+        tool_rollups AS (
+            SELECT
+                tc.profile_id,
+                tc.device_id,
+                tc.source,
+                {tool_bucket_expr} AS bucket_key,
+                COUNT(*) AS tool_calls,
+                COALESCE(SUM(CASE WHEN tc.status = 'failed' THEN 1 ELSE 0 END), 0) AS failed_tool_calls
+            FROM tool_calls tc
+            GROUP BY tc.profile_id, tc.device_id, tc.source, bucket_key
             HAVING bucket_key IS NOT NULL
         ),
         source_keys AS (
@@ -184,7 +215,9 @@ fn insert_source_rollups(
             UNION
             SELECT profile_id, device_id, source, bucket_key FROM turn_rollups
             UNION
-            SELECT profile_id, device_id, source, bucket_key FROM llm_cost_rollups
+            SELECT profile_id, device_id, source, bucket_key FROM llm_rollups
+            UNION
+            SELECT profile_id, device_id, source, bucket_key FROM tool_rollups
         )
         SELECT
             ?1,
@@ -195,22 +228,24 @@ fn insert_source_rollups(
             COALESCE(rr.sessions, 0),
             COALESCE(rr.runs, 0),
             COALESCE(tr.turns, 0),
-            COALESCE(rr.llm_calls, 0),
-            COALESCE(rr.tool_calls, 0),
-            COALESCE(rr.failed_tool_calls, 0),
-            COALESCE(rr.input_tokens, 0),
-            COALESCE(rr.output_tokens, 0),
-            COALESCE(rr.cache_read_tokens, 0),
-            COALESCE(rr.cache_write_tokens, 0),
-            COALESCE(lcr.total_cost_usd, rr.total_cost_usd, 0),
+            COALESCE(lr.llm_calls, 0),
+            COALESCE(tlr.tool_calls, 0),
+            COALESCE(tlr.failed_tool_calls, 0),
+            COALESCE(lr.input_tokens, 0),
+            COALESCE(lr.output_tokens, 0),
+            COALESCE(lr.cache_read_tokens, 0),
+            COALESCE(lr.cache_write_tokens, 0),
+            COALESCE(lr.total_cost_usd, 0),
             ?2
         FROM source_keys sk
         LEFT JOIN run_rollups rr
             ON rr.profile_id = sk.profile_id AND rr.device_id = sk.device_id AND rr.source = sk.source AND rr.bucket_key = sk.bucket_key
         LEFT JOIN turn_rollups tr
             ON tr.profile_id = sk.profile_id AND tr.device_id = sk.device_id AND tr.source = sk.source AND tr.bucket_key = sk.bucket_key
-        LEFT JOIN llm_cost_rollups lcr
-            ON lcr.profile_id = sk.profile_id AND lcr.device_id = sk.device_id AND lcr.source = sk.source AND lcr.bucket_key = sk.bucket_key"
+        LEFT JOIN llm_rollups lr
+            ON lr.profile_id = sk.profile_id AND lr.device_id = sk.device_id AND lr.source = sk.source AND lr.bucket_key = sk.bucket_key
+        LEFT JOIN tool_rollups tlr
+            ON tlr.profile_id = sk.profile_id AND tlr.device_id = sk.device_id AND tlr.source = sk.source AND tlr.bucket_key = sk.bucket_key"
     );
     conn.execute(&sql, (bucket, now))?;
     Ok(())
