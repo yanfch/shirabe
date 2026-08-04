@@ -1733,7 +1733,13 @@ fn parse_rfc3339_ns(value: &str) -> Option<i64> {
 mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
-    use std::{fs, io::Cursor, path::PathBuf, sync::Mutex, time::SystemTime};
+    use std::{
+        fs,
+        io::Cursor,
+        path::PathBuf,
+        sync::Mutex,
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     use crate::db::Database;
 
@@ -3144,11 +3150,11 @@ mod tests {
     }
 
     fn temp_dir(name: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "shirabe-{name}-{}-{:?}",
-            std::process::id(),
-            SystemTime::now()
-        ))
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        std::env::temp_dir().join(format!("shirabe-{name}-{}-{nonce}", std::process::id(),))
     }
 
     fn test_db(root: &std::path::Path) -> Result<Database> {

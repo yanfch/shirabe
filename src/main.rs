@@ -301,6 +301,7 @@ mod tests {
 
         assert_eq!(report.source, "amp");
         assert_eq!(report.root_path, root.join("threads"));
+        drop(db);
         fs::remove_dir_all(root)?;
         Ok(())
     }
@@ -334,6 +335,7 @@ mod tests {
             result.unwrap_err().to_string(),
             "CLI strategy selected for 1 root"
         );
+        drop(db);
         fs::remove_dir_all(root)?;
         Ok(())
     }

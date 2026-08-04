@@ -636,9 +636,7 @@ pub fn drain_inbox(db: &Database, workspace_dir: &Path) -> Result<DrainReport> {
             receipt_file
                 .sync_all()
                 .with_context(|| format!("sync {}", receipt.display()))?;
-            fs::File::open(&inbox_dir)
-                .and_then(|directory| directory.sync_all())
-                .with_context(|| format!("sync {}", inbox_dir.display()))?;
+            sync_directory(&inbox_dir)?;
         }
         #[cfg(unix)]
         {
@@ -960,9 +958,7 @@ fn write_atomic_json(path: &Path, value: &impl Serialize) -> Result<()> {
         drop(file);
         fs::rename(&temp_path, path)
             .with_context(|| format!("rename {} -> {}", temp_path.display(), path.display()))?;
-        fs::File::open(parent)
-            .and_then(|directory| directory.sync_all())
-            .with_context(|| format!("sync {}", parent.display()))?;
+        sync_directory(parent)?;
         Ok(())
     })();
     if result.is_err() {
@@ -996,6 +992,18 @@ fn sqlite_table_exists(conn: &Connection, table: &str) -> Result<bool> {
         |row| row.get(0),
     )?;
     Ok(count > 0)
+}
+
+#[cfg(unix)]
+fn sync_directory(path: &Path) -> Result<()> {
+    fs::File::open(path)
+        .and_then(|directory| directory.sync_all())
+        .with_context(|| format!("sync {}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn sync_directory(_path: &Path) -> Result<()> {
+    Ok(())
 }
 
 #[cfg(unix)]
