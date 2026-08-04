@@ -3,8 +3,9 @@ use std::path::PathBuf;
 
 use crate::projection::event::NormalizedEvent;
 use anyhow::Result;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
+pub mod amp;
 pub mod claude;
 pub mod codex;
 pub mod kanade;
@@ -21,6 +22,14 @@ pub struct ImportReport {
     pub events_projected: usize,
     pub source_bytes_scanned: u64,
     pub shirabe_bytes_written: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub threads_enumerated: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub threads_exported: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unchanged_threads_skipped: Option<usize>,
     pub timings: Vec<ImportTiming>,
     pub warnings: Vec<String>,
 }
@@ -52,6 +61,36 @@ impl ImportIdentity {
 
 pub fn write_collected_event(writer: &mut dyn Write, event: &NormalizedEvent) -> Result<()> {
     serde_json::to_writer(&mut *writer, event)?;
+    writer.write_all(b"\n")?;
+    Ok(())
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SupersedeCollectedEvents {
+    pub(crate) record_type: String,
+    pub(crate) profile_id: String,
+    pub(crate) source: String,
+    pub(crate) source_event_ids: Vec<String>,
+}
+
+pub(crate) fn write_supersede_collected_events(
+    writer: &mut dyn Write,
+    profile_id: &str,
+    source_event_ids: &[String],
+) -> Result<()> {
+    if source_event_ids.is_empty() {
+        return Ok(());
+    }
+    serde_json::to_writer(
+        &mut *writer,
+        &SupersedeCollectedEvents {
+            record_type: "supersede_source_events_v1".into(),
+            profile_id: profile_id.into(),
+            source: "amp".into(),
+            source_event_ids: source_event_ids.to_vec(),
+        },
+    )?;
     writer.write_all(b"\n")?;
     Ok(())
 }

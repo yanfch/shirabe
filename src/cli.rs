@@ -72,6 +72,7 @@ pub enum Commands {
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 pub enum ImportSource {
+    Amp,
     Codex,
     Claude,
     Kanade,

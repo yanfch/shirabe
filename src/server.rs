@@ -26,7 +26,7 @@ use tokio::{net::TcpListener, time};
 use tower_http::{services::ServeDir, trace::TraceLayer};
 
 use crate::{
-    config::{Identity, SourcePaths, is_shared_workspace_dir},
+    config::{Identity, SourcePaths, SourceSettings, is_shared_workspace_dir},
     db::Database,
     importers::{self, ImportIdentity},
     pricing, rollup, workspace,
@@ -41,6 +41,7 @@ struct AppState {
     db_path: PathBuf,
     ui_dir: PathBuf,
     source_paths: SourcePaths,
+    source_settings: SourceSettings,
     identity: Identity,
     sync: Mutex<SyncStatus>,
 }
@@ -50,16 +51,21 @@ pub async fn serve(
     bind: String,
     ui_dir: PathBuf,
     source_paths: SourcePaths,
+    source_settings: SourceSettings,
     identity: Identity,
 ) -> Result<()> {
     let _server_lock = acquire_server_lock_if_shared(&db_path)?;
     let addr: SocketAddr = bind
         .parse()
         .with_context(|| format!("parse bind address {bind}"))?;
+    for source in source_settings.unknown_sources() {
+        tracing::warn!(source, "ignoring unknown disabled source");
+    }
     let state = Arc::new(AppState {
         db_path,
         ui_dir,
         source_paths,
+        source_settings,
         identity,
         sync: Mutex::new(SyncStatus::default()),
     });
@@ -460,6 +466,14 @@ struct SyncSourceReport {
     files_skipped: usize,
     events_projected: usize,
     source_bytes_scanned: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mode: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    threads_enumerated: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    threads_exported: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    unchanged_threads_skipped: Option<usize>,
     elapsed_ms: i64,
     error: Option<String>,
 }
@@ -1723,7 +1737,7 @@ fn run_sync_job_inner(state: &Arc<AppState>) -> Result<()> {
         }
     }
 
-    for source in ["codex", "pi", "claude", "kanade"] {
+    for source in enabled_sync_sources(&state.source_settings) {
         set_sync_phase(state, &format!("import {source}"));
         let report = import_sync_source(&db, source, &state.source_paths, &state.identity);
         imported_files = imported_files.saturating_add(report.files_imported);
@@ -1753,6 +1767,13 @@ fn run_sync_job_inner(state: &Arc<AppState>) -> Result<()> {
     });
 
     Ok(())
+}
+
+fn enabled_sync_sources(settings: &SourceSettings) -> Vec<&'static str> {
+    ["codex", "pi", "claude", "kanade", "amp"]
+        .into_iter()
+        .filter(|source| settings.is_enabled(source))
+        .collect()
 }
 
 fn shared_workspace_dir(db_path: &FsPath) -> Option<&FsPath> {
@@ -1802,9 +1823,23 @@ fn import_sync_source(
             modified_since_ns,
             &import_identity,
         ),
+        "amp" => importers::amp::sync_cli_first_recent_with_identity(
+            db,
+            &source_paths.amp,
+            modified_since_ns,
+            &import_identity,
+        ),
         _ => unreachable!("unsupported sync source"),
     };
 
+    sync_source_report(source, result, elapsed_ms(started))
+}
+
+fn sync_source_report(
+    source: &str,
+    result: Result<crate::importers::ImportReport>,
+    elapsed_ms: i64,
+) -> SyncSourceReport {
     match result {
         Ok(report) => SyncSourceReport {
             source: report.source,
@@ -1814,7 +1849,11 @@ fn import_sync_source(
             files_skipped: report.files_skipped,
             events_projected: report.events_projected,
             source_bytes_scanned: report.source_bytes_scanned,
-            elapsed_ms: elapsed_ms(started),
+            mode: report.mode,
+            threads_enumerated: report.threads_enumerated,
+            threads_exported: report.threads_exported,
+            unchanged_threads_skipped: report.unchanged_threads_skipped,
+            elapsed_ms,
             error: None,
         },
         Err(error) => SyncSourceReport {
@@ -1825,7 +1864,11 @@ fn import_sync_source(
             files_skipped: 0,
             events_projected: 0,
             source_bytes_scanned: 0,
-            elapsed_ms: elapsed_ms(started),
+            mode: None,
+            threads_enumerated: None,
+            threads_exported: None,
+            unchanged_threads_skipped: None,
+            elapsed_ms,
             error: Some(format!("{error:#}")),
         },
     }
@@ -4654,6 +4697,7 @@ mod tests {
     use crate::{
         config::{Identity, SourcePaths},
         db::Database,
+        importers::{ImportReport, ImportTiming},
         projection::{
             event::{
                 EntityHint, NormalizedEvent, Operation, OperationStatus, OperationType,
@@ -4668,8 +4712,46 @@ mod tests {
         AppState, LatencySample, MenubarQuery, SyncStatus, UsageFilters, UsageQuery, load_menubar,
         load_overview, load_pattern_latency_panel, load_run_detail, load_session_detail,
         load_sessions, load_today_latency_panel, load_usage, load_workspace_status,
-        repair_workspace_inner,
+        repair_workspace_inner, sync_source_report,
     };
+
+    #[test]
+    fn amp_sync_report_preserves_local_fallback_mode_and_thread_counters() -> Result<()> {
+        let report = ImportReport {
+            source: "amp".into(),
+            source_id: "amp-source".into(),
+            root_path: PathBuf::from("<amp-local>"),
+            files_seen: 9,
+            files_imported: 4,
+            files_skipped: 5,
+            events_projected: 12,
+            source_bytes_scanned: 345,
+            shirabe_bytes_written: 678,
+            mode: Some("local_fallback"),
+            threads_enumerated: Some(11),
+            threads_exported: Some(7),
+            unchanged_threads_skipped: Some(3),
+            timings: vec![ImportTiming {
+                stage: "total",
+                elapsed_ms: 1,
+            }],
+            warnings: Vec::new(),
+        };
+
+        let value = serde_json::to_value(sync_source_report("amp", Ok(report), 23))?;
+        assert_eq!(value["mode"], "local_fallback");
+        assert_eq!(value["threads_enumerated"], 11);
+        assert_eq!(value["threads_exported"], 7);
+        assert_eq!(value["unchanged_threads_skipped"], 3);
+
+        let error = serde_json::to_value(sync_source_report(
+            "amp",
+            Err(anyhow::anyhow!("failed")),
+            23,
+        ))?;
+        assert!(error.get("mode").is_none());
+        Ok(())
+    }
 
     #[test]
     fn overview_reads_sqlite_totals_and_recent_runs() -> Result<()> {
@@ -5191,6 +5273,7 @@ mod tests {
             db_path: workspace_report.catalog_db.clone(),
             ui_dir: root.join("ui"),
             source_paths: test_source_paths(&root),
+            source_settings: crate::config::SourceSettings::from_values(Vec::new(), None),
             identity: identity.clone(),
             sync: Mutex::new(SyncStatus::default()),
         };
@@ -5472,6 +5555,7 @@ mod tests {
             pi: root.join("pi"),
             claude: root.join("claude"),
             kanade: root.join("kanade"),
+            amp: vec![root.join("amp")],
         }
     }
 
@@ -5484,4 +5568,18 @@ mod tests {
             })
             .collect()
     }
+}
+#[test]
+fn enabled_sync_sources_include_amp_by_default_and_skip_disabled_amp() {
+    let default = crate::config::SourceSettings::from_values(Vec::new(), None);
+    assert_eq!(
+        enabled_sync_sources(&default),
+        vec!["codex", "pi", "claude", "kanade", "amp"]
+    );
+    let disabled =
+        crate::config::SourceSettings::from_values(vec!["amp".into(), "pi".into()], None);
+    assert_eq!(
+        enabled_sync_sources(&disabled),
+        vec!["codex", "claude", "kanade"]
+    );
 }

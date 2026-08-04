@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     env, fs,
     path::{Path, PathBuf},
     process::Command,
@@ -16,6 +17,7 @@ pub struct Paths {
     pub catalog_db: PathBuf,
     pub ui_dist: PathBuf,
     pub source_paths: SourcePaths,
+    pub source_settings: SourceSettings,
     pub identity: Identity,
 }
 
@@ -25,6 +27,13 @@ pub struct SourcePaths {
     pub pi: PathBuf,
     pub claude: PathBuf,
     pub kanade: PathBuf,
+    pub amp: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SourceSettings {
+    disabled: HashSet<String>,
+    unknown: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -43,6 +52,7 @@ impl Paths {
         let data_dir = expand_tilde(data_dir)?;
         let config_dir = config_dir_for_data_dir(&data_dir)?;
         let source_paths = SourcePaths::resolve(&config_dir)?;
+        let source_settings = SourceSettings::resolve(&config_dir)?;
         let identity = Identity::resolve(&config_dir)?;
         let catalog_db = data_dir.join("catalog.sqlite");
         let ui_dist = env::current_dir()
@@ -56,6 +66,7 @@ impl Paths {
             catalog_db,
             ui_dist,
             source_paths,
+            source_settings,
             identity,
         })
     }
@@ -184,7 +195,55 @@ impl SourcePaths {
                 ],
                 &[".kanade", "traces"],
             )?,
+            amp: resolve_amp_paths_from_values(
+                sources.amp,
+                env::var_os("SHIRABE_AMP_THREADS_DIR").map(PathBuf::from),
+                env::var("AMP_DATA_DIR").ok(),
+                home_dir(),
+            )?,
         })
+    }
+}
+
+impl SourceSettings {
+    fn resolve(data_dir: &Path) -> Result<Self> {
+        let config = ConfigFile::load(data_dir)?;
+        Ok(Self::from_values(
+            config.disabled_sources,
+            env::var("SHIRABE_DISABLED_SOURCES").ok(),
+        ))
+    }
+
+    pub(crate) fn from_values(configured: Vec<String>, environment: Option<String>) -> Self {
+        let values = environment
+            .map(|value| value.split(',').map(str::to_owned).collect())
+            .unwrap_or(configured);
+        let known = ["codex", "pi", "claude", "kanade", "amp"];
+        let mut seen = HashSet::new();
+        let mut disabled = HashSet::new();
+        let mut unknown = Vec::new();
+
+        for value in values {
+            let source = value.trim().to_lowercase();
+            if source.is_empty() || !seen.insert(source.clone()) {
+                continue;
+            }
+            if known.contains(&source.as_str()) {
+                disabled.insert(source);
+            } else {
+                unknown.push(source);
+            }
+        }
+
+        Self { disabled, unknown }
+    }
+
+    pub fn is_enabled(&self, source: &str) -> bool {
+        !self.disabled.contains(&source.trim().to_lowercase())
+    }
+
+    pub fn unknown_sources(&self) -> &[String] {
+        &self.unknown
     }
 }
 
@@ -192,6 +251,8 @@ impl SourcePaths {
 struct ConfigFile {
     #[serde(default)]
     sources: Option<SourcePathConfig>,
+    #[serde(default)]
+    disabled_sources: Vec<String>,
     #[serde(default)]
     identity: Option<IdentityConfig>,
 }
@@ -202,6 +263,7 @@ struct SourcePathConfig {
     pi: Option<PathBuf>,
     claude: Option<PathBuf>,
     kanade: Option<PathBuf>,
+    amp: Option<PathBuf>,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -249,12 +311,24 @@ fn default_data_dir() -> PathBuf {
 }
 
 fn config_dir_for_data_dir(data_dir: &Path) -> Result<PathBuf> {
-    if let Some(config_dir) = env::var_os("SHIRABE_CONFIG_DIR") {
-        return expand_tilde(PathBuf::from(config_dir));
+    config_dir_for_data_dir_with_home(
+        data_dir,
+        env::var_os("SHIRABE_CONFIG_DIR").map(PathBuf::from),
+        home_dir(),
+    )
+}
+
+fn config_dir_for_data_dir_with_home(
+    data_dir: &Path,
+    configured_override: Option<PathBuf>,
+    home: Option<PathBuf>,
+) -> Result<PathBuf> {
+    if let Some(config_dir) = configured_override {
+        return expand_tilde_with_home(config_dir, home);
     }
 
     if is_shared_workspace_dir(data_dir) {
-        let home = home_dir().context("home directory is not set")?;
+        let home = home.context("home directory is not set")?;
         return Ok(home.join(".shirabe"));
     }
 
@@ -278,13 +352,17 @@ pub fn default_shared_workspace_dir() -> PathBuf {
 }
 
 fn expand_tilde(path: PathBuf) -> Result<PathBuf> {
+    expand_tilde_with_home(path, home_dir())
+}
+
+fn expand_tilde_with_home(path: PathBuf, home: Option<PathBuf>) -> Result<PathBuf> {
     let raw = path.to_string_lossy();
     if raw == "~" {
-        return home_dir().context("home directory is not set");
+        return home.context("home directory is not set");
     }
 
-    if let Some(rest) = raw.strip_prefix("~/") {
-        let home = home_dir().context("home directory is not set")?;
+    if let Some(rest) = raw.strip_prefix("~/").or_else(|| raw.strip_prefix(r"~\")) {
+        let home = home.context("home directory is not set")?;
         return Ok(home.join(rest));
     }
 
@@ -318,6 +396,49 @@ fn configured_path(
     }
 
     Ok(join_segments(PathBuf::new(), home_suffix))
+}
+
+pub(crate) fn resolve_amp_paths_from_values(
+    configured: Option<PathBuf>,
+    threads_environment: Option<PathBuf>,
+    data_environment: Option<String>,
+    home: Option<PathBuf>,
+) -> Result<Vec<PathBuf>> {
+    let configured = configured.filter(|path| !path.to_string_lossy().trim().is_empty());
+    let threads_environment =
+        threads_environment.filter(|path| !path.to_string_lossy().trim().is_empty());
+    let mut candidates = if let Some(path) = configured {
+        vec![path]
+    } else if let Some(path) = threads_environment {
+        vec![path]
+    } else if let Some(value) = data_environment {
+        value
+            .split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| PathBuf::from(value).join("threads"))
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    if candidates.is_empty() {
+        candidates.push(
+            home.clone()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join(".local/share/amp/threads"),
+        );
+    }
+
+    let mut seen = HashSet::new();
+    let mut paths = Vec::new();
+    for candidate in candidates {
+        let path = expand_tilde_with_home(candidate, home.clone())?;
+        if seen.insert(path.clone()) {
+            paths.push(path);
+        }
+    }
+    Ok(paths)
 }
 
 pub fn home_dir() -> Option<PathBuf> {
@@ -432,7 +553,173 @@ fn parse_platform_uuid(output: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{default_shared_workspace_dir, is_shared_workspace_dir, parse_platform_uuid};
+    use std::path::PathBuf;
+
+    use super::{
+        SourceSettings, config_dir_for_data_dir_with_home, default_shared_workspace_dir,
+        expand_tilde_with_home, is_shared_workspace_dir, parse_platform_uuid,
+        resolve_amp_paths_from_values,
+    };
+
+    #[test]
+    fn configured_sources_are_normalized_and_deduplicated() {
+        let settings = SourceSettings::from_values(
+            vec![" Codex ".into(), "CODEX".into(), " pi ".into()],
+            None,
+        );
+
+        assert!(!settings.is_enabled("codex"));
+        assert!(!settings.is_enabled("PI"));
+        assert!(settings.is_enabled("claude"));
+        assert!(settings.unknown_sources().is_empty());
+    }
+
+    #[test]
+    fn environment_replaces_configured_sources() {
+        let settings =
+            SourceSettings::from_values(vec!["codex".into()], Some(" Claude, AMP, claude ".into()));
+
+        assert!(settings.is_enabled("codex"));
+        assert!(!settings.is_enabled("claude"));
+        assert!(!settings.is_enabled("amp"));
+    }
+
+    #[test]
+    fn explicit_empty_environment_enables_all_sources() {
+        let settings = SourceSettings::from_values(vec!["codex".into()], Some(String::new()));
+
+        for source in ["codex", "pi", "claude", "kanade", "amp"] {
+            assert!(settings.is_enabled(source));
+        }
+    }
+
+    #[test]
+    fn reports_normalized_unknown_sources_without_disabling_them() {
+        let settings = SourceSettings::from_values(
+            vec![" Future ".into(), "future".into(), "OTHER".into()],
+            None,
+        );
+
+        assert_eq!(settings.unknown_sources(), &["future", "other"]);
+        assert!(settings.is_enabled("future"));
+    }
+
+    #[test]
+    fn resolves_two_amp_data_roots_and_deduplicates_them() {
+        let paths = resolve_amp_paths_from_values(
+            None,
+            None,
+            Some(" /one, /two, /one, , ".into()),
+            Some(PathBuf::from("/home/test")),
+        )
+        .unwrap();
+
+        assert_eq!(
+            paths,
+            vec![PathBuf::from("/one/threads"), PathBuf::from("/two/threads")]
+        );
+    }
+
+    #[test]
+    fn expands_supported_tilde_separators_with_injected_home() {
+        let home = Some(PathBuf::from("/home/test"));
+
+        assert_eq!(
+            expand_tilde_with_home(PathBuf::from("~/amp"), home.clone()).unwrap(),
+            PathBuf::from("/home/test/amp")
+        );
+        assert_eq!(
+            expand_tilde_with_home(PathBuf::from(r"~\amp"), home).unwrap(),
+            PathBuf::from("/home/test/amp")
+        );
+    }
+
+    #[test]
+    fn preserves_literal_filenames_beginning_with_tilde() {
+        let path = PathBuf::from("~amp");
+
+        assert_eq!(
+            expand_tilde_with_home(path.clone(), Some(PathBuf::from("/home/test"))).unwrap(),
+            path
+        );
+    }
+
+    #[test]
+    fn amp_resolver_expands_configured_and_environment_tildes_with_injected_home() {
+        let configured = resolve_amp_paths_from_values(
+            Some(PathBuf::from("~/amp")),
+            None,
+            None,
+            Some(PathBuf::from("/home/test")),
+        )
+        .unwrap();
+        let environment = resolve_amp_paths_from_values(
+            None,
+            Some(PathBuf::from(r"~\amp")),
+            None,
+            Some(PathBuf::from("/home/test")),
+        )
+        .unwrap();
+
+        assert_eq!(configured, vec![PathBuf::from("/home/test/amp")]);
+        assert_eq!(environment, vec![PathBuf::from("/home/test/amp")]);
+    }
+
+    #[test]
+    fn configured_amp_source_has_highest_precedence() {
+        let paths = resolve_amp_paths_from_values(
+            Some(PathBuf::from("/configured/threads")),
+            Some(PathBuf::from("/environment/threads")),
+            Some("/amp-data".into()),
+            Some(PathBuf::from("/home/test")),
+        )
+        .unwrap();
+
+        assert_eq!(paths, vec![PathBuf::from("/configured/threads")]);
+    }
+
+    #[test]
+    fn shirabe_amp_threads_dir_precedes_amp_data_dir_and_default() {
+        let paths = resolve_amp_paths_from_values(
+            None,
+            Some(PathBuf::from("/environment/threads")),
+            Some("/amp-data".into()),
+            Some(PathBuf::from("/home/test")),
+        )
+        .unwrap();
+
+        assert_eq!(paths, vec![PathBuf::from("/environment/threads")]);
+    }
+
+    #[test]
+    fn amp_source_defaults_to_home_local_share() {
+        let paths =
+            resolve_amp_paths_from_values(None, None, None, Some(PathBuf::from("/home/test")))
+                .unwrap();
+
+        assert_eq!(
+            paths,
+            vec![PathBuf::from("/home/test/.local/share/amp/threads")]
+        );
+    }
+
+    #[test]
+    fn empty_amp_environment_values_fall_through_to_default() {
+        for threads in ["", "  \t"] {
+            let paths = resolve_amp_paths_from_values(
+                None,
+                Some(PathBuf::from(threads)),
+                Some(" , \t,  ".into()),
+                Some(PathBuf::from("/home/test")),
+            )
+            .unwrap();
+
+            assert_eq!(
+                paths,
+                vec![PathBuf::from("/home/test/.local/share/amp/threads")]
+            );
+        }
+    }
 
     #[test]
     fn parses_ioreg_platform_uuid() {
@@ -446,5 +733,16 @@ mod tests {
     #[test]
     fn recognizes_default_shared_workspace() {
         assert!(is_shared_workspace_dir(&default_shared_workspace_dir()));
+    }
+
+    #[test]
+    fn shared_workspace_uses_home_config_directory() {
+        let workspace = default_shared_workspace_dir().join("team");
+        let config_dir =
+            config_dir_for_data_dir_with_home(&workspace, None, Some(PathBuf::from("/home/test")))
+                .unwrap();
+
+        assert_eq!(config_dir, PathBuf::from("/home/test/.shirabe"));
+        assert_ne!(config_dir, workspace);
     }
 }
