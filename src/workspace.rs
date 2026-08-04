@@ -1820,6 +1820,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     #[test]
     fn shared_workspace_ledger_replaces_previously_drained_amp_message_usage() -> Result<()> {
         let root = std::env::temp_dir().join(format!("shirabe-amp-replace-{}", super::now_ns()));
