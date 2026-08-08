@@ -173,6 +173,11 @@ fn insert_source_rollups(
                 l.device_id,
                 l.source,
                 {llm_bucket_expr} AS bucket_key,
+                COUNT(*) AS llm_calls,
+                COALESCE(SUM(l.input_tokens), 0) AS input_tokens,
+                COALESCE(SUM(l.output_tokens), 0) AS output_tokens,
+                COALESCE(SUM(l.cache_read_tokens), 0) AS cache_read_tokens,
+                COALESCE(SUM(l.cache_write_tokens), 0) AS cache_write_tokens,
                 COALESCE(SUM({LLM_COST_SQL}), 0) AS total_cost_usd
             FROM llm_calls l
             LEFT JOIN model_prices mp ON mp.model_name = l.model
@@ -195,13 +200,13 @@ fn insert_source_rollups(
             COALESCE(rr.sessions, 0),
             COALESCE(rr.runs, 0),
             COALESCE(tr.turns, 0),
-            COALESCE(rr.llm_calls, 0),
+            COALESCE(lcr.llm_calls, 0),
             COALESCE(rr.tool_calls, 0),
             COALESCE(rr.failed_tool_calls, 0),
-            COALESCE(rr.input_tokens, 0),
-            COALESCE(rr.output_tokens, 0),
-            COALESCE(rr.cache_read_tokens, 0),
-            COALESCE(rr.cache_write_tokens, 0),
+            COALESCE(lcr.input_tokens, 0),
+            COALESCE(lcr.output_tokens, 0),
+            COALESCE(lcr.cache_read_tokens, 0),
+            COALESCE(lcr.cache_write_tokens, 0),
             COALESCE(lcr.total_cost_usd, rr.total_cost_usd, 0),
             ?2
         FROM source_keys sk
@@ -317,4 +322,76 @@ fn insert_tool_model_rollups(conn: &Connection, bucket: &str, bucket_expr: &str)
 fn count(conn: &Connection, table: &str) -> Result<i64> {
     let sql = format!("SELECT COUNT(*) FROM {table}");
     Ok(conn.query_row(&sql, [], |row| row.get(0))?)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{fs, time::SystemTime};
+
+    use anyhow::Result;
+
+    use super::refresh_all;
+    use crate::db::Database;
+
+    #[test]
+    fn source_rollup_attributes_llm_usage_by_call_time() -> Result<()> {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)?
+            .as_nanos();
+        let db_path = std::env::temp_dir().join(format!(
+            "shirabe-source-rollup-call-time-{}-{unique}.sqlite",
+            std::process::id()
+        ));
+
+        {
+            let db = Database::open(&db_path)?;
+            db.migrate()?;
+            db.connection().execute_batch(
+                "INSERT INTO sessions (
+                    session_id, profile_id, device_id, source, kind,
+                    first_seen_ns, last_seen_ns
+                 ) VALUES (
+                    'amp:session', 'profile', 'device', 'amp', 'amp_thread', 1, 2
+                 );
+                 INSERT INTO runs (
+                    run_id, profile_id, device_id, source, kind, status, session_id,
+                    started_at_ns, started_day, started_month
+                 ) VALUES (
+                    'amp:run', 'profile', 'device', 'amp', 'amp_thread', 'success',
+                    'amp:session', 1, '2026-08-04', '2026-08'
+                 );
+                 INSERT INTO llm_calls (
+                    llm_call_id, profile_id, device_id, run_id, session_id, source,
+                    model, status, output_tokens, cache_read_tokens, cache_write_tokens,
+                    total_cost_usd, started_at_ns, started_day, started_month
+                 ) VALUES (
+                    'amp:call', 'profile', 'device', 'amp:run', 'amp:session', 'amp',
+                    'gpt-5.6-sol', 'success', 25, 1000, 200, 0.5,
+                    2, '2026-08-05', '2026-08'
+                 );",
+            )?;
+
+            refresh_all(&db)?;
+
+            let actual = db.connection().query_row(
+                "SELECT llm_calls, output_tokens, cache_read_tokens, cache_write_tokens
+                 FROM usage_source_rollups
+                 WHERE bucket = 'day' AND bucket_key = '2026-08-05'
+                   AND profile_id = 'profile' AND device_id = 'device' AND source = 'amp'",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )?;
+            assert_eq!(actual, (1, 25, 1000, 200));
+        }
+
+        let _ = fs::remove_file(db_path);
+        Ok(())
+    }
 }

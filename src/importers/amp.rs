@@ -1420,7 +1420,14 @@ pub(crate) fn parse_thread_reader<R: Read>(
                 .and_then(|id| cache.get(id))
                 .copied()
                 .unwrap_or_default();
-            if input == 0 && output == 0 && cache_write == 0 && cache_read == 0 {
+            let uncached_input = input;
+            let Some(input) = uncached_input
+                .checked_add(cache_write)
+                .and_then(|value| value.checked_add(cache_read))
+            else {
+                continue;
+            };
+            if input == 0 && output == 0 {
                 continue;
             }
             let explicit_id = item.id.as_deref().filter(|id| !id.trim().is_empty());
@@ -1441,6 +1448,7 @@ pub(crate) fn parse_thread_reader<R: Read>(
                 model,
                 Mapped {
                     input,
+                    uncached_input,
                     output,
                     cache_write,
                     cache_read,
@@ -1485,6 +1493,7 @@ struct Diagnostics {
 }
 struct Mapped {
     input: i64,
+    uncached_input: i64,
     output: i64,
     cache_write: i64,
     cache_read: i64,
@@ -1508,30 +1517,32 @@ fn map_current(value: &CurrentUsage, diagnostics: &mut Diagnostics) -> Option<Ma
     let split_present = value.input_tokens.is_some()
         || value.cache_creation_input_tokens.is_some()
         || value.cache_read_input_tokens.is_some();
-    let (input, cache_write, cache_read, confidence, aggregate_fallback) = if split_present {
-        let values = (
-            value.input_tokens.unwrap_or(0),
-            value.cache_creation_input_tokens.unwrap_or(0),
-            value.cache_read_input_tokens.unwrap_or(0),
-        );
-        let split_total = values.0.checked_add(values.1)?.checked_add(values.2)?;
-        if value
-            .total_input_tokens
-            .is_some_and(|total| total != split_total)
-        {
-            diagnostics.mismatches += 1;
-        }
-        (values.0, values.1, values.2, 0.9, false)
-    } else {
-        let aggregate = value.total_input_tokens.unwrap_or(0);
-        if aggregate > 0 {
-            diagnostics.aggregates += 1;
-        }
-        (aggregate, 0, 0, 0.6, aggregate > 0)
-    };
+    let (input, uncached_input, cache_write, cache_read, confidence, aggregate_fallback) =
+        if split_present {
+            let values = (
+                value.input_tokens.unwrap_or(0),
+                value.cache_creation_input_tokens.unwrap_or(0),
+                value.cache_read_input_tokens.unwrap_or(0),
+            );
+            let split_total = values.0.checked_add(values.1)?.checked_add(values.2)?;
+            if value
+                .total_input_tokens
+                .is_some_and(|total| total != split_total)
+            {
+                diagnostics.mismatches += 1;
+            }
+            (split_total, values.0, values.1, values.2, 0.9, false)
+        } else {
+            let aggregate = value.total_input_tokens.unwrap_or(0);
+            if aggregate > 0 {
+                diagnostics.aggregates += 1;
+            }
+            (aggregate, aggregate, 0, 0, 0.6, aggregate > 0)
+        };
     let output = value.output_tokens.unwrap_or(0);
     (input != 0 || output != 0 || cache_write != 0 || cache_read != 0).then_some(Mapped {
         input,
+        uncached_input,
         output,
         cache_write,
         cache_read,
@@ -1601,7 +1612,7 @@ fn make_event(
             model: Some(model.into()),
             input_tokens: mapped.input,
             output_tokens: mapped.output,
-            uncached_input_tokens: mapped.input,
+            uncached_input_tokens: mapped.uncached_input,
             cache_read_tokens: mapped.cache_read,
             cache_write_tokens: mapped.cache_write,
             pricing_status: Some("estimated_from_model_prices".into()),
@@ -2331,7 +2342,7 @@ mod tests {
                 event.usage.cache_write_tokens,
                 event.usage.cache_read_tokens
             ),
-            (10, 10, 5, 3, 2)
+            (15, 10, 5, 3, 2)
         );
         assert_eq!(event.usage.provider.as_deref(), Some("anthropic"));
         assert_eq!(event.usage.model_context_window, Some(200000));
@@ -2409,7 +2420,7 @@ mod tests {
         let p=parse(&wrap("",r#"[{"role":"assistant","model":"x","timestamp":1,"usage":{"inputTokens":2,"cacheReadInputTokens":3,"totalInputTokens":99}},{"role":"assistant","model":"x","timestamp":2,"usage":{"totalInputTokens":8}}]"#)).unwrap();
         assert_eq!(p.split_total_mismatch_count, 1);
         assert_eq!(p.aggregate_only_count, 1);
-        assert_eq!(p.events[0].usage.input_tokens, 2);
+        assert_eq!(p.events[0].usage.input_tokens, 5);
         assert_eq!(
             p.events[0].operation.metadata,
             Some(serde_json::json!({"identity_fallback": true}))
@@ -2703,7 +2714,7 @@ mod tests {
             [],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
         )?;
-        assert_eq!(totals, (30, 12, 7, 3));
+        assert_eq!(totals, (40, 12, 7, 3));
 
         let repeated = import_local_recent_with_identity(&db, &[root], 0, &identity)?;
         assert_eq!(
@@ -2858,7 +2869,7 @@ mod tests {
         assert_eq!(
             values,
             (
-                100,
+                150,
                 50,
                 30,
                 20,
@@ -2895,7 +2906,7 @@ mod tests {
             (
                 "claude-test".into(),
                 1_767_225_600_000_000_000,
-                10,
+                15,
                 5,
                 3,
                 2,
@@ -2915,7 +2926,7 @@ mod tests {
             [],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
         )?;
-        assert_eq!(values, ("claude-new".into(), 40, 9, 3, 2));
+        assert_eq!(values, ("claude-new".into(), 45, 9, 3, 2));
         Ok(())
     }
 
@@ -2942,7 +2953,7 @@ mod tests {
                 .query_row("SELECT model, input_tokens FROM llm_calls", [], |row| {
                     Ok((row.get(0)?, row.get(1)?))
                 })?;
-        assert_eq!(retained, ("claude-test".into(), 10));
+        assert_eq!(retained, ("claude-test".into(), 15));
         assert_eq!(count(&db, "llm_calls")?, 1);
         assert_eq!(count(&db, "run_steps")?, 1);
         Ok(())

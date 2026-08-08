@@ -15,7 +15,7 @@ use sha2::{Digest, Sha256};
 use crate::{config::Identity, projection::ids};
 
 pub const SCHEMA_VERSION: i64 = 7;
-const IMPORT_PARSER_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "+import-v3");
+const IMPORT_PARSER_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "+import-v4");
 const PI_LLM_EVENT_ID_MIGRATION: &str = "pi_llm_event_ids_v2";
 
 pub struct Database {
@@ -207,6 +207,7 @@ impl Database {
             self.ensure_column(table, "profile_id", "TEXT NOT NULL DEFAULT 'local'")?;
             self.ensure_column(table, "device_id", "TEXT NOT NULL DEFAULT 'local_device'")?;
         }
+        self.backfill_amp_input_tokens()?;
         self.backfill_time_buckets()?;
         self.backfill_observed_llm_latency()?;
 
@@ -991,6 +992,39 @@ impl Database {
         Ok(())
     }
 
+    fn backfill_amp_input_tokens(&self) -> Result<()> {
+        let changed = self.conn.execute(
+            "UPDATE llm_calls
+             SET input_tokens = uncached_input_tokens + cache_read_tokens + cache_write_tokens
+             WHERE source = 'amp'
+               AND input_tokens != uncached_input_tokens + cache_read_tokens + cache_write_tokens
+               AND uncached_input_tokens <= 9223372036854775807 - cache_read_tokens
+               AND uncached_input_tokens + cache_read_tokens
+                   <= 9223372036854775807 - cache_write_tokens",
+            [],
+        )?;
+        if changed == 0 {
+            return Ok(());
+        }
+        self.conn.execute_batch(
+            "UPDATE run_steps
+             SET input_tokens = COALESCE((
+                 SELECT input_tokens FROM llm_calls
+                 WHERE llm_calls.llm_call_id = run_steps.llm_call_id
+             ), input_tokens)
+             WHERE source = 'amp' AND llm_call_id IS NOT NULL;
+
+             UPDATE runs
+             SET input_tokens = COALESCE((
+                 SELECT SUM(input_tokens) FROM llm_calls
+                 WHERE llm_calls.run_id = runs.run_id
+             ), 0)
+             WHERE source = 'amp';",
+        )?;
+        self.clear_usage_rollups()?;
+        Ok(())
+    }
+
     pub fn record_import_source(
         &self,
         source: &str,
@@ -1669,6 +1703,8 @@ CREATE TABLE IF NOT EXISTS run_steps (
 CREATE INDEX IF NOT EXISTS idx_run_steps_run_order ON run_steps(run_id, order_index, started_at_ns);
 CREATE INDEX IF NOT EXISTS idx_run_steps_run_status ON run_steps(run_id, status);
 CREATE INDEX IF NOT EXISTS idx_run_steps_profile_started ON run_steps(profile_id, started_at_ns);
+CREATE INDEX IF NOT EXISTS idx_run_steps_source_event
+ON run_steps(profile_id, source, source_event_id);
 
 CREATE TABLE IF NOT EXISTS llm_calls (
     llm_call_id TEXT PRIMARY KEY,
@@ -2259,6 +2295,69 @@ mod tests {
         assert_eq!(db.migrate_pi_llm_event_ids()?, 0);
 
         let _ = fs::remove_file(session_path);
+        let _ = fs::remove_file(db_path);
+        Ok(())
+    }
+
+    #[test]
+    fn migrate_repairs_legacy_amp_input_token_semantics() -> Result<()> {
+        let db_path = std::env::temp_dir().join(format!(
+            "shirabe-amp-input-token-migration-{}.sqlite",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&db_path);
+        let db = Database::open(&db_path)?;
+        db.migrate()?;
+        db.connection().execute_batch(
+            "INSERT INTO sessions (
+                session_id, profile_id, device_id, source, kind, first_seen_ns, last_seen_ns
+             ) VALUES ('amp:session', 'profile', 'device', 'amp', 'amp_thread', 1, 1);
+             INSERT INTO runs (
+                run_id, profile_id, device_id, source, kind, status, session_id,
+                started_at_ns, input_tokens
+             ) VALUES (
+                'amp:run', 'profile', 'device', 'amp', 'amp_thread', 'success',
+                'amp:session', 1, 10
+             );
+             INSERT INTO llm_calls (
+                llm_call_id, profile_id, device_id, run_id, session_id, source, status,
+                input_tokens, uncached_input_tokens, cache_read_tokens, cache_write_tokens,
+                started_at_ns
+             ) VALUES (
+                'amp:llm', 'profile', 'device', 'amp:run', 'amp:session', 'amp', 'success',
+                10, 10, 2, 3, 1
+             );
+             INSERT INTO run_steps (
+                step_id, profile_id, device_id, run_id, session_id, source,
+                source_event_id, step_type, name, status, started_at_ns, llm_call_id,
+                input_tokens
+             ) VALUES (
+                'amp:step', 'profile', 'device', 'amp:run', 'amp:session', 'amp',
+                'amp:event', 'llm', 'llm_call', 'success', 1, 'amp:llm', 10
+             );
+             INSERT INTO usage_source_rollups (
+                bucket, bucket_key, profile_id, device_id, source, input_tokens, updated_at_ns
+             ) VALUES ('day', '1970-01-01', 'profile', 'device', 'amp', 10, 1);",
+        )?;
+
+        db.migrate()?;
+
+        let repaired: (i64, i64, i64) = db.connection().query_row(
+            "SELECT l.input_tokens, r.input_tokens, s.input_tokens
+             FROM llm_calls l
+             JOIN runs r ON r.run_id = l.run_id
+             JOIN run_steps s ON s.llm_call_id = l.llm_call_id",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        assert_eq!(repaired, (15, 15, 15));
+        let rollups: i64 =
+            db.connection()
+                .query_row("SELECT COUNT(*) FROM usage_source_rollups", [], |row| {
+                    row.get(0)
+                })?;
+        assert_eq!(rollups, 0);
+
         let _ = fs::remove_file(db_path);
         Ok(())
     }
