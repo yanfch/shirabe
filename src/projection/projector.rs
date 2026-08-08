@@ -538,6 +538,10 @@ impl<'a> Projector<'a> {
                 turn_id = COALESCE(excluded.turn_id, run_steps.turn_id),
                 status = excluded.status,
                 error_type = COALESCE(excluded.error_type, run_steps.error_type),
+                started_at_ns = CASE
+                    WHEN excluded.step_type = 'llm' THEN excluded.started_at_ns
+                    ELSE run_steps.started_at_ns
+                END,
                 ended_at_ns = COALESCE(excluded.ended_at_ns, run_steps.ended_at_ns),
                 duration_ns = COALESCE(excluded.duration_ns, run_steps.duration_ns),
                 llm_call_id = COALESCE(excluded.llm_call_id, run_steps.llm_call_id),
@@ -633,6 +637,7 @@ impl<'a> Projector<'a> {
                 total_cost_usd = excluded.total_cost_usd,
                 pricing_status = COALESCE(excluded.pricing_status, llm_calls.pricing_status),
                 cost_confidence = COALESCE(excluded.cost_confidence, llm_calls.cost_confidence),
+                started_at_ns = excluded.started_at_ns,
                 started_day = excluded.started_day,
                 started_month = excluded.started_month,
                 trace_id = COALESCE(excluded.trace_id, llm_calls.trace_id),
@@ -714,8 +719,6 @@ impl<'a> Projector<'a> {
                 status = excluded.status,
                 error_type = COALESCE(excluded.error_type, tool_calls.error_type),
                 output_bytes = COALESCE(excluded.output_bytes, tool_calls.output_bytes),
-                started_day = excluded.started_day,
-                started_month = excluded.started_month,
                 trace_id = COALESCE(excluded.trace_id, tool_calls.trace_id),
                 span_id = COALESCE(excluded.span_id, tool_calls.span_id),
                 ended_at_ns = COALESCE(excluded.ended_at_ns, tool_calls.ended_at_ns),
@@ -1284,6 +1287,97 @@ mod tests {
             |row| row.get(0),
         )?;
         assert_eq!(trigger_name, "bash");
+
+        let _ = fs::remove_file(db_path);
+        Ok(())
+    }
+
+    #[test]
+    fn cross_midnight_updates_keep_operation_start_and_date_consistent() -> Result<()> {
+        let db_path = temp_db_path("cross_midnight_operation_update");
+        let db = Database::open(&db_path)?;
+        db.migrate()?;
+        let today_start_ns: i64 = db.connection().query_row(
+            "SELECT CAST(strftime('%s', date('now', 'localtime', 'start of day'), 'utc') AS INTEGER) * 1000000000",
+            [],
+            |row| row.get(0),
+        )?;
+        let before = today_start_ns - 1_000_000_000;
+        let after = today_start_ns + 1_000_000_000;
+        let projector = Projector::new(&db);
+
+        let tool_started = test_event(
+            "tool-cross-midnight",
+            OperationType::ToolCall,
+            "exec",
+            before,
+            Some(1),
+            0,
+            OperationStatus::Running,
+        );
+        let tool_finished = test_event(
+            "tool-cross-midnight",
+            OperationType::ToolCall,
+            "exec",
+            after,
+            Some(2),
+            0,
+            OperationStatus::Success,
+        );
+        projector.project(&tool_started)?;
+        projector.project(&tool_finished)?;
+
+        let tool: (i64, String) = db.connection().query_row(
+            "SELECT started_at_ns, started_day FROM tool_calls",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        assert_eq!(tool.0, before);
+        assert_eq!(
+            tool.1,
+            db.connection().query_row(
+                "SELECT date(?1 / 1000000000, 'unixepoch', 'localtime')",
+                [before],
+                |row| row.get::<_, String>(0),
+            )?
+        );
+
+        let llm_before = test_event(
+            "llm-corrected",
+            OperationType::LlmCall,
+            "gpt-test",
+            before,
+            Some(3),
+            10,
+            OperationStatus::Success,
+        );
+        let llm_after = test_event(
+            "llm-corrected",
+            OperationType::LlmCall,
+            "gpt-test",
+            after,
+            Some(3),
+            20,
+            OperationStatus::Success,
+        );
+        projector.project(&llm_before)?;
+        let projected = projector.project(&llm_after)?;
+        let llm_and_step: (i64, String, i64) = db.connection().query_row(
+            "SELECT l.started_at_ns, l.started_day, rs.started_at_ns
+             FROM llm_calls l JOIN run_steps rs ON rs.step_id = ?1
+             WHERE l.operation = 'gpt-test'",
+            [projected.step_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        assert_eq!((llm_and_step.0, llm_and_step.2), (after, after));
+        assert_eq!(
+            llm_and_step.1,
+            db.connection().query_row(
+                "SELECT date(?1 / 1000000000, 'unixepoch', 'localtime')",
+                [after],
+                |row| row.get::<_, String>(0),
+            )?
+        );
 
         let _ = fs::remove_file(db_path);
         Ok(())

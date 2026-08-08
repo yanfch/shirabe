@@ -14,7 +14,7 @@ use sha2::{Digest, Sha256};
 
 use crate::{config::Identity, projection::ids};
 
-pub const SCHEMA_VERSION: i64 = 7;
+pub const SCHEMA_VERSION: i64 = 8;
 const IMPORT_PARSER_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "+import-v4");
 const PI_LLM_EVENT_ID_MIGRATION: &str = "pi_llm_event_ids_v2";
 
@@ -213,6 +213,7 @@ impl Database {
         }
         self.backfill_amp_input_tokens()?;
         self.backfill_time_buckets()?;
+        self.repair_time_buckets_v8()?;
         self.backfill_observed_llm_latency()?;
 
         self.conn.execute(
@@ -993,6 +994,56 @@ impl Database {
                  WHERE started_day IS NULL OR started_month IS NULL;",
             )
             .context("backfill operation time buckets")?;
+        Ok(())
+    }
+
+    fn repair_time_buckets_v8(&self) -> Result<()> {
+        let previous_version = self
+            .conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'schema_version'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or_default();
+        if previous_version >= 8 {
+            return Ok(());
+        }
+
+        let tx = self.begin_batch()?;
+        self.conn.execute_batch(
+            "UPDATE runs
+             SET started_day = date(started_at_ns / 1000000000, 'unixepoch', 'localtime'),
+                 started_month = strftime('%Y-%m', started_at_ns / 1000000000, 'unixepoch', 'localtime')
+             WHERE COALESCE(started_day, '') != date(started_at_ns / 1000000000, 'unixepoch', 'localtime')
+                OR COALESCE(started_month, '') != strftime('%Y-%m', started_at_ns / 1000000000, 'unixepoch', 'localtime');
+
+             UPDATE turns
+             SET started_day = date(started_at_ns / 1000000000, 'unixepoch', 'localtime'),
+                 started_month = strftime('%Y-%m', started_at_ns / 1000000000, 'unixepoch', 'localtime')
+             WHERE COALESCE(started_day, '') != date(started_at_ns / 1000000000, 'unixepoch', 'localtime')
+                OR COALESCE(started_month, '') != strftime('%Y-%m', started_at_ns / 1000000000, 'unixepoch', 'localtime');
+
+             UPDATE llm_calls
+             SET started_day = date(started_at_ns / 1000000000, 'unixepoch', 'localtime'),
+                 started_month = strftime('%Y-%m', started_at_ns / 1000000000, 'unixepoch', 'localtime')
+             WHERE COALESCE(started_day, '') != date(started_at_ns / 1000000000, 'unixepoch', 'localtime')
+                OR COALESCE(started_month, '') != strftime('%Y-%m', started_at_ns / 1000000000, 'unixepoch', 'localtime');
+
+             UPDATE tool_calls
+             SET started_day = date(started_at_ns / 1000000000, 'unixepoch', 'localtime'),
+                 started_month = strftime('%Y-%m', started_at_ns / 1000000000, 'unixepoch', 'localtime')
+             WHERE COALESCE(started_day, '') != date(started_at_ns / 1000000000, 'unixepoch', 'localtime')
+                OR COALESCE(started_month, '') != strftime('%Y-%m', started_at_ns / 1000000000, 'unixepoch', 'localtime');
+
+             DELETE FROM usage_source_rollups;
+             DELETE FROM usage_model_rollups;
+             DELETE FROM usage_tool_rollups;
+             DELETE FROM usage_tool_model_rollups;",
+        )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -2355,6 +2406,68 @@ mod tests {
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )?;
         assert_eq!(repaired, (15, 15, 15));
+        let rollups: i64 =
+            db.connection()
+                .query_row("SELECT COUNT(*) FROM usage_source_rollups", [], |row| {
+                    row.get(0)
+                })?;
+        assert_eq!(rollups, 0);
+
+        let _ = fs::remove_file(db_path);
+        Ok(())
+    }
+
+    #[test]
+    fn migrate_v8_repairs_operation_dates_and_clears_rollups() -> Result<()> {
+        let db_path = std::env::temp_dir().join(format!(
+            "shirabe-operation-date-migration-{}.sqlite",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&db_path);
+        let db = Database::open(&db_path)?;
+        db.migrate()?;
+        db.connection().execute_batch(
+            "INSERT INTO runs (
+                run_id, profile_id, device_id, source, kind, status, started_at_ns,
+                started_day, started_month
+             ) VALUES (
+                'codex:run', 'profile', 'device', 'codex', 'codex_turn', 'success', 1,
+                '2099-12-31', '2099-12'
+             );
+             INSERT INTO llm_calls (
+                llm_call_id, profile_id, device_id, run_id, source, status, started_at_ns,
+                started_day, started_month
+             ) VALUES (
+                'codex:llm', 'profile', 'device', 'codex:run', 'codex', 'success', 1,
+                '2099-12-31', '2099-12'
+             );
+             INSERT INTO tool_calls (
+                tool_call_id, profile_id, device_id, run_id, source, tool_name, status,
+                started_at_ns, started_day, started_month
+             ) VALUES (
+                'codex:tool', 'profile', 'device', 'codex:run', 'codex', 'exec', 'success',
+                1, '2099-12-31', '2099-12'
+             );
+             INSERT INTO usage_source_rollups (
+                bucket, bucket_key, profile_id, device_id, source, updated_at_ns
+             ) VALUES ('day', '2099-12-31', 'profile', 'device', 'codex', 1);
+             UPDATE meta SET value = '7' WHERE key = 'schema_version';",
+        )?;
+
+        db.migrate()?;
+
+        for table in ["runs", "llm_calls", "tool_calls"] {
+            let mismatches: i64 = db.connection().query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM {table}
+                     WHERE started_day != date(started_at_ns / 1000000000, 'unixepoch', 'localtime')
+                        OR started_month != strftime('%Y-%m', started_at_ns / 1000000000, 'unixepoch', 'localtime')"
+                ),
+                [],
+                |row| row.get(0),
+            )?;
+            assert_eq!(mismatches, 0, "{table} date fields were not repaired");
+        }
         let rollups: i64 =
             db.connection()
                 .query_row("SELECT COUNT(*) FROM usage_source_rollups", [], |row| {

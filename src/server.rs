@@ -1422,40 +1422,43 @@ fn load_overview(db_path: &PathBuf) -> Result<OverviewResponse> {
 }
 
 fn load_usage(db_path: &PathBuf, filters: UsageFilters) -> Result<UsageResponse> {
-    let conn =
+    let mut conn =
         Connection::open(db_path).with_context(|| format!("open sqlite {}", db_path.display()))?;
-    let totals = load_usage_totals(&conn, &filters)?;
+    let tx = conn.transaction()?;
+    let totals = load_usage_totals(&tx, &filters)?;
     let buckets = if filters.preset == "today" {
-        load_today_hourly_usage_buckets(&conn, &filters)?
+        load_today_hourly_usage_buckets(&tx, &filters)?
     } else {
-        compact_usage_buckets(load_usage_buckets(&conn, &filters)?)
+        compact_usage_buckets(load_usage_buckets(&tx, &filters)?)
     };
     let summary = UsageSummary::from_totals(&totals);
-    let latency_observations = load_latency_observations(&conn, &filters)?;
+    let latency_observations = load_latency_observations(&tx, &filters)?;
     let latency = latency_summary_from_observations(&latency_observations);
-    let latency_panel = latency_panel_from_observations(&conn, &filters, &latency_observations)?;
+    let latency_panel = latency_panel_from_observations(&tx, &filters, &latency_observations)?;
     let latency_buckets = latency_buckets_from_observations(&filters, &latency_observations);
 
-    Ok(UsageResponse {
+    let response = UsageResponse {
         status: "ok",
         filters: filters.clone(),
         usage_grain: filters.usage_grain().to_string(),
-        profile_options: load_profile_options(&conn, filters.profile_id.as_deref())?,
-        source_options: load_source_options(&conn)?,
-        model_options: load_model_options(&conn)?,
+        profile_options: load_profile_options(&tx, filters.profile_id.as_deref())?,
+        source_options: load_source_options(&tx)?,
+        model_options: load_model_options(&tx)?,
         summary,
         latency,
         latency_panel,
         latency_buckets,
         buckets,
-        source_usage: load_source_usage_scoped(&conn, &filters)?,
-        recent_sessions: load_recent_sessions_scoped(&conn, &filters)?,
-        recent_runs: load_recent_runs_scoped(&conn, &filters)?,
-        tool_summaries: load_tool_summaries_scoped(&conn, &filters)?,
-        tool_failures: load_tool_failures_scoped(&conn, &filters)?,
-        skill_summaries: load_skill_summaries_scoped(&conn, &filters)?,
-        model_summaries: load_model_summaries_scoped(&conn, &filters)?,
-    })
+        source_usage: load_source_usage_scoped(&tx, &filters)?,
+        recent_sessions: load_recent_sessions_scoped(&tx, &filters)?,
+        recent_runs: load_recent_runs_scoped(&tx, &filters)?,
+        tool_summaries: load_tool_summaries_scoped(&tx, &filters)?,
+        tool_failures: load_tool_failures_scoped(&tx, &filters)?,
+        skill_summaries: load_skill_summaries_scoped(&tx, &filters)?,
+        model_summaries: load_model_summaries_scoped(&tx, &filters)?,
+    };
+    tx.commit()?;
+    Ok(response)
 }
 
 fn load_menubar(
@@ -1464,20 +1467,21 @@ fn load_menubar(
     sync: SyncStatus,
     identity: &Identity,
 ) -> Result<MenubarResponse> {
-    let conn =
+    let mut conn =
         Connection::open(db_path).with_context(|| format!("open sqlite {}", db_path.display()))?;
+    let tx = conn.transaction()?;
     let range = normalize_menubar_range(query.range.as_deref());
     let selected_profile_id =
         normalize_filter_value(query.profile_id).or_else(|| Some(identity.profile_id.clone()));
     let filters = menubar_filters(range, selected_profile_id);
-    let summary = UsageSummary::from_totals(&load_usage_totals(&conn, &filters)?);
-    let latency_observations = load_latency_observations(&conn, &filters)?;
+    let summary = UsageSummary::from_totals(&load_usage_totals(&tx, &filters)?);
+    let latency_observations = load_latency_observations(&tx, &filters)?;
     let latency = latency_summary_from_observations(&latency_observations);
-    let latency_panel = latency_panel_from_observations(&conn, &filters, &latency_observations)?;
-    let mut recent_runs = load_recent_runs_scoped(&conn, &filters)?;
+    let latency_panel = latency_panel_from_observations(&tx, &filters, &latency_observations)?;
+    let mut recent_runs = load_recent_runs_scoped(&tx, &filters)?;
     recent_runs.truncate(6);
     let latest_run = if recent_runs.is_empty() {
-        load_recent_runs_scoped(&conn, &UsageFilters::all())?
+        load_recent_runs_scoped(&tx, &UsageFilters::all())?
             .into_iter()
             .next()
     } else {
@@ -1486,12 +1490,12 @@ fn load_menubar(
 
     let last_updated_at_ns = sync
         .finished_at_ns
-        .or_else(|| latest_import_scan_ns(&conn).ok().flatten());
+        .or_else(|| latest_import_scan_ns(&tx).ok().flatten());
 
-    Ok(MenubarResponse {
+    let response = MenubarResponse {
         status: "ok",
         range: range.to_string(),
-        profile_options: load_profile_options(&conn, filters.profile_id.as_deref())?,
+        profile_options: load_profile_options(&tx, filters.profile_id.as_deref())?,
         current_profile_id: filters
             .profile_id
             .clone()
@@ -1500,16 +1504,18 @@ fn load_menubar(
         latency,
         latency_panel,
         trend: if range == "today" {
-            load_today_hourly_usage_buckets(&conn, &filters)?
+            load_today_hourly_usage_buckets(&tx, &filters)?
         } else {
-            load_usage_buckets(&conn, &filters)?
+            load_usage_buckets(&tx, &filters)?
         },
-        source_usage: load_source_usage_scoped(&conn, &filters)?,
+        source_usage: load_source_usage_scoped(&tx, &filters)?,
         recent_runs,
         latest_run,
         last_updated_at_ns,
         sync,
-    })
+    };
+    tx.commit()?;
+    Ok(response)
 }
 
 fn normalize_menubar_range(value: Option<&str>) -> &'static str {
@@ -1952,6 +1958,10 @@ fn load_totals(conn: &Connection) -> Result<OverviewTotals> {
 }
 
 fn load_usage_totals(conn: &Connection, filters: &UsageFilters) -> Result<OverviewTotals> {
+    if filters.preset == "today" {
+        return load_usage_totals_raw(conn, filters);
+    }
+
     let sessions = if filters.model.is_some() {
         count_sql(
             conn,
@@ -2089,6 +2099,117 @@ fn load_usage_totals(conn: &Connection, filters: &UsageFilters) -> Result<Overvi
         cache_read_tokens,
         cache_write_tokens,
         total_cost_usd,
+    })
+}
+
+fn load_usage_totals_raw(conn: &Connection, filters: &UsageFilters) -> Result<OverviewTotals> {
+    let sessions = if filters.model.is_some() {
+        count_sql(
+            conn,
+            &format!(
+                "SELECT COUNT(DISTINCT l.session_id) FROM llm_calls l WHERE {}",
+                filters.llm_where("l")
+            ),
+        )?
+    } else {
+        count_sql(
+            conn,
+            &format!(
+                "SELECT COUNT(DISTINCT r.session_id) FROM runs r WHERE {}",
+                filters.run_where("r")
+            ),
+        )?
+    };
+    let runs = if filters.model.is_some() {
+        count_sql(
+            conn,
+            &format!(
+                "SELECT COUNT(DISTINCT l.run_id) FROM llm_calls l WHERE {}",
+                filters.llm_where("l")
+            ),
+        )?
+    } else {
+        count_sql(
+            conn,
+            &format!(
+                "SELECT COUNT(*) FROM runs r WHERE {}",
+                filters.run_where("r")
+            ),
+        )?
+    };
+    let turns = if filters.model.is_some() {
+        count_sql(
+            conn,
+            &format!(
+                "SELECT COUNT(DISTINCT l.turn_id) FROM llm_calls l WHERE {}",
+                filters.llm_where("l")
+            ),
+        )?
+    } else {
+        count_sql(
+            conn,
+            &format!(
+                "SELECT COUNT(*) FROM turns t WHERE {}",
+                filters.turn_where("t")
+            ),
+        )?
+    };
+
+    let llm_sql = format!(
+        "SELECT
+            COUNT(*),
+            COALESCE(SUM(l.input_tokens), 0),
+            COALESCE(SUM(l.output_tokens), 0),
+            COALESCE(SUM(l.cache_read_tokens), 0),
+            COALESCE(SUM(l.cache_write_tokens), 0),
+            COALESCE(SUM({LLM_COST_SQL}), 0)
+         FROM llm_calls l
+         LEFT JOIN model_prices mp ON mp.model_name = l.model
+         WHERE {}",
+        filters.llm_where("l")
+    );
+    let llm = conn.query_row(&llm_sql, [], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, i64>(2)?,
+            row.get::<_, i64>(3)?,
+            row.get::<_, i64>(4)?,
+            row.get::<_, f64>(5)?,
+        ))
+    })?;
+
+    let tool_sql = format!(
+        "SELECT
+            COUNT(*),
+            COALESCE(SUM(CASE WHEN tc.status = 'failed' THEN 1 ELSE 0 END), 0)
+         FROM tool_calls tc
+         WHERE {}",
+        filters.tool_where("tc")
+    );
+    let tools = conn.query_row(&tool_sql, [], |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+    })?;
+
+    Ok(OverviewTotals {
+        import_sources: 0,
+        import_files: 0,
+        imported_files: 0,
+        partial_files: 0,
+        failed_files: 0,
+        sessions,
+        runs,
+        turns,
+        run_steps: 0,
+        llm_calls: llm.0,
+        tool_calls: tools.0,
+        failed_tool_calls: tools.1,
+        signals: 0,
+        input_tokens: llm.1,
+        output_tokens: llm.2,
+        cache_read_tokens: llm.3,
+        cache_write_tokens: llm.4,
+        total_cost_usd: llm.5,
     })
 }
 
@@ -3023,6 +3144,10 @@ fn load_source_usage_scoped(
     conn: &Connection,
     filters: &UsageFilters,
 ) -> Result<Vec<SourceUsageSummary>> {
+    if filters.preset == "today" {
+        return load_source_usage_scoped_raw(conn, filters);
+    }
+
     let sql = if filters.model.is_some() {
         let model_where = filters.rollup_model_where("m");
         let tool_model_where = filters.rollup_model_where("tm");
@@ -3112,6 +3237,58 @@ fn load_source_usage_scoped(
     })?;
 
     collect_rows(rows)
+}
+
+fn load_source_usage_scoped_raw(
+    conn: &Connection,
+    filters: &UsageFilters,
+) -> Result<Vec<SourceUsageSummary>> {
+    let sql = format!(
+        "SELECT source FROM runs r WHERE {}
+         UNION SELECT source FROM turns t WHERE {}
+         UNION SELECT source FROM llm_calls l WHERE {}
+         UNION SELECT source FROM tool_calls tc WHERE {}",
+        filters.run_where("r"),
+        filters.turn_where("t"),
+        filters.llm_where("l"),
+        filters.tool_where("tc")
+    );
+    let mut statement = conn.prepare(&sql)?;
+    let sources = collect_rows(statement.query_map([], |row| row.get::<_, String>(0))?)?;
+    let mut summaries = Vec::with_capacity(sources.len());
+    for source in sources {
+        let mut source_filters = filters.clone();
+        source_filters.source = Some(source.clone());
+        let totals = load_usage_totals_raw(conn, &source_filters)?;
+        summaries.push(SourceUsageSummary {
+            source,
+            sessions: totals.sessions,
+            runs: totals.runs,
+            turns: totals.turns,
+            llm_calls: totals.llm_calls,
+            tool_calls: totals.tool_calls,
+            failed_tool_calls: totals.failed_tool_calls,
+            input_tokens: totals.input_tokens,
+            output_tokens: totals.output_tokens,
+            cache_read_tokens: totals.cache_read_tokens,
+            cache_write_tokens: totals.cache_write_tokens,
+            total_cost_usd: totals.total_cost_usd,
+        });
+    }
+    summaries.sort_by(|left, right| {
+        let left_tokens = left
+            .input_tokens
+            .saturating_add(left.output_tokens)
+            .saturating_add(left.cache_read_tokens);
+        let right_tokens = right
+            .input_tokens
+            .saturating_add(right.output_tokens)
+            .saturating_add(right.cache_read_tokens);
+        right_tokens
+            .cmp(&left_tokens)
+            .then_with(|| left.source.cmp(&right.source))
+    });
+    Ok(summaries)
 }
 
 fn load_recent_sessions(conn: &Connection) -> Result<Vec<SessionSummary>> {
@@ -3789,6 +3966,40 @@ fn load_model_summaries_scoped(
     conn: &Connection,
     filters: &UsageFilters,
 ) -> Result<Vec<ModelSummary>> {
+    if filters.preset == "today" {
+        let sql = format!(
+            "SELECT
+                COALESCE(NULLIF(l.model, ''), 'unknown') AS model,
+                COUNT(*) AS calls,
+                COALESCE(SUM(l.input_tokens), 0) AS input_tokens,
+                COALESCE(SUM(l.output_tokens), 0) AS output_tokens,
+                COALESCE(SUM(l.cache_read_tokens), 0) AS cache_read_tokens,
+                COALESCE(SUM({LLM_COST_SQL}), 0) AS total_cost_usd
+             FROM llm_calls l
+             LEFT JOIN model_prices mp ON mp.model_name = l.model
+             WHERE {}
+             GROUP BY COALESCE(NULLIF(l.model, ''), 'unknown')
+             ORDER BY total_cost_usd DESC,
+                      input_tokens + output_tokens DESC,
+                      calls DESC,
+                      model
+             LIMIT 20",
+            filters.llm_where("l")
+        );
+        let mut statement = conn.prepare(&sql)?;
+        let rows = statement.query_map([], |row| {
+            Ok(ModelSummary {
+                model: row.get(0)?,
+                calls: row.get(1)?,
+                input_tokens: row.get(2)?,
+                output_tokens: row.get(3)?,
+                cache_read_tokens: row.get(4)?,
+                total_cost_usd: row.get(5)?,
+            })
+        })?;
+        return collect_rows(rows);
+    }
+
     let model_where = filters.rollup_model_where("m");
     let sql = format!(
         "SELECT
@@ -4972,7 +5183,7 @@ mod tests {
     }
 
     #[test]
-    fn today_usage_attributes_cross_midnight_run_tokens_to_each_call_day() -> Result<()> {
+    fn today_usage_reads_raw_cross_midnight_calls_before_rollup_refresh() -> Result<()> {
         let db_path = temp_db_path("usage-cross-midnight");
         let db = Database::open(&db_path)?;
         db.migrate()?;
@@ -5007,7 +5218,6 @@ mod tests {
         let projector = Projector::new(&db);
         projector.project(&before_midnight)?;
         projector.project(&after_midnight)?;
-        rollup::refresh_all(&db)?;
 
         let usage = load_usage(
             &db_path,
@@ -5031,6 +5241,10 @@ mod tests {
 
         assert_eq!(usage.summary.total_tokens, 220);
         assert_eq!(bucket_tokens, usage.summary.total_tokens);
+        assert_eq!(usage.source_usage.len(), 1);
+        assert_eq!(usage.source_usage[0].input_tokens, 200);
+        assert_eq!(usage.model_summaries.len(), 1);
+        assert_eq!(usage.model_summaries[0].input_tokens, 200);
 
         let _ = fs::remove_file(db_path);
         Ok(())
@@ -5280,7 +5494,6 @@ mod tests {
         let projector = Projector::new(&db);
         projector.project(&profile_a)?;
         projector.project(&profile_b)?;
-        rollup::refresh_all(&db)?;
 
         let menubar = load_menubar(
             &db_path,
