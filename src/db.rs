@@ -39,6 +39,10 @@ pub(crate) struct AmpVirtualImportState {
     pub status: String,
     pub message_count: usize,
     pub updated_at_ns: i64,
+    #[serde(default)]
+    pub listed_updated_at_ns: Option<i64>,
+    #[serde(default)]
+    pub last_verified_at_ns: i64,
     pub payload_fingerprint: Option<String>,
     pub event_count: usize,
 }

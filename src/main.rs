@@ -64,8 +64,11 @@ async fn main() -> Result<()> {
             )
             .await?;
         }
-        Commands::Import { source, path } => {
+        Commands::Import { source, path, full } => {
             ensure_not_shared_workspace_direct_write(&paths, "import")?;
+            if full && (!matches!(source, ImportSource::Amp) || path.is_some()) {
+                bail!("--full is only supported for CLI-based Amp imports")
+            }
             let (database, _adopted_legacy_profile) = open_registered_database(&paths)?;
             let import_identity = importers::ImportIdentity::new(
                 paths.identity.profile_id.clone(),
@@ -78,12 +81,20 @@ async fn main() -> Result<()> {
                     &paths.source_paths.amp,
                     &import_identity,
                     &paths.source_settings,
-                    |database, fallback_roots, identity| {
-                        importers::amp::sync_cli_first_with_identity(
-                            database,
-                            fallback_roots,
-                            identity,
-                        )
+                    move |database, fallback_roots, identity| {
+                        if full {
+                            importers::amp::sync_cli_first_full_with_identity(
+                                database,
+                                fallback_roots,
+                                identity,
+                            )
+                        } else {
+                            importers::amp::sync_cli_first_with_identity(
+                                database,
+                                fallback_roots,
+                                identity,
+                            )
+                        }
                     },
                 )?,
                 ImportSource::Codex => importers::codex::import_with_identity(

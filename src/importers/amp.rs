@@ -35,6 +35,7 @@ const SOURCE_KIND: &str = "amp_local_thread_json";
 const MAX_THREAD_JSON_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_LIST_BYTES: usize = 8 * 1024 * 1024;
 const RECENT_NS: i64 = 15 * 60 * 1_000_000_000;
+const FULL_RECHECK_NS: i64 = 24 * 60 * 60 * 1_000_000_000;
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub(crate) struct AmpCollectorState {
@@ -46,6 +47,10 @@ pub(crate) struct AmpCollectorState {
 pub(crate) struct AmpCollectorThreadState {
     pub message_count: usize,
     pub updated_at_ns: i64,
+    #[serde(default)]
+    pub listed_updated_at_ns: Option<i64>,
+    #[serde(default)]
+    pub last_verified_at_ns: i64,
     pub fingerprint: Option<String>,
     pub event_count: usize,
     pub status: String,
@@ -55,6 +60,7 @@ pub(crate) struct AmpCollectorThreadState {
 pub(crate) struct CliThread {
     pub id: String,
     pub message_count: usize,
+    pub updated_at_ns: Option<i64>,
 }
 struct CliPage {
     threads: Vec<CliThread>,
@@ -62,7 +68,37 @@ struct CliPage {
 }
 
 fn parse_cli_thread_page(bytes: &[u8]) -> Result<CliPage> {
-    let text = std::str::from_utf8(bytes).context("Amp list output is not UTF-8")?;
+    let cleaned = strip_terminal_sequences(bytes);
+    let text = std::str::from_utf8(&cleaned).context("Amp list output is not UTF-8")?;
+    let trimmed = text.trim();
+    if trimmed.starts_with('[') {
+        #[derive(Deserialize)]
+        struct JsonThread {
+            id: String,
+            #[serde(rename = "messageCount")]
+            message_count: usize,
+            updated: String,
+        }
+        let rows: Vec<JsonThread> =
+            serde_json::from_str(trimmed).context("invalid Amp JSON thread listing")?;
+        let mut threads = Vec::with_capacity(rows.len());
+        for row in rows {
+            if !valid_thread_id(&row.id) {
+                bail!("malformed Amp JSON thread listing row")
+            }
+            let updated_at_ns = parse_rfc3339_ns(&row.updated)
+                .context("invalid Amp JSON thread updated timestamp")?;
+            threads.push(CliThread {
+                id: row.id,
+                message_count: row.message_count,
+                updated_at_ns: Some(updated_at_ns),
+            });
+        }
+        return Ok(CliPage {
+            candidate_rows: threads.len(),
+            threads,
+        });
+    }
     let lines: Vec<_> = text.lines().collect();
     let header = lines.iter().position(|line| {
         line.split_whitespace().collect::<Vec<_>>()
@@ -108,12 +144,34 @@ fn parse_cli_thread_page(bytes: &[u8]) -> Result<CliPage> {
         threads.push(CliThread {
             id: (*id).into(),
             message_count,
+            updated_at_ns: None,
         });
     }
     Ok(CliPage {
         candidate_rows: threads.len(),
         threads,
     })
+}
+
+fn strip_terminal_sequences(bytes: &[u8]) -> Vec<u8> {
+    let mut cleaned = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == 0x1b && bytes.get(index + 1) == Some(&b'[') {
+            index += 2;
+            while index < bytes.len() {
+                let byte = bytes[index];
+                index += 1;
+                if (0x40..=0x7e).contains(&byte) {
+                    break;
+                }
+            }
+        } else {
+            cleaned.push(bytes[index]);
+            index += 1;
+        }
+    }
+    cleaned
 }
 
 fn is_table_separator(line: &str) -> bool {
@@ -282,19 +340,36 @@ impl ProcessAmpRunner {
 }
 impl AmpCommandRunner for ProcessAmpRunner {
     fn list(&self, offset: usize) -> Result<Vec<u8>> {
+        let offset = offset.to_string();
         self.run_list(
             "list",
             &[
                 "threads",
                 "list",
                 "--include-archived",
+                "--json",
                 "--limit",
                 "100",
                 "--offset",
-                &offset.to_string(),
+                &offset,
             ],
             self.list_cap,
         )
+        .or_else(|_| {
+            self.run_list(
+                "list",
+                &[
+                    "threads",
+                    "list",
+                    "--include-archived",
+                    "--limit",
+                    "100",
+                    "--offset",
+                    &offset,
+                ],
+                self.list_cap,
+            )
+        })
     }
     fn export(&self, id: &str, identity: &ImportIdentity) -> Result<ParsedExport> {
         if !valid_thread_id(id) {
@@ -353,7 +428,15 @@ pub fn sync_cli_first_with_identity(
     fallback_roots: &[PathBuf],
     identity: &ImportIdentity,
 ) -> Result<ImportReport> {
-    sync_cli_first_recent_with_identity(db, fallback_roots, i64::MIN, identity)
+    sync_cli_first_recent_with_identity_and_force(db, fallback_roots, i64::MIN, identity, false)
+}
+
+pub fn sync_cli_first_full_with_identity(
+    db: &Database,
+    fallback_roots: &[PathBuf],
+    identity: &ImportIdentity,
+) -> Result<ImportReport> {
+    sync_cli_first_recent_with_identity_and_force(db, fallback_roots, i64::MIN, identity, true)
 }
 
 pub fn sync_cli_first_recent_with_identity(
@@ -361,6 +444,22 @@ pub fn sync_cli_first_recent_with_identity(
     fallback_roots: &[PathBuf],
     modified_since_ns: i64,
     identity: &ImportIdentity,
+) -> Result<ImportReport> {
+    sync_cli_first_recent_with_identity_and_force(
+        db,
+        fallback_roots,
+        modified_since_ns,
+        identity,
+        false,
+    )
+}
+
+fn sync_cli_first_recent_with_identity_and_force(
+    db: &Database,
+    fallback_roots: &[PathBuf],
+    modified_since_ns: i64,
+    identity: &ImportIdentity,
+    force_full: bool,
 ) -> Result<ImportReport> {
     let runner = resolve_amp_cli().map(|executable| ProcessAmpRunner {
         executable,
@@ -376,6 +475,7 @@ pub fn sync_cli_first_recent_with_identity(
         fallback_roots,
         modified_since_ns,
         identity,
+        force_full,
     )
 }
 
@@ -385,6 +485,7 @@ fn sync_cli_or_local_with_runner(
     fallback_roots: &[PathBuf],
     modified_since_ns: i64,
     identity: &ImportIdentity,
+    force_full: bool,
 ) -> Result<ImportReport> {
     let Some(runner) = runner else {
         let mut report =
@@ -402,7 +503,7 @@ fn sync_cli_or_local_with_runner(
             return Ok(report);
         }
     };
-    sync_discovered_threads(db, runner, identity, threads, started)
+    sync_discovered_threads(db, runner, identity, threads, started, force_full)
 }
 
 fn resolve_amp_cli() -> Option<PathBuf> {
@@ -433,7 +534,18 @@ fn sync_with_runner(
 ) -> Result<ImportReport> {
     let started = Instant::now();
     let threads = discover_cli_threads(runner)?;
-    sync_discovered_threads(db, runner, identity, threads, started)
+    sync_discovered_threads(db, runner, identity, threads, started, false)
+}
+
+#[cfg(test)]
+fn sync_with_runner_force(
+    db: &Database,
+    runner: &dyn AmpCommandRunner,
+    identity: &ImportIdentity,
+) -> Result<ImportReport> {
+    let started = Instant::now();
+    let threads = discover_cli_threads(runner)?;
+    sync_discovered_threads(db, runner, identity, threads, started, true)
 }
 
 fn discover_cli_threads(runner: &dyn AmpCommandRunner) -> Result<Vec<CliThread>> {
@@ -474,6 +586,7 @@ fn sync_discovered_threads(
     identity: &ImportIdentity,
     threads: Vec<CliThread>,
     started: Instant,
+    force_full: bool,
 ) -> Result<ImportReport> {
     let source_id = db.record_import_source_for_profile(
         "amp",
@@ -486,11 +599,19 @@ fn sync_discovered_threads(
     for thread in threads {
         stats.files_seen += 1;
         let prior = db.amp_virtual_state(&source_id, &thread.id)?;
-        let should_export = prior.as_ref().is_none_or(|state| {
-            state.message_count != thread.message_count
-                || !matches!(state.status.as_str(), "imported" | "partial")
-                || state.updated_at_ns >= now_ns().saturating_sub(RECENT_NS)
-        });
+        let current_ns = now_ns();
+        let should_export = force_full
+            || prior.as_ref().is_none_or(|state| {
+                thread_needs_export(
+                    state.message_count,
+                    state.listed_updated_at_ns,
+                    &state.status,
+                    state.updated_at_ns,
+                    state.last_verified_at_ns,
+                    &thread,
+                    current_ns,
+                )
+            });
         if !should_export {
             stats.files_skipped += 1;
             continue;
@@ -521,6 +642,8 @@ fn sync_discovered_threads(
             status: status.into(),
             message_count: thread.message_count,
             updated_at_ns: updated,
+            listed_updated_at_ns: thread.updated_at_ns,
+            last_verified_at_ns: now_ns(),
             payload_fingerprint: Some(digest),
             event_count,
         };
@@ -546,6 +669,24 @@ fn sync_discovered_threads(
     report.threads_exported = Some(threads_exported);
     report.unchanged_threads_skipped = Some(unchanged_threads_skipped);
     Ok(report)
+}
+
+fn thread_needs_export(
+    prior_message_count: usize,
+    prior_listed_updated_at_ns: Option<i64>,
+    prior_status: &str,
+    prior_payload_updated_at_ns: i64,
+    last_verified_at_ns: i64,
+    thread: &CliThread,
+    current_ns: i64,
+) -> bool {
+    prior_message_count != thread.message_count
+        || thread
+            .updated_at_ns
+            .is_some_and(|updated| prior_listed_updated_at_ns != Some(updated))
+        || !matches!(prior_status, "imported" | "partial")
+        || prior_payload_updated_at_ns >= current_ns.saturating_sub(RECENT_NS)
+        || last_verified_at_ns < current_ns.saturating_sub(FULL_RECHECK_NS)
 }
 
 #[derive(Debug)]
@@ -711,10 +852,17 @@ fn collect_cli_first_recent_with_runner(
     let mut stats = ScanStats::default();
     for thread in threads {
         stats.files_seen += 1;
+        let current_ns = now_ns();
         let should_export = state.threads.get(&thread.id).is_none_or(|prior| {
-            prior.message_count != thread.message_count
-                || !matches!(prior.status.as_str(), "imported" | "partial")
-                || prior.updated_at_ns >= now_ns().saturating_sub(RECENT_NS)
+            thread_needs_export(
+                prior.message_count,
+                prior.listed_updated_at_ns,
+                &prior.status,
+                prior.updated_at_ns,
+                prior.last_verified_at_ns,
+                &thread,
+                current_ns,
+            )
         });
         if !should_export {
             stats.files_skipped += 1;
@@ -741,6 +889,8 @@ fn collect_cli_first_recent_with_runner(
                     AmpCollectorThreadState {
                         message_count: thread.message_count,
                         updated_at_ns: exported.parsed.updated_at_ns,
+                        listed_updated_at_ns: thread.updated_at_ns,
+                        last_verified_at_ns: now_ns(),
                         fingerprint: Some(exported.fingerprint),
                         event_count,
                         status: if warnings == 0 { "imported" } else { "partial" }.into(),
@@ -1765,7 +1915,8 @@ mod tests {
             page.threads[0],
             CliThread {
                 id: "T-one".into(),
-                message_count: 7
+                message_count: 7,
+                updated_at_ns: None,
             }
         );
         assert_eq!(page.threads[1].id, "T-two");
@@ -1775,6 +1926,64 @@ mod tests {
     fn cli_table_parser_rejects_a_malformed_candidate() {
         let table = b"Title Last Updated Visibility Messages Thread ID\n----- ---- ------- ---------- -------- ------ --\ngood yesterday private 2 T-good\nbad yesterday private nope T-bad\n";
         assert!(parse_cli_thread_page(table).is_err());
+    }
+
+    #[test]
+    fn cli_json_parser_reads_updated_time_and_terminal_sequences() {
+        let json = b"\x1b[=0u\x1b[?25h[\n  {\"id\":\"T-json\",\"messageCount\":3,\"updated\":\"2026-08-08T05:31:47.252Z\"}\n]\x1b[0m";
+        let page = parse_cli_thread_page(json).unwrap();
+        assert_eq!(page.candidate_rows, 1);
+        assert_eq!(page.threads[0].id, "T-json");
+        assert_eq!(page.threads[0].message_count, 3);
+        assert_eq!(
+            page.threads[0].updated_at_ns,
+            parse_rfc3339_ns("2026-08-08T05:31:47.252Z")
+        );
+    }
+
+    #[test]
+    fn incremental_selection_uses_list_update_and_daily_recheck() {
+        let current_ns = 2_000_000_000_000_000_000;
+        let listed = current_ns - 2 * FULL_RECHECK_NS;
+        let thread = CliThread {
+            id: "T-state".into(),
+            message_count: 3,
+            updated_at_ns: Some(listed),
+        };
+        let old_payload = current_ns - RECENT_NS - 1;
+
+        assert!(!thread_needs_export(
+            3,
+            Some(listed),
+            "imported",
+            old_payload,
+            current_ns,
+            &thread,
+            current_ns,
+        ));
+
+        let changed = CliThread {
+            updated_at_ns: Some(listed + 1),
+            ..thread.clone()
+        };
+        assert!(thread_needs_export(
+            3,
+            Some(listed),
+            "imported",
+            old_payload,
+            current_ns,
+            &changed,
+            current_ns,
+        ));
+        assert!(thread_needs_export(
+            3,
+            Some(listed),
+            "imported",
+            old_payload,
+            current_ns - FULL_RECHECK_NS - 1,
+            &thread,
+            current_ns,
+        ));
     }
 
     #[test]
@@ -1889,6 +2098,8 @@ mod tests {
             AmpCollectorThreadState {
                 message_count: 1,
                 updated_at_ns: 123,
+                listed_updated_at_ns: None,
+                last_verified_at_ns: 123,
                 fingerprint: Some("old-fingerprint".into()),
                 event_count: 4,
                 status: "imported".into(),
@@ -2081,6 +2292,29 @@ mod tests {
     }
 
     #[test]
+    fn forced_cli_sync_reexports_an_unchanged_stale_thread() -> Result<()> {
+        let root = temp_dir("amp-cli-full");
+        fs::create_dir_all(&root)?;
+        let db = test_db(&root)?;
+        let runner = MutableRunner {
+            message_count: Mutex::new(1),
+            payload: br#"{"id":"T-state","updatedAt":"2020-01-01T00:00:00Z","messages":[]}"#
+                .to_vec(),
+            exports: Mutex::new(0),
+            fail: Mutex::new(false),
+        };
+        let identity = ImportIdentity::new("p", "d");
+        sync_with_runner(&db, &runner, &identity)?;
+        sync_with_runner(&db, &runner, &identity)?;
+        assert_eq!(*runner.exports.lock().unwrap(), 1);
+        sync_with_runner_force(&db, &runner, &identity)?;
+        assert_eq!(*runner.exports.lock().unwrap(), 2);
+        drop(db);
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
     fn failed_cli_retry_preserves_successful_fingerprint_updated_at_and_event_count() -> Result<()>
     {
         let root = temp_dir("amp-cli-preserve");
@@ -2201,6 +2435,7 @@ mod tests {
             &roots,
             i64::MIN,
             &ImportIdentity::new("p", "d"),
+            false,
         )?;
         assert_eq!((report.files_imported, report.events_projected), (2, 2));
         assert_eq!(*runner.exports.lock().unwrap(), 0);
@@ -2237,6 +2472,7 @@ mod tests {
             &[fallback],
             i64::MIN,
             &ImportIdentity::new("p", "d"),
+            false,
         );
 
         assert!(result.is_err());

@@ -1426,6 +1426,8 @@ mod tests {
                     crate::importers::amp::AmpCollectorThreadState {
                         message_count: 1,
                         updated_at_ns: 2,
+                        listed_updated_at_ns: None,
+                        last_verified_at_ns: 2,
                         fingerprint: Some("new".into()),
                         event_count: 1,
                         status: "imported".into(),
@@ -1453,6 +1455,8 @@ mod tests {
                     crate::importers::amp::AmpCollectorThreadState {
                         message_count: 1,
                         updated_at_ns: 2,
+                        listed_updated_at_ns: None,
+                        last_verified_at_ns: 2,
                         fingerprint: Some("new".into()),
                         event_count: 1,
                         status: "imported".into(),
@@ -1495,6 +1499,8 @@ mod tests {
                     crate::importers::amp::AmpCollectorThreadState {
                         message_count: 1,
                         updated_at_ns: 2,
+                        listed_updated_at_ns: None,
+                        last_verified_at_ns: 2,
                         fingerprint: Some("once".into()),
                         event_count: 1,
                         status: "imported".into(),

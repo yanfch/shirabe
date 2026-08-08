@@ -42,6 +42,10 @@ pub enum Commands {
         /// Source path. Defaults depend on the importer.
         #[arg(long)]
         path: Option<PathBuf>,
+
+        /// Re-export every Amp thread instead of using incremental state.
+        #[arg(long)]
+        full: bool,
     },
 
     /// Collect current-account events into a shared workspace inbox.
