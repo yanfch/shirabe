@@ -317,8 +317,8 @@ impl ProcessAmpRunner {
                 let output = match captured {
                     Some(output) => output,
                     None => rx
-                        .recv_timeout(Duration::from_secs(1))
-                        .map_err(|_| anyhow::anyhow!("Amp {kind} output unavailable"))??,
+                        .recv_timeout(self.deadline.saturating_sub(started.elapsed()))
+                        .map_err(|_| anyhow::anyhow!("Amp {kind} command timed out"))??,
                 };
                 if output.len() > cap {
                     bail!("Amp {kind} output limit exceeded")
@@ -404,8 +404,8 @@ impl AmpCommandRunner for ProcessAmpRunner {
                 let result = match parsed {
                     Some(result) => result,
                     None => rx
-                        .recv_timeout(Duration::from_secs(1))
-                        .map_err(|_| anyhow::anyhow!("Amp export output unavailable for {id}"))?,
+                        .recv_timeout(self.deadline.saturating_sub(started.elapsed()))
+                        .map_err(|_| anyhow::anyhow!("Amp export command timed out for {id}"))?,
                 };
                 if !status.success() {
                     bail!("Amp export command failed for {id}")
