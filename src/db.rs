@@ -17,6 +17,7 @@ use crate::{config::Identity, projection::ids};
 pub const SCHEMA_VERSION: i64 = 8;
 const IMPORT_PARSER_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "+import-v4");
 const PI_LLM_EVENT_ID_MIGRATION: &str = "pi_llm_event_ids_v2";
+const CODEX_ROLLOUT_EVENT_ID_MIGRATION: &str = "codex_rollout_event_ids_v1";
 
 pub struct Database {
     path: PathBuf,
@@ -224,6 +225,152 @@ impl Database {
         )?;
 
         Ok(())
+    }
+
+    /// Starts the one-time rebuild required after Codex rollout token events gained stable IDs.
+    ///
+    /// A continued Codex rollout repeats its parent's history with a new file-local line number.
+    /// Those old IDs cannot be repaired safely in place, so remove only this profile/device's
+    /// Codex projection and make the next import scan every session file again.
+    pub(crate) fn begin_codex_rollout_rebuild(
+        &self,
+        profile_id: &str,
+        device_id: &str,
+    ) -> Result<bool> {
+        let migration_key = format!("{CODEX_ROLLOUT_EVENT_ID_MIGRATION}:{profile_id}:{device_id}");
+        let state = self
+            .conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = ?1",
+                [&migration_key],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if state.as_deref() == Some("complete") {
+            return Ok(false);
+        }
+        if state.as_deref() == Some("rebuilding") {
+            return Ok(true);
+        }
+
+        let tx = self.begin_batch()?;
+        self.conn.execute(
+            "DELETE FROM skill_events
+             WHERE profile_id = ?1 AND device_id = ?2 AND source = 'codex'",
+            params![profile_id, device_id],
+        )?;
+        self.conn.execute(
+            "DELETE FROM run_signals
+             WHERE profile_id = ?1 AND device_id = ?2 AND source = 'codex'",
+            params![profile_id, device_id],
+        )?;
+        self.conn.execute(
+            "DELETE FROM tool_calls
+             WHERE profile_id = ?1 AND device_id = ?2 AND source = 'codex'",
+            params![profile_id, device_id],
+        )?;
+        self.conn.execute(
+            "DELETE FROM run_steps
+             WHERE profile_id = ?1 AND device_id = ?2 AND source = 'codex'",
+            params![profile_id, device_id],
+        )?;
+        self.conn.execute(
+            "DELETE FROM llm_calls
+             WHERE profile_id = ?1 AND device_id = ?2 AND source = 'codex'",
+            params![profile_id, device_id],
+        )?;
+        self.conn.execute(
+            "DELETE FROM turns
+             WHERE profile_id = ?1 AND device_id = ?2 AND source = 'codex'",
+            params![profile_id, device_id],
+        )?;
+        self.conn.execute(
+            "DELETE FROM runs
+             WHERE profile_id = ?1 AND device_id = ?2 AND source = 'codex'",
+            params![profile_id, device_id],
+        )?;
+        self.conn.execute(
+            "DELETE FROM sessions
+             WHERE profile_id = ?1 AND device_id = ?2 AND source = 'codex'",
+            params![profile_id, device_id],
+        )?;
+        self.conn.execute(
+            "DELETE FROM event_identities
+             WHERE profile_id = ?1 AND device_id = ?2 AND source = 'codex'",
+            params![profile_id, device_id],
+        )?;
+        self.conn.execute(
+            "UPDATE import_files
+             SET status = 'pending', parser_version = NULL, last_offset = NULL,
+                 event_count = 0, warning_count = 0, first_event_ns = NULL,
+                 last_event_ns = NULL, metadata_json = NULL
+             WHERE profile_id = ?1 AND device_id = ?2
+               AND source_id IN (
+                   SELECT source_id FROM import_sources
+                   WHERE profile_id = ?1 AND device_id = ?2 AND source = 'codex'
+               )",
+            params![profile_id, device_id],
+        )?;
+        for table in [
+            "usage_source_rollups",
+            "usage_model_rollups",
+            "usage_tool_rollups",
+            "usage_tool_model_rollups",
+        ] {
+            self.conn.execute(
+                &format!(
+                    "DELETE FROM {table}
+                     WHERE profile_id = ?1 AND device_id = ?2 AND source = 'codex'"
+                ),
+                params![profile_id, device_id],
+            )?;
+        }
+        self.conn.execute(
+            "INSERT INTO meta (key, value, updated_at_ns)
+             VALUES (?1, 'rebuilding', ?2)
+             ON CONFLICT(key) DO UPDATE SET
+                value = excluded.value,
+                updated_at_ns = excluded.updated_at_ns",
+            params![migration_key, now_ns()],
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    pub(crate) fn finish_codex_rollout_rebuild(
+        &self,
+        profile_id: &str,
+        device_id: &str,
+    ) -> Result<()> {
+        let migration_key = format!("{CODEX_ROLLOUT_EVENT_ID_MIGRATION}:{profile_id}:{device_id}");
+        self.conn.execute(
+            "INSERT INTO meta (key, value, updated_at_ns)
+             VALUES (?1, 'complete', ?2)
+             ON CONFLICT(key) DO UPDATE SET
+                value = excluded.value,
+                updated_at_ns = excluded.updated_at_ns",
+            params![migration_key, now_ns()],
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn projected_llm_event_started_at_ns(
+        &self,
+        profile_id: &str,
+        source: &str,
+        source_event_id: &str,
+    ) -> Result<Option<i64>> {
+        let llm_call_id =
+            ids::event_scoped_id(profile_id, source, "llm", Some(source_event_id), "");
+        self.conn
+            .query_row(
+                "SELECT started_at_ns FROM llm_calls
+                 WHERE profile_id = ?1 AND source = ?2 AND llm_call_id = ?3",
+                params![profile_id, source, llm_call_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
     }
 
     pub fn register_identity(&self, identity: &Identity) -> Result<()> {
