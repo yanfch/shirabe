@@ -17,7 +17,7 @@ use crate::{config::Identity, projection::ids};
 pub const SCHEMA_VERSION: i64 = 8;
 const IMPORT_PARSER_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "+import-v4");
 const PI_LLM_EVENT_ID_MIGRATION: &str = "pi_llm_event_ids_v2";
-const CODEX_ROLLOUT_EVENT_ID_MIGRATION: &str = "codex_rollout_event_ids_v1";
+const CODEX_ROLLOUT_EVENT_ID_MIGRATION: &str = "codex_legacy_subagent_projection_v1";
 
 pub struct Database {
     path: PathBuf,
@@ -227,10 +227,9 @@ impl Database {
         Ok(())
     }
 
-    /// Starts the one-time rebuild required after Codex rollout token events gained stable IDs.
+    /// Starts the one-time rebuild required after Codex rollout projection rules change.
     ///
-    /// A continued Codex rollout repeats its parent's history with a new file-local line number.
-    /// Those old IDs cannot be repaired safely in place, so remove only this profile/device's
+    /// Existing rows cannot be repaired safely in place, so remove only this profile/device's
     /// Codex projection and make the next import scan every session file again.
     pub(crate) fn begin_codex_rollout_rebuild(
         &self,
@@ -251,6 +250,10 @@ impl Database {
         }
         if state.as_deref() == Some("rebuilding") {
             return Ok(true);
+        }
+
+        if self.has_codex_projection(profile_id, device_id)? {
+            self.backup_catalog_for_codex_rebuild(&migration_key)?;
         }
 
         let tx = self.begin_batch()?;
@@ -335,6 +338,42 @@ impl Database {
         )?;
         tx.commit()?;
         Ok(true)
+    }
+
+    fn has_codex_projection(&self, profile_id: &str, device_id: &str) -> Result<bool> {
+        self.conn
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM runs
+                    WHERE profile_id = ?1 AND device_id = ?2 AND source = 'codex'
+                )",
+                params![profile_id, device_id],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+    }
+
+    fn backup_catalog_for_codex_rebuild(&self, migration_key: &str) -> Result<()> {
+        let backup_suffix = format!(".backup-{}-{}", migration_key.replace(':', "_"), now_ns());
+        for suffix in ["", "-wal", "-shm"] {
+            let source = PathBuf::from(format!("{}{}", self.path.display(), suffix));
+            if !source.exists() {
+                continue;
+            }
+            let file_name = source
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or("catalog.sqlite");
+            let destination = source.with_file_name(format!("{file_name}{backup_suffix}"));
+            fs::copy(&source, &destination).with_context(|| {
+                format!(
+                    "backup catalog before Codex rebuild: {} -> {}",
+                    source.display(),
+                    destination.display()
+                )
+            })?;
+        }
+        Ok(())
     }
 
     pub(crate) fn finish_codex_rollout_rebuild(

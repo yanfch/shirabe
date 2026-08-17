@@ -169,9 +169,7 @@ fn import_with_modified_since(
     let shirabe_bytes_written = catalog_size(db.path())?;
     let catalog_elapsed_ms = catalog_started.elapsed().as_millis();
 
-    let mut warnings = vec![
-        "codex importer uses metadata-first parsing and does not copy prompt, response, or tool output content".to_string(),
-    ];
+    let mut warnings = Vec::new();
     if scan.warnings > 0 {
         warnings.push(format!(
             "{} session lines could not be parsed and were skipped",
@@ -554,6 +552,10 @@ fn parse_session_line(
         state.apply_turn_context(&payload);
     }
 
+    if state.should_skip_legacy_subagent_history() {
+        return Ok(Vec::new());
+    }
+
     if is_user_turn_boundary(outer_type, payload_type, &payload) {
         state.start_next_turn(timestamp_ns);
         return Ok(vec![state.event(
@@ -707,6 +709,10 @@ struct SessionState {
     turn_context_id: Option<String>,
     #[serde(default)]
     token_count_index: usize,
+    #[serde(default)]
+    legacy_subagent: bool,
+    #[serde(default)]
+    has_seen_turn_context: bool,
     tool_names: HashMap<String, String>,
 }
 
@@ -725,11 +731,14 @@ impl SessionState {
             turn_index: 0,
             turn_context_id: None,
             token_count_index: 0,
+            legacy_subagent: false,
+            has_seen_turn_context: false,
             tool_names: HashMap::new(),
         }
     }
 
     fn apply_session_meta(&mut self, payload: &Map<String, Value>) {
+        self.legacy_subagent |= is_legacy_subagent_session(payload);
         if let Some(id) = string_field(payload, "session_id")
             .or_else(|| string_field(payload, "parent_thread_id"))
             .or_else(|| string_field(payload, "forked_from_id"))
@@ -738,9 +747,11 @@ impl SessionState {
             self.session_external_id = id;
         }
         self.cwd = string_field(payload, "cwd").or_else(|| self.cwd.clone());
-        self.model = string_field(payload, "model").or_else(|| self.model.clone());
-        self.model_provider =
-            string_field(payload, "model_provider").or_else(|| self.model_provider.clone());
+        if !self.legacy_subagent || self.has_seen_turn_context {
+            self.model = string_field(payload, "model").or_else(|| self.model.clone());
+            self.model_provider =
+                string_field(payload, "model_provider").or_else(|| self.model_provider.clone());
+        }
         self.title = self.cwd.as_ref().and_then(|cwd| {
             Path::new(cwd)
                 .file_name()
@@ -750,6 +761,7 @@ impl SessionState {
     }
 
     fn apply_turn_context(&mut self, payload: &Map<String, Value>) {
+        self.has_seen_turn_context = true;
         self.turn_context_id = string_field(payload, "turn_id");
         self.token_count_index = 0;
         self.cwd = string_field(payload, "cwd").or_else(|| self.cwd.clone());
@@ -832,6 +844,10 @@ impl SessionState {
             })
     }
 
+    fn should_skip_legacy_subagent_history(&self) -> bool {
+        self.legacy_subagent && !self.has_seen_turn_context
+    }
+
     fn event(
         &self,
         identity: &ImportIdentity,
@@ -891,6 +907,28 @@ impl SessionState {
             confidence: 0.9,
         }
     }
+}
+
+fn is_legacy_subagent_session(payload: &Map<String, Value>) -> bool {
+    let declared_legacy_subagent = string_field(payload, "thread_source")
+        .is_some_and(|source| source.eq_ignore_ascii_case("subagent"))
+        && string_field(payload, "history_mode")
+            .is_some_and(|history_mode| history_mode.eq_ignore_ascii_case("legacy"));
+    let inherited_subagent_chain = match (
+        string_field(payload, "id"),
+        string_field(payload, "session_id"),
+        string_field(payload, "parent_thread_id"),
+        string_field(payload, "forked_from_id"),
+    ) {
+        (Some(id), Some(session_id), Some(parent_thread_id), Some(forked_from_id)) => {
+            id != parent_thread_id
+                && session_id == parent_thread_id
+                && parent_thread_id == forked_from_id
+        }
+        _ => false,
+    };
+
+    declared_legacy_subagent || inherited_subagent_chain
 }
 
 fn is_user_turn_boundary(
@@ -1312,11 +1350,19 @@ mod tests {
                 input_tokens, output_tokens, started_at_ns
              ) VALUES
                 ('legacy-codex-call', 'local', 'local_device', 'legacy-codex-run', 'codex', 'success', 999, 0, 1),
-                ('pi-call', 'local', 'local_device', 'pi-run', 'pi', 'success', 10, 2, 1);",
+                ('pi-call', 'local', 'local_device', 'pi-run', 'pi', 'success', 10, 2, 1);
+             INSERT INTO meta (key, value, updated_at_ns)
+             VALUES ('codex_rollout_event_ids_v1:local:local_device', 'complete', 1);",
         )?;
 
         let report = import(&db, Some(root.clone()))?;
         assert_eq!(report.files_imported, 2);
+        assert!(fs::read_dir(&root)?.flatten().any(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("catalog.sqlite.backup-codex_legacy_subagent_projection_v1_")
+        }));
         let first_pass: (i64, i64, i64, String) = db.connection().query_row(
             "SELECT COUNT(*), SUM(input_tokens), SUM(output_tokens), MIN(started_day)
              FROM llm_calls WHERE source = 'codex'",
@@ -1363,6 +1409,82 @@ mod tests {
             event_id,
             format!("{root_session}:turn_context:{shared_turn}:token_count:0")
         );
+
+        let _ = fs::remove_dir_all(root);
+        Ok(())
+    }
+
+    #[test]
+    fn skips_legacy_subagent_history_until_the_first_turn_context() -> Result<()> {
+        let root = temp_dir("codex-import-legacy-subagent");
+        fs::create_dir_all(&root)?;
+        let session_path = root.join("subagent.jsonl");
+        fs::write(
+            &session_path,
+            [
+                r#"{"timestamp":"2026-08-17T08:00:00.000Z","type":"session_meta","payload":{"id":"subagent-session","session_id":"parent-session","parent_thread_id":"parent-session","forked_from_id":"parent-session","thread_source":"subagent","history_mode":"legacy","cwd":"/tmp/project"}}"#,
+                r#"{"timestamp":"2026-08-17T08:00:01.000Z","type":"response_item","payload":{"type":"function_call","name":"inherited_tool","call_id":"inherited-call"}}"#,
+                r#"{"timestamp":"2026-08-17T08:00:02.000Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":100,"cached_input_tokens":90,"output_tokens":10,"reasoning_output_tokens":1,"total_tokens":110},"model_context_window":1000}}}"#,
+                r#"{"timestamp":"2026-08-17T08:00:03.000Z","type":"session_meta","payload":{"id":"parent-session","session_id":"parent-session","model":"gpt-5.6-terra","model_provider":"openai"}}"#,
+                r#"{"timestamp":"2026-08-17T08:00:04.000Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":100,"cached_input_tokens":90,"output_tokens":10,"reasoning_output_tokens":1,"total_tokens":110},"model_context_window":1000}}}"#,
+                r#"{"timestamp":"2026-08-17T08:00:05.000Z","type":"turn_context","payload":{"turn_id":"turn-unknown","cwd":"/tmp/project"}}"#,
+                r#"{"timestamp":"2026-08-17T08:00:06.000Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":30,"cached_input_tokens":20,"output_tokens":3,"reasoning_output_tokens":1,"total_tokens":33},"model_context_window":1000}}}"#,
+                r#"{"timestamp":"2026-08-17T08:00:07.000Z","type":"turn_context","payload":{"turn_id":"turn-luna","cwd":"/tmp/project","model":"gpt-5.6-luna","model_provider":"openai"}}"#,
+                r#"{"timestamp":"2026-08-17T08:00:08.000Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":70,"cached_input_tokens":50,"output_tokens":7,"reasoning_output_tokens":2,"total_tokens":77},"model_context_window":1000}}}"#,
+                r#"{"timestamp":"2026-08-17T08:00:09.000Z","type":"response_item","payload":{"type":"function_call","name":"real_tool","call_id":"real-call"}}"#,
+                r#"{"timestamp":"2026-08-17T08:00:10.000Z","type":"response_item","payload":{"type":"function_call_output","call_id":"real-call","output":"Exit code: 0"}}"#,
+                r#"{"timestamp":"2026-08-17T08:00:11.000Z","type":"turn_context","payload":{"turn_id":"turn-terra","cwd":"/tmp/project","model":"gpt-5.6-terra","model_provider":"openai"}}"#,
+                r#"{"timestamp":"2026-08-17T08:00:12.000Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":50,"cached_input_tokens":30,"output_tokens":5,"reasoning_output_tokens":1,"total_tokens":55},"model_context_window":1000}}}"#,
+            ]
+            .join("\n")
+                + "\n",
+        )?;
+
+        let db_path = root.join("catalog.sqlite");
+        let db = Database::open(&db_path)?;
+        db.migrate()?;
+
+        let first = import(&db, Some(root.clone()))?;
+        assert_eq!(first.files_imported, 1);
+        assert!(first.warnings.is_empty());
+        let totals: (i64, i64, i64, i64) = db.connection().query_row(
+            "SELECT COUNT(*), SUM(input_tokens), SUM(output_tokens), SUM(cache_read_tokens)
+             FROM llm_calls WHERE source = 'codex'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+        assert_eq!(totals, (3, 150, 15, 100));
+        let models: (i64, i64, i64) = db.connection().query_row(
+            "SELECT
+                SUM(CASE WHEN model = 'gpt-5.6-luna' THEN 1 ELSE 0 END),
+                SUM(CASE WHEN model IS NULL THEN 1 ELSE 0 END),
+                SUM(CASE WHEN model = 'gpt-5.6-terra' THEN 1 ELSE 0 END)
+             FROM llm_calls WHERE source = 'codex'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        assert_eq!(models, (1, 1, 1));
+        assert_eq!(count(&db, "tool_calls")?, 1);
+
+        let repeated = import(&db, Some(root.clone()))?;
+        assert_eq!(repeated.files_imported, 0);
+        assert_eq!(count(&db, "llm_calls")?, 3);
+
+        append_lines(
+            &session_path,
+            &[
+                r#"{"timestamp":"2026-08-17T08:00:13.000Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":10,"cached_input_tokens":5,"output_tokens":1,"reasoning_output_tokens":0,"total_tokens":11},"model_context_window":1000}}}"#,
+            ],
+        )?;
+        let appended = import(&db, Some(root.clone()))?;
+        assert_eq!(appended.files_imported, 1);
+        let after_append: (i64, i64, i64, i64) = db.connection().query_row(
+            "SELECT COUNT(*), SUM(input_tokens), SUM(output_tokens), SUM(cache_read_tokens)
+             FROM llm_calls WHERE source = 'codex'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+        assert_eq!(after_append, (4, 160, 16, 105));
 
         let _ = fs::remove_dir_all(root);
         Ok(())
